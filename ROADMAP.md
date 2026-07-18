@@ -6,7 +6,7 @@ dates would just be wrong.
 
 - [V1 — shipped](#v1--shipped)
 - [V1.1–V1.2 — near-term](#v11v12--near-term)
-- [V2 — stake-based memberships (mid-term)](#v2--stake-based-memberships-mid-term)
+- [V2 — enterprise reserve memberships (mid-term)](#v2--enterprise-reserve-memberships-mid-term)
 - [V3+ — longer-term](#v3--longer-term)
 - [Risks & open questions](#risks--open-questions)
 
@@ -79,220 +79,262 @@ left open.
 - [ ] **Address validation.** Checksum/format validation on `pay_to` and
       `asset_address` at write time, not just "trust the caller."
 
-## V2 — stake-based memberships (mid-term)
+## V2 — enterprise reserve memberships (mid-term)
 
-The bigger idea from the README: refundable USDC stakes that earn yield,
-subsidize usage, and convert what's currently pure pay-per-call into an
-optional membership layer on top. This is a genuinely new product
-surface, not a refactor of V1 — treat it as additive.
+The V2 product is a **refundable enterprise membership reserve** that
+unlocks fixed service entitlements and discounted, metered access. It
+is not a yield-sharing product, and it is not an investor account.
 
-### New data model
-- [ ] `stakes` table: `id`, `caller_id`, `principal_atomic`, `asset`,
-      `network`, `deposited_at`, `status` (`active`/`withdrawing`/`closed`),
-      `escrow_address`, `yield_strategy_id`.
-- [ ] `yield_positions` table: tracks where a stake's principal is
-      currently deployed (which protocol, which pool/vault, entry
-      timestamp, entry price/share count) — needed for accurate accrued-yield
-      accounting per stake, since stakes will pool into shared vaults in
-      practice rather than each getting isolated on-chain positions.
-- [ ] `usage_allowances` table: per-`caller_id` monthly budget derived
-      from stake size, current period's consumed amount, reset date.
+The core design rule is permanent: **this Worker remains the access
+policy engine. It does not custody customer funds, manage a treasury,
+execute refunds, or attribute investment positions to members.**
 
-### New tools
-- [ ] `deposit_stake` — record an incoming stake deposit (after
-      facilitator settlement confirms the transfer into escrow).
-- [ ] `withdraw_stake` — initiate principal return; needs a cooldown /
-      time-lock policy, not instant withdrawal, both for yield-source
-      liquidity reasons and fraud/abuse resistance.
-- [ ] `get_stake_status` — principal, accrued yield to date, current
-      usage allowance, allowance consumed this period.
-- [ ] `calculate_usage_allowance` — pure function: stake size + yield
-      rate + subsidy split → monthly allowance. Should be callable
-      standalone (for showing a prospective member "here's what a $500
-      stake gets you") as well as internally by `evaluate_request`.
-- [ ] Extend `evaluate_request` to check `usage_allowances` *before*
-      falling through to normal per-call pricing — allowance-covered
-      usage should short-circuit straight to `200` the same way a free
-      coupon does today.
+### V2 launch gates
 
-### Yield automation
-- [ ] Decide and document the actual yield venue(s) — Aave, Morpho, and
-      Ondo are named as candidates in the README; each has different
-      integration complexity (Aave/Morpho are on-chain money markets
-      with real-time composable yield; Ondo's tokenized treasuries are a
-      different risk/liquidity profile entirely). This needs a real
-      decision, not just a list, before any code gets written.
-- [ ] Build (or integrate) the actual deposit-into-yield-source
-      mechanism. This is the one piece of V2 that isn't a natural
-      extension of existing x402 primitives — it's real DeFi protocol
-      integration, likely needs its own sub-agent rather than living in
-      this worker.
-- [ ] Yield accrual accounting: how often is yield calculated and
-      attributed per stake (real-time via share price, daily snapshot,
-      etc.)? Affects both the `yield_positions` schema and how
-      `get_stake_status` computes "accrued yield to date."
+No production code may accept real membership principal until all of
+the following have written, reviewable answers:
 
-### Membership tiers in x402 terms
-- [ ] Map stake tiers ($100 / $500 / $1,000+) onto `pricing_tiers`-style
-      rows with a `min_stake_atomic` requirement instead of (or in
-      addition to) `caller_id`-specific overrides.
-- [ ] Decide overage behavior precisely: auto-charge via x402
-      micropayment against a linked payment method, require manual
-      top-up, or degrade gracefully (rate-limit, not block)? This is a
-      product decision, not just an engineering one.
+- [ ] **Security gate:** complete MCP authentication, role-based access,
+      signed administrative requests, replay protection, idempotency,
+      address validation, and immutable audit events.
+- [ ] **Legal gate:** obtain jurisdiction-specific analysis of the
+      service contract, money-transmission facts, prepaid-membership or
+      club-deposit rules, stablecoin treatment, AML/KYC obligations,
+      unclaimed property, tax, and accounting.
+- [ ] **Custody gate:** select a regulated or counsel-approved custody,
+      escrow, bank, or brokerage structure with segregated records and
+      a defined refund workflow.
+- [ ] **Contract gate:** define reserve amount, term, cancellation
+      eligibility, refund timing, fees, included services, overage
+      pricing, suspension rights, insolvency treatment, and dispute
+      handling without implying a return on capital.
+- [ ] **Liquidity gate:** establish a reserve buffer, maturity ladder,
+      concentration limits, stress tests, and a refund service-level
+      objective that can be met during correlated cancellations.
+- [ ] **Accounting gate:** implement double-entry treatment in which
+      refundable principal is a liability, not revenue, and treasury
+      earnings and losses are recorded separately.
+
+These gates do not block V1.1/V1.2 or a synthetic V2 prototype. They do
+block real customer custody.
+
+### V2A — synthetic/testnet entitlement prototype
+
+Build the membership and access logic first with synthetic records or
+signed testnet attestations. No real principal, treasury assets, or
+refund transactions are involved.
+
+#### Data model owned by this policy service
+
+- [ ] `membership_plans`: `id`, `name`, `reserve_requirement_atomic`,
+      `asset`, `network`, `term_days`, `included_usage_atomic`,
+      `discount_bps`, `overage_policy`, `scope_pattern`, `enabled`,
+      `created_at`, `updated_at`.
+- [ ] `membership_agreements`: `id`, `caller_id`, `plan_id`,
+      `term_starts_at`, `term_ends_at`, `status`
+      (`pending`/`active`/`cancelling`/`closed`),
+      `funding_attestation_id`, `created_at`, `updated_at`.
+- [ ] `funding_attestations`: signed references from the external
+      membership/custody layer: `id`, `provider`, `external_ref`,
+      `principal_atomic`, `asset`, `network`, `status`, `verified_at`,
+      `payload_hash`, `signature`. This is evidence of funding, not a
+      custody ledger.
+- [ ] `plan_entitlements`: per-`caller_id` and agreement period:
+      included budget, consumed budget, period start/end, reset time,
+      scope, and status. Entitlements are fixed by the plan and contract,
+      not calculated from APY or portfolio performance.
+- [ ] `cancellation_requests`: `id`, `agreement_id`, `requested_at`,
+      `eligible_at`, `external_ref`, `status`, `refund_attestation_id`.
+      This tracks workflow state; it never initiates a transfer.
+- [ ] `entitlement_events`: append-only grant, consume, reset, suspend,
+      cancellation, and attestation-verification events for audit and
+      reconciliation.
+
+Do **not** add `yield_positions`, member vault shares, accrued member
+yield, or per-member treasury allocation to this database.
+
+#### MCP tools
+
+- [ ] `create_membership_plan`, `list_membership_plans`, and
+      `update_membership_plan`.
+- [ ] `register_funding_attestation` — verify and record a signed
+      external attestation; never accept raw custody credentials or
+      private keys.
+- [ ] `activate_membership` — bind a verified attestation to a caller,
+      plan, and fixed term.
+- [ ] `get_membership_status` — return principal reference, term,
+      entitlement, consumption, cancellation eligibility, and external
+      workflow status; never return APY, accrued yield, or vault shares.
+- [ ] `calculate_plan_entitlement` — pure function based only on plan
+      terms and contract overrides, not yield assumptions.
+- [ ] `request_membership_cancellation` — create an authenticated,
+      idempotent request for the external membership/custody workflow.
+- [ ] `record_refund_attestation` — reconcile a signed external refund
+      result and close the agreement when appropriate.
+- [ ] Extend `evaluate_request` to check `plan_entitlements` before
+      coupons, negotiated per-call pricing, and ordinary x402 payment.
+      Covered usage returns `200`; overage follows the current x402
+      path.
+
+#### Architecture boundary
+
+Implement five distinct layers:
+
+1. **Membership service:** contracts, organizations, seats, plans,
+   terms, cancellations, and entitlements.
+2. **Custody/escrow provider:** receives and returns principal.
+3. **Treasury service:** manages company-approved assets and liquidity.
+4. **Accounting ledger:** reconciles liabilities, cash, treasury
+   positions, income, losses, and refunds using double entry.
+5. **x402 policy engine:** this repo; authorizes access and charges
+   overages from signed entitlement state.
+
+Only signed, minimal attestations cross into this Worker. Treasury
+positions and customer-money movement stay outside it.
+
+### V2B — controlled real-customer pilot
+
+After every launch gate is satisfied:
+
+- [ ] Start with U.S. enterprise customers in a deliberately limited
+      jurisdictional footprint rather than opening globally.
+- [ ] Use a regulated or counsel-approved custodian/escrow arrangement;
+      do not hold customer reserves in a general Worker-controlled
+      wallet.
+- [ ] Prefer a simple, liquid treasury policy for the first pilot. Test
+      company-owned funds before investing customer-backed reserves.
+      Do not start with automated DeFi routing.
+- [ ] Match reserve duration and refund notice to the liquidity and
+      maturity profile of the underlying assets; keep a documented
+      liquid buffer rather than investing 100%.
+- [ ] Make entitlements and discounts fixed by contract. Do not market
+      APY, expected return, foregone yield, or performance-linked access.
+- [ ] Verify custody and refund webhooks cryptographically, require
+      approval controls, and reconcile every external transaction to the
+      accounting ledger and policy state.
+- [ ] Run cancellation, custodian-outage, stablecoin-depeg, rate-shock,
+      and mass-refund simulations before expanding the pilot.
+
+### Enterprise pricing in x402 terms
+
+- [ ] Map reserve membership plans onto fixed `plan_entitlements`,
+      scoped route permissions, and negotiated `pricing_tiers`.
+- [ ] Choose overage behavior explicitly: x402 micropayment, invoiced
+      enterprise overage, manual top-up, or graceful rate limiting.
+- [ ] Keep the relationship independent of treasury performance:
+
+      `enterprise price = base service fee + metered usage - fixed reserve-tier discount`
+
+Treasury income may improve platform margin, but it is not the source of
+or formula for a member's entitlement.
+
+### Investor product separation
+
+Any product that offers yield, equity, profit participation, governance,
+or an expectation of return is an **investor product**, not a membership
+tier. It must use a separate entity, legal analysis, contracts,
+marketing, repo, database, and onboarding flow. It is outside V2 and
+must never reuse enterprise membership language or data.
 
 ## V3+ — longer-term
 
 Bigger, riskier, or lower-priority than V2 — roughly ordered by how
 likely they are to matter soon, not by size.
 
-- [ ] **Multi-token support beyond USDC.** EURC, other stablecoins,
-      possibly non-stable assets for the internal-token use case.
-- [ ] **On-chain escrow / smart contracts for stakes.** V2 as scoped
-      above can run with this sub-agent (or a paired custodial service)
-      holding stakes in a controlled wallet — which is simpler to ship
-      but means members are trusting the platform's custody, not a
-      contract. A real escrow contract (time-locked, member-withdrawable
-      by design, yield-source-integrated) removes that trust assumption
-      but is a much bigger build (audited Solidity, not a Worker
-      change).
-- [ ] **Analytics dashboard.** Visual layer over `usage_events` /
-      `stakes` / `yield_positions` — total value locked, yield
-      generated vs. distributed, per-tier retention, etc. Probably a
-      separate Worker or a Cloudflare Pages app reading from the same D1.
-- [ ] **Production yield automation.** Auto-rebalancing across yield
-      sources for best risk-adjusted rate, automated compounding,
-      alerting on yield-source health (e.g., a money market's
-      utilization spiking).
-- [ ] **Governance features.** If this grows into something
-      multi-stakeholder (not just one operator), decisions like "which
-      yield sources are approved" or "what's the subsidy split"
-      probably need some kind of transparent process rather than being
-      a config value only the operator can see.
+- [ ] **Signed entitlement tokens.** Let protected Workers validate
+      short-lived membership grants at the edge without a D1 round-trip,
+      while preserving revocation and consumption accounting.
+- [ ] **Custody-provider adapters.** Normalize funding, cancellation,
+      and refund attestations across approved banks, custodians, escrow
+      providers, or brokerages.
+- [ ] **Independent accounting service.** Maintain the double-entry
+      ledger, reconciliation jobs, exception queues, and signed
+      accounting attestations outside the policy Worker.
+- [ ] **Treasury service for company-controlled policy.** Liquidity
+      ladders, concentration limits, maturity matching, counterparty
+      health, and approval workflows belong in a separate service.
+      Tokenized Treasuries or DeFi may be evaluated later, but not as the
+      initial customer-reserve pilot and never as member-owned positions.
+- [ ] **Analytics dashboard.** Visualize active agreements,
+      entitlements, usage, liabilities, refund queues, reserve coverage,
+      and operational exceptions without exposing private custody data.
+- [ ] **Multi-token support beyond USDC.** EURC or other assets only
+      after the custody, accounting, and jurisdictional treatment is
+      explicit for each asset and network.
 - [ ] **Cloudflare Rules-expression / Monetization Gateway
-      integration.** Push route matching to the edge (before a request
-      even reaches a Worker) instead of doing it in `evaluate_request`.
-- [ ] **Real Web Bot Auth verification.** V1 trusts a
-      `bot_auth_verified` boolean the caller asserts; a real
-      implementation verifies the HTTP Message Signatures directive
-      itself.
-- [ ] **Signed coupon tokens.** Move from DB-row coupons to signed
-      JWT-style tokens so edge logic can validate a trial without a D1
+      integration.** Push route matching to the edge before a request
+      reaches a Worker.
+- [ ] **Real Web Bot Auth verification.** Verify HTTP Message
+      Signatures rather than trusting a caller-supplied boolean.
+- [ ] **Signed coupon tokens.** Validate trials at the edge without a D1
       round-trip.
 - [ ] **Multi-facilitator failover.** Retry against a secondary
       facilitator if the primary times out or degrades.
+- [ ] **Separate investor-product research.** Explore only through a
+      dedicated project after specialist legal review; do not add it to
+      this Worker's membership surface.
 
 ## Risks & open questions
 
-**Model update (reflected below):** the working design is no longer a
-yield-*share* with members — it's closer to a refundable membership
-deposit. A member pays (e.g.) $5,000/year for tool access; the company
-holds that $5,000, invests it (Treasuries, money-market funds, or a
-DeFi yield source depending on how V2 lands), keeps 100% of whatever it
-earns as ordinary business revenue, and refunds the full $5,000
-principal if the member cancels. The member is not promised any return,
-any share of yield, or any profit participation — they're buying
-service access with a refundable deposit, full stop. That's a
-meaningfully different (and better) legal shape than the original
-50/50 yield-split framing, closer in spirit to how a private club deposit
-works than to an investment product. It changes *which* regulatory
-buckets apply, not *whether* any apply.
+This section is design guidance, not legal, tax, accounting, custody, or
+investment advice. Classification depends on the actual contracts,
+marketing, fund flows, counterparties, jurisdictions, and operational
+control — not the name used in code.
 
-- **This is very likely a money transmission / money-services-business
-  question first, not a securities question.** Taking custody of a
-  customer's funds and holding a refund obligation against them is the
-  core fact pattern state money transmitter statutes and (for
-  cross-border customers) FinCEN's MSB rules are built to cover. This
-  is arguably the single most important item to resolve before
-  `deposit_stake` accepts a real dollar — more directly on-point than
-  the securities analysis below, and unlike securities exposure it
-  doesn't go away just because there's no yield-share.
-- **Securities-law exposure is real but weaker without a yield-share.**
-  The classic U.S. test (Howey) turns on whether the buyer has an
-  expectation of profit from the arrangement. A no-yield, full-refund,
-  pay-for-access deposit doesn't obviously create that expectation the
-  way a profit-split did — this is a genuine improvement over the
-  earlier framing. It's not a guarantee of "not a security," just a
-  meaningfully better starting position; a lawyer still needs to
-  confirm the actual terms (refund policy wording, marketing language,
-  whether any return is implied) don't accidentally recreate an
-  expectation of profit.
-- **State prepaid-membership / club-deposit statutes are the closest
-  existing legal category.** Refundable-deposit-for-service-access is
-  an old business model (private clubs, gyms, some subscription
-  services) with real regulatory history — several states specifically
-  require bonding, trust accounts, or escrow arrangements for prepaid
-  membership deposits, precisely because members have historically lost
-  deposits when such companies went insolvent. This is likely the most
-  directly applicable body of law to research first, state by state for
-  wherever members are based.
-- **The GENIUS Act (signed July 2025) is relevant context, not a
-  direct constraint here.** It prohibits *payment stablecoin issuers*
-  from paying interest/yield to holders, with proposed OCC rules
-  extending that to affiliate/third-party arrangements. This worker
-  isn't issuing a stablecoin and isn't paying yield to depositors under
-  the current no-share design, so the Act's core prohibition likely
-  doesn't reach it directly — but it signals that "yield connected to
-  stablecoin holding, paid by anyone in the chain" is exactly the
-  pattern federal regulators are watching, and it's worth re-checking
-  this analysis if the model ever reintroduces any member-facing yield
-  component.
-- **AML / KYC obligations follow from the money-transmission
-  question.** If this is (or resembles) a money-services business,
-  standard Bank Secrecy Act expectations apply: identity verification,
-  transaction monitoring, suspicious activity reporting — especially
-  relevant given international customers were explicitly part of the
-  original pitch.
-- **Unclaimed property / escheatment.** Deposits that go unclaimed for
-  an extended period (member disappears, doesn't formally cancel)
-  can trigger state requirements to eventually remit the balance to the
-  state. Needs a defined dormancy/escheatment policy, not just "we hold
-  it forever."
-- **Custody model still matters, independent of the legal
-  question.** Platform-controlled account/wallet (simpler, more trust
-  required from members) vs. a real segregated trust/escrow account
-  (harder to set up, less trust required, and likely what several
-  states' prepaid-membership statutes actually require) is a decision
-  that should land before `deposit_stake` ships, not after.
-- **Where the deposit is invested still carries real risk, even in
-  "safe" instruments.** Direct T-bill holdings carry minimal credit
-  risk but real interest-rate and liquidity risk if a bill needs to be
-  sold before maturity to fund a refund; a DeFi yield source adds smart
-  contract and depeg risk on top; a tokenized-treasury product (Ondo's
-  OUSG/USDY, Franklin Templeton's BENJI, Superstate, etc.) shifts the
-  risk profile again since those are themselves securities/fund
-  interests with their own redemption mechanics and eligibility
-  restrictions (some are accredited-investor-only). Whichever venue V2
-  picks, "refundable principal" is a promise the company has to be able
-  to keep on the *member's* cancellation timeline, which may not match
-  the yield source's liquidity timeline — this argues for holding some
-  buffer un-invested rather than deploying 100% of deposits.
-- **Withdrawal timing creates a run risk regardless of legal
-  structure.** If many members cancel at once (bad press, a rate
-  environment shift, whatever), can the company actually honor
-  refunds on the promised timeline? Same structural question every
-  system that promises instant liquidity on an less-liquid underlying
-  asset has to answer, independent of whether it's legally a security.
-- **Revenue economics need a real model, not just the yield-share math
-  from the original framing.** Without a subsidy split, 100% of the
-  yield is company revenue — the earlier "$100 stake → $0.21/mo
-  subsidy" table no longer applies as a member-facing number, but the
-  underlying point stands: at low deposit sizes and near-term rates,
-  yield income per member is modest, and the business case likely
-  depends on deposit volume/scale, higher minimum deposit tiers, or
-  treating the yield as a margin-improver on top of otherwise-priced
-  service rather than the primary revenue source.
-- **Tax treatment.** Yield earned on customer deposits is very likely
-  ordinary income to the company under this no-share structure (cleaner
-  than the split-recognition question the original framing raised) —
-  but refundable customer deposits sitting on the balance sheet also
-  have their own accounting treatment (liability, not revenue) that
-  should be set up correctly from day one rather than reconstructed
-  later.
+- **Money-transmission analysis is fact-specific.** A refundable
+  deposit taken for the provider's own non-financial service and
+  returned to the same customer may present different facts from
+  accepting value for transmission to another person or location.
+  Direct custody, pooling, conversion, cross-border use, or movement
+  into third-party protocols materially increases the complexity. Get a
+  written analysis before accepting real principal.
+- **Removing member-facing yield improves but does not settle the
+  securities analysis.** The enterprise terms and marketing must avoid
+  an expectation of profit, performance-linked benefits, transferable
+  interests, governance rights, or language that treats the member as
+  an investor.
+- **Prepaid-membership and refundable-deposit rules may apply.** State
+  law can require trust accounts, escrow, bonding, disclosures,
+  cancellation rights, or other protections. Scope the first pilot to
+  jurisdictions that have been reviewed.
+- **Custody and insolvency protection are central.** A platform wallet
+  creates commingling, operational, bankruptcy, key-management, and
+  customer-trust risk. Segregated custody records and clear beneficial
+  ownership/claim treatment must be resolved contractually and
+  operationally.
+- **Refund timing and asset liquidity must match.** Direct T-bills can
+  carry sale-before-maturity risk; money-market funds have settlement
+  and gate mechanics; stablecoins can depeg or be frozen; tokenized
+  funds add transfer and eligibility constraints; DeFi adds smart
+  contract, oracle, liquidation, and protocol-governance risk.
+- **Mass cancellations create run risk.** Model correlated withdrawals,
+  custodian outages, settlement delays, and asset impairment. Maintain a
+  liquid buffer and do not promise instant refunds against less-liquid
+  assets.
+- **Refunds are a high-risk payment workflow.** Require authenticated
+  requests, destination validation, sanctions and fraud controls,
+  approval thresholds, idempotency, transaction limits,
+  reconciliation, and recovery for partial failures.
+- **Accounting must be correct from day one.** Refundable principal is
+  generally modeled as a liability rather than service revenue;
+  treasury earnings, losses, service fees, and refunds need separate
+  ledger treatment confirmed by qualified professionals.
+- **Unclaimed property and dormancy require policy.** Define contact,
+  dormancy, notice, and escheatment handling before accounts can remain
+  inactive for long periods.
+- **International expansion multiplies obligations.** Do not infer that
+  a U.S. structure works for customers, custodians, or assets in other
+  countries.
+- **Economics must survive low rates and zero treasury income.** At
+  ordinary reserve sizes, treasury income is modest. The service should
+  be viable from its fees and metered usage; reserve earnings are a
+  margin enhancer, not the primary revenue source.
+- **Security compromise could become a financial event.** Complete
+  authentication, authorization, signing, audit, replay protection,
+  separation of duties, incident response, and key/custodian controls
+  before connecting policy state to real funding status.
 
-None of this blocks V1.1/V1.2 — those are safe, incremental, and don't
-touch custody. It should block the start of any real V2 implementation
-work until at least the money-transmission and prepaid-membership
-regulatory questions have real answers — that's now the higher-priority
-legal question to resolve first, ahead of the securities analysis,
-given the no-yield-share structure.
+V1.1/V1.2 and the synthetic V2A entitlement prototype may proceed
+without custody. A real V2B pilot begins only after the launch gates have
+written approvals, verified integrations, and tested operational
+controls.
