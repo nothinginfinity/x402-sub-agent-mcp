@@ -7,8 +7,8 @@ single `evaluate_request` call.
 
 Status: **V1 shipped and verified end-to-end** (real EIP-712 signing,
 real facilitator round-trips, real Cloudflare deploy). See
-[ROADMAP.md](./ROADMAP.md) for what's next, including the stake-based
-membership model described below.
+[ROADMAP.md](./ROADMAP.md) for what's next, including the enterprise
+reserve membership model described below.
 
 ---
 
@@ -21,7 +21,7 @@ membership model described below.
 - [Testing](#testing)
 - [MCP tools reference](#mcp-tools-reference)
 - [Usage examples](#usage-examples)
-- [Stake-based membership model (design, not yet built)](#stake-based-membership-model-design-not-yet-built)
+- [Enterprise reserve membership model (design, not yet built)](#enterprise-reserve-membership-model-design-not-yet-built)
 - [Security notes & limitations](#security-notes--limitations)
 - [Contributing / extending](#contributing--extending)
 
@@ -109,7 +109,7 @@ migrations/0001_initial.sql   D1 schema for all five tables above
 docs/DEPLOY.md                step-by-step setup, written for doing this entirely from an iPhone
 docs/MCP-TOOL-CALLS.md        example tool-call payloads
 README.md                     this file
-ROADMAP.md                    where this is headed, including the stake-based membership model
+ROADMAP.md                    where this is headed, including the enterprise reserve membership model
 ```
 
 `worker.js` is intentionally dependency-free and single-file — same
@@ -252,79 +252,115 @@ set. Quick taste:
 }}
 ```
 
-## Stake-based membership model (design, not yet built)
+## Enterprise reserve membership model (design, not yet built)
 
-This is where the project is headed next (see
-[ROADMAP.md](./ROADMAP.md) for the implementation plan) — documented
-here because it changes how you should think about what this sub-agent
-is *for*.
+This is the intended enterprise product direction (see
+[ROADMAP.md](./ROADMAP.md) for the build order). The model is a
+**refundable capital reserve that unlocks discounted, metered access to
+AI tools, data, compute, and custom workflows**. It is not an investment
+product and it is not a yield-sharing program.
 
-### The idea
+### Product definition
 
-Instead of (or alongside) pay-per-call pricing, a member deposits a
-refundable **stake** in USDC — say $100, $500, or $1,000+ tiers. That
-stake:
+An enterprise customer commits a refundable reserve for a defined
+contract term. In exchange, the customer receives fixed service rights:
 
-- Is never spent. On cancellation, the member gets their **full
-  principal back**.
-- Is deployed by the platform into low-risk on-chain yield sources
-  (Aave, Morpho, Ondo, or similar money-market protocols) earning
-  roughly **4–6% APY**.
-- Generates yield that's split between the member and the platform —
-  e.g. 50% subsidizes the member's usage of your MCP sub-agents,
-  Cloudflare AI, and compute costs; 50% is platform revenue.
-- Determines a **monthly usage allowance** proportional to stake size —
-  higher stake, higher allowance. Usage beyond the allowance is billed
-  normally via x402 micropayments (exactly what this sub-agent already
-  does), or covered by adding more stake.
+- a negotiated set of tools, routes, datasets, seats, and workflow
+  permissions;
+- a fixed monthly or annual included-usage entitlement;
+- a contractual discount or preferred overage rate; and
+- normal x402 billing after the entitlement is exhausted.
 
-The pitch to the member: membership feels free (or close to it) because
-they never lose principal — they're forgoing the yield on money they'd
-otherwise have sitting in a bank account or stablecoin wallet anyway.
+The customer is **not** promised interest, APY, a share of treasury
+income, profit participation, ownership, governance rights, or an
+entitlement that changes with investment performance. Any return earned
+on company-managed treasury assets belongs to the company. The company
+also bears treasury losses, liquidity risk, custody costs, and the
+obligation to return the contractual principal.
 
-### The economics (illustrative, not a promise)
+Use **reserve membership** or **membership reserve** in product and code
+language. Avoid presenting the enterprise customer as an investor or
+the reserve as an appreciating stake.
 
-At 5% APY, split 50/50 between member-subsidy and platform revenue:
+### Enterprise and investor products are separate
 
-| Stake | Annual yield (5%) | Member-subsidy pool (50%) | ≈ Monthly usage subsidy | Platform revenue (50%) |
-|---:|---:|---:|---:|---:|
-| $100 | $5.00 | $2.50 | ~$0.21 | $2.50 |
-| $500 | $25.00 | $12.50 | ~$1.04 | $12.50 |
-| $1,000 | $50.00 | $25.00 | ~$2.08 | $25.00 |
-| $5,000 | $250.00 | $125.00 | ~$10.42 | $125.00 |
+| Enterprise reserve membership | Investor product |
+|---|---|
+| Purchases service access | Supplies risk capital seeking a return |
+| Fixed contractual entitlements | Yield, equity, profit share, or governance may apply |
+| No member-facing APY or profit expectation | Requires its own legal and offering structure |
+| Refund governed by the service contract | Redemption/return governed by investment documents |
+| Lives in this access-policy product | Must use a separate entity, repo, contracts, data model, and customer flow |
 
-Two honest caveats on this table: (1) at low stake tiers the monthly
-subsidy is small in absolute dollar terms — the model works better as a
-volume play across many members, or at higher stake tiers, than as a
-meaningful subsidy for a single $100 depositor; (2) 4–6% APY on
-"low-risk" DeFi yield sources is a current-market assumption, not a
-guarantee — see [Risks](./ROADMAP.md#risks--open-questions) in the
-roadmap.
+Combining the two would contaminate the enterprise model. Terms such as
+"investor," "return," "yield share," and "capital appreciation" must
+not appear in enterprise membership marketing or entitlement logic.
+
+### Required system boundary
+
+The reserve product must be split into independent layers:
+
+1. **Membership service** — contracts, organizations, seats, plans,
+   term dates, cancellation eligibility, and service entitlements.
+2. **Custody or escrow provider** — holds refundable principal and
+   executes approved funding and refund instructions.
+3. **Treasury service** — manages company-approved cash, Treasury,
+   money-market, or other positions; members never own portfolio shares.
+4. **Accounting ledger** — records principal as a refundable liability,
+   treasury income as company income, and every movement with
+   double-entry reconciliation.
+5. **x402 policy engine** — this repo; consumes signed entitlement
+   attestations, meters usage, and charges overages.
+
+`x402-sub-agent-mcp` must remain a policy and bookkeeping layer, not a
+wallet, bank, escrow contract, broker, investment fund, or treasury
+manager. It should know that an account has an active plan and a
+remaining entitlement. It should not know that a member "owns" vault
+shares or has accrued yield.
+
+### Economics
+
+The intended pricing relationship is:
+
+```text
+enterprise price = base service fee + metered usage - fixed reserve-tier discount
+```
+
+A representative contract could use a $25,000 refundable reserve, a
+12- or 24-month commitment, fixed included usage, a fixed platform-fee
+discount, and x402 overage billing. The discount and entitlement are
+set by contract and do not float with Treasury rates or protocol yield.
+
+Treasury income is a possible **margin enhancer**, not the economic
+foundation for unlimited AI usage. Refundable principal remains a
+liability, and the platform must be able to honor refunds even if rates
+fall, assets lose value, or many customers cancel together.
 
 ### How x402 fits
 
-This sub-agent's existing primitives map onto the stake model almost
-directly, which is why it's a natural extension rather than a rewrite:
+The x402 integration is narrower and safer than the original stake
+proposal:
 
-- **Deposits** become a new kind of "payment" — an x402 `exact` (or a
-  new `stake`/`deposit` scheme) transfer into an escrow address, tracked
-  in a new `stakes` table (mirrors `payment_rules`/`coupons` in shape).
-- **Usage allowance** is a per-`caller_id` construct almost identical to
-  today's `pricing_tiers` — "this account gets $X/month of usage at
-  $0 marginal cost" is just a tier with a monthly-reset budget instead
-  of a flat per-call rate.
-- **Overage billing** is exactly today's `evaluate_request` flow —
-  once the allowance is exhausted, fall through to normal x402
-  micropayments (or auto-charge against a secondary payment method).
-- **Withdrawals** are a new settlement direction: this sub-agent (or a
-  paired escrow contract) initiates a transfer *back* to the member,
-  which is the same facilitator `/settle` primitive run in reverse.
+- `evaluate_request` checks an active `plan_entitlement` before ordinary
+  per-call pricing.
+- Entitlement-covered requests short-circuit to `200`; consumption is
+  recorded against a fixed period budget.
+- Overage falls through to the existing x402 challenge, verify, settle,
+  and usage-log flow.
+- Membership activation is based on a signed funding attestation from
+  the external membership/custody layer, not on this Worker receiving
+  or controlling funds.
+- Cancellation creates a request for the external custody workflow.
+  A refund is **not** the facilitator `/settle` operation run in reverse;
+  it needs authenticated approvals, destination validation,
+  idempotency, compliance checks, reconciliation, and failure recovery.
 
-None of this is implemented in V1 — seeing this section is your
-signal that `stakes`, `withdraw_stake`, and `calculate_usage_allowance`
-are coming, not that they exist yet. See the roadmap for the build
-order and, importantly, the legal/regulatory questions that need
-answering *before* any of this touches real money.
+None of the reserve, custody, treasury, cancellation, or refund
+capabilities exist in V1. The first implementation should use synthetic
+or testnet funding attestations and fixed entitlements only. Real
+customer principal must wait for the security work, contracts,
+accounting, regulatory analysis, and custody structure described in the
+roadmap.
 
 ## Security notes & limitations
 
