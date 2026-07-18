@@ -21,6 +21,7 @@ reserve membership model described below.
 - [Testing](#testing)
 - [MCP tools reference](#mcp-tools-reference)
 - [Usage examples](#usage-examples)
+- [Agent operating balances & branded denomination UX (future design)](#agent-operating-balances--branded-denomination-ux-future-design)
 - [Enterprise reserve membership model (design, not yet built)](#enterprise-reserve-membership-model-design-not-yet-built)
 - [Security notes & limitations](#security-notes--limitations)
 - [Contributing / extending](#contributing--extending)
@@ -251,6 +252,32 @@ set. Quick taste:
     "x_payment": "<base64 X-PAYMENT header value, omit on the first attempt>"
 }}
 ```
+
+## Agent operating balances & branded denomination UX (future design)
+
+The long-term payment product has two customer funding concepts that must remain separate:
+
+| Concept | Economic behavior | This Worker's role |
+|---|---|---|
+| **Agent operating balance** | A consumable prepaid balance used for tool calls, data, compute, workflows, and developer services. Spending reduces the balance. | Authorize a maximum amount, meter actual usage, route x402 payment, and record a receipt from signed external balance or settlement state. |
+| **Enterprise membership reserve** | Refundable principal committed for a defined term to unlock fixed service entitlements and preferred overage pricing. Ordinary tool calls do not consume the reserve principal. | Check the active plan and remaining entitlement, then fall through to metered overage when needed. |
+
+The settlement asset beneath an operating balance may eventually be USDC, USDT, a tokenized deposit, fiat held by an approved provider, or another asset that has passed the custody, accounting, technical, and jurisdictional gates. The asset remains external to this Worker.
+
+A branded **Penny**, **Nickel**, **Quarter**, or **Mill** can be a human-readable pricing and marketing denomination mapped to one underlying atomic ledger. A mill is $0.001. These names should normally be display metadata, not separate transferable tokens or separate customer liabilities. Machines receive integer atomic amounts; humans may see `$0.80`, `80 cents`, or `3 quarters + 1 nickel`.
+
+Early versions must not issue a proprietary redeemable stablecoin. They should use:
+
+- an approved external settlement asset;
+- an integer-based internal accounting unit;
+- signed authorization, reservation, commit, release, and receipt events; and
+- branded denomination metadata at the UI and discovery layers.
+
+A future on-chain branded unit may be researched only through a separate issuer/custody/legal project or an approved issuing partner. Branding does not change the underlying financial classification. Product language must not call a private stablecoin **government-backed**, **government-issued**, **official**, **insured**, or **deposit-protected** unless that exact claim has been independently verified for the specific asset, issuer, account structure, and jurisdiction. Holding government securities in reserves is not the same as a government guarantee.
+
+The intended architecture is an **agent commerce operating system**: identity, budgets, policy, metering, receipts, tool discovery, and payment routing. This repo remains its policy plane; it does not become the wallet, stablecoin issuer, custodian, treasury manager, developer bank, or payout processor.
+
+See [docs/AGENT-OPERATING-BALANCES.md](./docs/AGENT-OPERATING-BALANCES.md) for the staged architecture, terminology, accounting examples, and marketing guardrails.
 
 ## Enterprise reserve membership model (design, not yet built)
 
