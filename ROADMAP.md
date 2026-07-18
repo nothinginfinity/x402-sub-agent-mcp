@@ -74,9 +74,13 @@ left open.
       `facilitator_url` explicitly per-call. Add a lookup so a rule
       whose `network`/`asset` matches a registered internal token picks
       up that token's `facilitator_url` by default.
-- [ ] **Basic MCP-surface auth.** Shared-secret header check at minimum,
-      ahead of anything real touching this worker's rule/coupon/tier
-      tools.
+- [x] **Basic MCP-surface auth.** ✅ Shipped: every `tools/call` (over
+      `/mcp` JSON-RPC or REST `/call`) requires `Authorization: Bearer
+      <token>`, checked against the `MCP_AUTH_TOKEN` Cloudflare secret
+      with a constant-time comparison. Fails closed (denies everything)
+      if the secret isn't configured. Discovery endpoints (`tools/list`,
+      `GET /status`, `GET /tools`) stay public. This is a single shared
+      secret, not per-caller auth/RBAC — that's still open for later.
 - [ ] **Address validation.** Checksum/format validation on `pay_to` and
       `asset_address` at write time, not just "trust the caller."
 
