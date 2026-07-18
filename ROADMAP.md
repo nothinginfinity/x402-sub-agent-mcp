@@ -7,6 +7,7 @@ dates would just be wrong.
 - [V1 — shipped](#v1--shipped)
 - [V1.1–V1.2 — near-term](#v11v12--near-term)
 - [V1.3 — agent operating balances & denomination UX](#v13--agent-operating-balances--denomination-ux)
+- [V1.4 — payment-signing orchestration](#v14--payment-signing-orchestration)
 - [V2 — enterprise reserve memberships (mid-term)](#v2--enterprise-reserve-memberships-mid-term)
 - [V3+ — longer-term](#v3--longer-term)
 - [Risks & open questions](#risks--open-questions)
@@ -146,6 +147,70 @@ This stage begins only after the security and legal gates relevant to stored val
 A future branded Penny, Quarter, or other on-chain unit may be useful for distribution and marketing, but it is not required for sub-cent x402 pricing. Research it only through a separate issuer/custody/legal project or an approved issuing partner. Branding must not be used to imply government backing, deposit insurance, independent redemption rights, or a new asset when the product is only a display denomination mapped to an existing settlement asset.
 
 See [docs/AGENT-OPERATING-BALANCES.md](./docs/AGENT-OPERATING-BALANCES.md) for the full conceptual architecture.
+
+## V1.4 — payment-signing orchestration
+
+Design decision captured now, before anything gets built ad hoc.
+`x402-sub-agent-mcp` is the seller/policy side and stays that way — it
+never holds keys. Signing a `TransferWithAuthorization` payload is a
+separate concern on the *buyer* side, and it splits into two cases that
+need different answers.
+
+**Case 1 — a human or end customer paying.** Their own wallet signs:
+browser extension, mobile wallet, or a thin client SDK. Nothing custom
+to build. This is the default the x402 spec assumes and needs no work
+here.
+
+**Case 2 — one of our own agents paying autonomously.** This is the
+real design question, and it's where the decision below applies.
+
+### Options considered
+
+- [ ] **Rejected: a custom "micro-wallet sub-agent" holding a raw
+      private key** in a Cloudflare secret. Single point of failure —
+      anyone who compromises that one Worker gets full spend authority.
+      No MPC, no built-in spending limits, no sanctions screening. The
+      naive version of case 2 and the one to actively avoid building.
+- [ ] **Rejected as a complete answer on its own: a generic client-side
+      SDK for agents.** Doesn't resolve where key material actually
+      lives when the "client" is one of our own always-on Workers
+      rather than a human with a device — the SDK still needs a key
+      somewhere, which just relocates the case-2 problem rather than
+      solving it.
+- [x] **Chosen direction: MPC wallet-as-a-service + a thin AFO policy
+      wrapper.** Custody stays with an MPC provider (2-of-2 key shares,
+      never exposed to the agent) instead of a self-hosted key. AFO
+      adds its own spend-policy layer on top of the provider's own
+      limits, rather than re-implementing custody from scratch.
+
+### Provider candidates (evaluate, don't build custody ourselves)
+
+- [ ] **Circle Agent Wallets** — leading candidate. 2-of-2 MPC, built-in
+      USDC/EURC spend limits (time-bound), address allowlists/blocklists,
+      sanctions screening on every transfer, already wired to x402
+      nanopayments via Circle Gateway. Operated through Circle CLI with
+      no custom integration code required for the basic flow.
+- [ ] **Coinbase Agentic Wallets** — alternative. MPC-plus-TEE custody,
+      native x402 client, per-token allowances and session keys, ships
+      as an MCP server. Worth comparing against Circle on policy
+      granularity and pricing before committing to one.
+
+### Scoped build (when there's an actual use case, not speculative)
+
+- [ ] Provision an MPC agent wallet with the chosen provider rather than
+      building custody in-house.
+- [ ] Build a thin "payment-signing sub-agent": receives a `402`
+      challenge from `evaluate_request`, checks AFO-specific policy
+      (pre-approved routes, price ceilings, allow-listed sellers)
+      *before* requesting a signature, calls the provider's API for the
+      signed authorization, returns it to the calling agent to retry
+      `evaluate_request`.
+- [ ] This sub-agent never stores raw key material — it's a policy gate
+      in front of the provider's signing API, not a wallet itself.
+- [ ] Log every signing request and policy decision the same way
+      `x402-sub-agent-mcp` logs `usage_events`, for auditability.
+- [ ] Don't build this speculatively — revisit once there's a concrete
+      autonomous-payment use case in front of us.
 
 ## V2 — enterprise reserve memberships (mid-term)
 
