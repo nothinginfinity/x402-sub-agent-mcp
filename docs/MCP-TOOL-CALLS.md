@@ -3,6 +3,24 @@
 All examples show the `tools/call` `arguments` object — an LLM (Claude,
 Grok, etc.) connected to this MCP server would call these by name.
 
+## Authentication
+
+Every `tools/call` (both over `/mcp` JSON-RPC and the REST `/call`
+fallback) requires an `Authorization: Bearer <token>` header, where
+`<token>` matches the `MCP_AUTH_TOKEN` Cloudflare secret configured on
+the Worker. `initialize`, `notifications/initialized`, `ping`,
+`tools/list`, and the `GET /status` / `GET /tools` discovery endpoints
+stay public — only actual tool invocation is gated. If `MCP_AUTH_TOKEN`
+isn't set on the Worker yet, every call is denied by default (fail
+closed), so a missing secret can never leave the surface open.
+
+```bash
+curl https://x402-sub-agent-mcp.<your-subdomain>.workers.dev/call \
+  -H "content-type: application/json" \
+  -H "authorization: Bearer <your MCP_AUTH_TOKEN value>" \
+  -d '{"name": "list_payment_rules", "arguments": {}}'
+```
+
 ## Protect a route with a flat price
 
 ```json
