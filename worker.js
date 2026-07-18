@@ -86,6 +86,35 @@ function assetAddress(network, asset, override) {
   return KNOWN_ASSETS[network + ':' + asset] || null;
 }
 
+// ---- address validation --------------------------------------------
+// Strict hex-format check only: 0x + exactly 40 hex chars, and not the
+// null address. This is NOT full EIP-55 checksum verification — that
+// needs Keccak-256, which isn't in Workers' Web Crypto and would mean
+// pulling in a crypto library, breaking this worker's intentional
+// zero-dependency, single-file design. Format validation still catches
+// the realistic failure modes: wrong length, missing 0x, stray
+// whitespace, non-hex characters, pasting the wrong kind of string
+// entirely. It will NOT catch a single transposed character that keeps
+// valid hex shape and case — only a real checksum library catches that.
+const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const NULL_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+function assertValidAddress(value, label) {
+  const v = clean(value);
+  if (!ADDRESS_RE.test(v)) {
+    throw new Error(`${label} must be a 0x-prefixed 40-hex-character address (got: ${v || '(empty)'})`);
+  }
+  if (v.toLowerCase() === NULL_ADDRESS) {
+    throw new Error(`${label} cannot be the null address (0x000...000) — this is almost always a mistake`);
+  }
+  return v;
+}
+
+function assertValidAddressIfPresent(value, label) {
+  const v = clean(value);
+  return v ? assertValidAddress(v, label) : null;
+}
+
 // ---- D1 helpers -----------------------------------------------------
 function requireDb(env) {
   if (!env.DB) throw new Error('D1 binding DB is not configured on this Worker');
@@ -108,10 +137,10 @@ async function dbRun(env, sql, params = []) {
 async function createPaymentRule(env, a) {
   const pattern = clean(a.pattern);
   if (!pattern) throw new Error('pattern is required, e.g. /api/premium/*');
-  const payTo = clean(a.pay_to);
-  if (!payTo) throw new Error('pay_to (receiving wallet address) is required');
+  const payTo = assertValidAddress(a.pay_to, 'pay_to');
   const network = clean(a.network) || 'base';
   const asset = clean(a.asset) || 'USDC';
+  const explicitAssetAddress = assertValidAddressIfPresent(a.asset_address, 'asset_address');
   const priceAtomic = a.price_atomic != null ? clean(a.price_atomic) : toAtomic(a.price_usd || 0, a.decimals);
   const id = uid('rule');
   const ts = nowIso();
@@ -120,7 +149,7 @@ async function createPaymentRule(env, a) {
        auth_required, bot_auth_required, description, priority, enabled, created_at, updated_at)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [id, pattern, clean(a.method) || '*', clean(a.mode) || 'exact', priceAtomic, asset,
-      assetAddress(network, asset, clean(a.asset_address) || null), network, payTo,
+      assetAddress(network, asset, explicitAssetAddress), network, payTo,
       bool01(a.auth_required), bool01(a.bot_auth_required), clean(a.description) || null,
       Number.isFinite(Number(a.priority)) ? Number(a.priority) : 100, 1, ts, ts]);
   return { ok: true, rule: await dbFirst(env, 'SELECT * FROM payment_rules WHERE id = ?', [id]) };
@@ -139,12 +168,14 @@ async function updatePaymentRule(env, a) {
   if (!id) throw new Error('id is required');
   const existing = await dbFirst(env, 'SELECT * FROM payment_rules WHERE id = ?', [id]);
   if (!existing) return { ok: false, error: 'rule not found', id };
-  const fields = ['pattern', 'method', 'mode', 'asset', 'network', 'pay_to', 'description'];
+  const fields = ['pattern', 'method', 'mode', 'asset', 'network', 'description'];
   const sets = [];
   const params = [];
   for (const f of fields) {
     if (a[f] != null) { sets.push(f + ' = ?'); params.push(clean(a[f])); }
   }
+  if (a.pay_to != null) { sets.push('pay_to = ?'); params.push(assertValidAddress(a.pay_to, 'pay_to')); }
+  if (a.asset_address != null) { sets.push('asset_address = ?'); params.push(assertValidAddress(a.asset_address, 'asset_address')); }
   if (a.price_atomic != null) { sets.push('price_atomic = ?'); params.push(clean(a.price_atomic)); }
   else if (a.price_usd != null) { sets.push('price_atomic = ?'); params.push(toAtomic(a.price_usd, a.decimals)); }
   if (a.priority != null) { sets.push('priority = ?'); params.push(Number(a.priority)); }
@@ -293,11 +324,12 @@ async function registerInternalToken(env, a) {
   const network = clean(a.network);
   const asset = clean(a.asset);
   if (!name || !network || !asset) throw new Error('name, network, and asset are required');
+  const assetAddr = assertValidAddressIfPresent(a.asset_address, 'asset_address');
   const id = uid('tok');
   await dbRun(env, `INSERT INTO internal_tokens
       (id, name, scheme, network, asset, asset_address, facilitator_url, enabled, note, created_at)
      VALUES (?,?,?,?,?,?,?,1,?,?)`,
-    [id, name, clean(a.scheme) || 'exact', network, asset, clean(a.asset_address) || null,
+    [id, name, clean(a.scheme) || 'exact', network, asset, assetAddr,
       clean(a.facilitator_url) || null, clean(a.note) || null, nowIso()]);
   return { ok: true, token: await dbFirst(env, 'SELECT * FROM internal_tokens WHERE id = ?', [id]) };
 }
