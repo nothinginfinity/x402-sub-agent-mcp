@@ -555,6 +555,7 @@ function status(env) {
     mode: 'x402_policy_engine',
     facilitator_default: env.X402_FACILITATOR_URL || DEFAULT_FACILITATOR,
     bindings: { DB: !!env.DB, AI: !!env.AI, WORKER_NAME: !!env.WORKER_NAME },
+    auth_configured: !!env.MCP_AUTH_TOKEN,
     tools: toolSchemas.map(t => t.name)
   };
 }
@@ -642,6 +643,43 @@ function mcpResponse(req, payload) {
   });
 }
 
+// --- Auth -----------------------------------------------------------
+// Every tool here can create/modify pricing rules, coupons, tiers, and
+// tokens (or trigger real facilitator calls), so tool invocation is
+// gated behind a shared secret (Cloudflare secret MCP_AUTH_TOKEN, never
+// a plain wrangler.jsonc var). Health/status/tool-schema discovery stay
+// public since they carry no sensitive data and are useful for
+// unauthenticated deploy verification. If MCP_AUTH_TOKEN isn't set yet,
+// every guarded call fails closed rather than silently running open.
+function extractBearer(req) {
+  const auth = req.headers.get('authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  return m ? m[1].trim() : null;
+}
+
+function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function isAuthed(req, env) {
+  if (!env.MCP_AUTH_TOKEN) return false;
+  const token = extractBearer(req);
+  return !!token && timingSafeEqual(token, env.MCP_AUTH_TOKEN);
+}
+
+function authErrorPayload(env) {
+  const configured = !!env.MCP_AUTH_TOKEN;
+  return {
+    ok: false,
+    error: configured
+      ? 'unauthorized: missing or invalid Authorization: Bearer <token> header'
+      : 'unauthorized: MCP_AUTH_TOKEN is not configured on this Worker yet, so all tool calls are denied by default'
+  };
+}
+
 async function handleMcp(req, env) {
   const rpc = await readJson(req);
   const id = rpc.id == null ? null : rpc.id;
@@ -655,6 +693,9 @@ async function handleMcp(req, env) {
     if (rpc.method === 'ping') return mcpResponse(req, { jsonrpc: '2.0', id, result: {} });
     if (rpc.method === 'tools/list') return mcpResponse(req, { jsonrpc: '2.0', id, result: { tools: toolSchemas } });
     if (rpc.method === 'tools/call') {
+      if (!isAuthed(req, env)) {
+        return mcpResponse(req, { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(authErrorPayload(env), null, 2) }], isError: true } });
+      }
       let result;
       try {
         result = await callTool(env, rpc.params && rpc.params.name, (rpc.params && rpc.params.arguments) || {});
@@ -678,6 +719,7 @@ export default {
       if (url.pathname === '/tools') return j({ ok: true, tools: toolSchemas });
       if (url.pathname === '/mcp') return handleMcp(req, env);
       if (req.method === 'POST' && url.pathname === '/call') {
+        if (!isAuthed(req, env)) return j(authErrorPayload(env), 401);
         const body = await readJson(req);
         try { return j(await callTool(env, body.name, body.arguments || {})); }
         catch (e) { return j({ ok: false, error: String(e.message || e) }, 200); }
