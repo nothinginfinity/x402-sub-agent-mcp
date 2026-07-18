@@ -19,9 +19,14 @@ jobs:
         run: npm install
 
       - name: Set MCP_AUTH_TOKEN secret (if configured)
-        if: ${{ secrets.MCP_AUTH_TOKEN != '' }}
-        run: echo "${{ secrets.MCP_AUTH_TOKEN }}" | npx wrangler secret put MCP_AUTH_TOKEN
+        run: |
+          if [ -n "$MCP_AUTH_TOKEN_VALUE" ]; then
+            echo "$MCP_AUTH_TOKEN_VALUE" | npx wrangler secret put MCP_AUTH_TOKEN
+          else
+            echo "MCP_AUTH_TOKEN repo secret not set yet; skipping. All tool calls remain denied (fail-closed) until it is set."
+          fi
         env:
+          MCP_AUTH_TOKEN_VALUE: ${{ secrets.MCP_AUTH_TOKEN }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
