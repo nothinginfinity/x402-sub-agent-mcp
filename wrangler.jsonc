@@ -12,7 +12,7 @@
     {
       "binding": "DB",
       "database_name": "x402-sub-agent-db",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+      "database_id": "9db1fe16-7097-445e-8d7e-d37e12695374"
     }
   ]
 }
