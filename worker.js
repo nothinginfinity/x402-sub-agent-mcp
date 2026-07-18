@@ -315,13 +315,26 @@ function decodePaymentHeader(b64) {
   try { return JSON.parse(atob(b64)); } catch { return b64; } // fall back to raw string if not base64 JSON
 }
 
+// Cloudflare blocks a Worker on *.workers.dev from fetch()-ing another
+// *.workers.dev subdomain directly (error 1042). Known sibling workers.dev
+// facilitators get routed through a Service Binding instead; anything else
+// (the public internet, or a facilitator on a custom domain) uses a plain
+// fetch() as normal.
+const WORKERS_DEV_SERVICE_BINDINGS = {
+  'x402-mock-facilitator.jaredtechfit.workers.dev': 'MOCK_FACILITATOR'
+};
+
 async function facilitatorCall(env, facilitatorUrl, path, body) {
   const base = clean(facilitatorUrl) || env.X402_FACILITATOR_URL || DEFAULT_FACILITATOR;
-  const res = await fetch(base.replace(/\/$/, '') + path, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body)
-  });
+  const url = base.replace(/\/$/, '') + path;
+  const req = { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) };
+  let res;
+  try {
+    const bindingName = WORKERS_DEV_SERVICE_BINDINGS[new URL(base).hostname];
+    res = bindingName && env[bindingName] ? await env[bindingName].fetch(url, req) : await fetch(url, req);
+  } catch (e) {
+    return { httpStatus: 0, httpOk: false, facilitator: base, data: { raw: 'fetch failed: ' + String(e.message || e) } };
+  }
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch { data = { raw: text }; }
