@@ -50,10 +50,17 @@ worker — not aspirational.
 Small, concrete, no new concepts — mostly closing gaps V1 knowingly
 left open.
 
-- [ ] **Switch default testing to real testnet USDC.** Sign against the
-      real Base Sepolia USDC contract via `x402.org/facilitator`
-      instead of (or alongside) the mock, using the same throwaway
-      wallet, funded via Circle's faucet. First real balance-aware test.
+- [x] **Switch default testing to real testnet USDC.** ✅ Shipped and
+      verified: signed a real EIP-712 `TransferWithAuthorization` with
+      a funded wallet against the actual Base Sepolia USDC contract,
+      settled through the real `x402.org/facilitator`, and confirmed
+      the balance change independently on-chain (20.0 → 19.99 USDC
+      payer, 0 → 0.01 USDC receiver). Caught and fixed a real bug along
+      the way: `accepts[].extra` was missing the `name`/`version`
+      EIP-712 domain fields the facilitator needs (was using `symbol`
+      instead) — the mock facilitator didn't care, but a real one
+      correctly rejected it with `invalid_exact_evm_missing_eip712_domain`
+      until fixed. First real balance-aware test, and it found a spec bug.
 - [ ] **Basic on-chain balance checks.** Right now `evaluate_request`
       trusts the facilitator's `/verify` response entirely — add an
       optional pre-check (RPC `balanceOf` call) so a request with an
