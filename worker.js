@@ -415,7 +415,12 @@ function buildAccepts(rule, priceAtomic, payTo, path, description) {
     payTo: payTo || rule.pay_to,
     maxTimeoutSeconds: 60,
     asset: rule.asset_address || assetAddress(rule.network, rule.asset, null) || rule.asset,
-    extra: { symbol: rule.asset, decimals: 6 }
+    // `name`/`version` are the EIP-712 domain fields a facilitator needs to
+    // reconstruct the signing domain and verify the signature (this is the
+    // spec's actual field naming, confirmed against a live facilitator
+    // response of "invalid_exact_evm_missing_eip712_domain" without it).
+    // USDC and EURC (Circle's FiatTokenV2) both use version "2".
+    extra: { name: rule.asset, version: '2', decimals: 6 }
   }];
 }
 
