@@ -188,10 +188,12 @@ error 1042.
 This proves out rule matching, the 402 handshake, header round-tripping,
 and verify/settle proxying — everything except actual token custody.
 
-### Real USDC flow (next step, not yet exercised)
+### Real USDC flow — verified working
 
 1. Fund a real wallet with testnet USDC on Base Sepolia via
-   [Circle's faucet](https://faucet.circle.com).
+   [Circle's faucet](https://faucet.circle.com). (Double-check the
+   network dropdown says **Base Sepolia** — Circle's faucet also lists
+   Arc and Ethereum Sepolia, and it's an easy mix-up.)
 2. Sign the same `TransferWithAuthorization` structure, but with the
    **real USDC contract** as `verifyingContract`
    (`0x036CbD53842c5426634e7929541eC2318f3dCF7e` on Base Sepolia).
@@ -199,6 +201,16 @@ and verify/settle proxying — everything except actual token custody.
    `https://x402.org/facilitator` (the default) instead of the mock.
 4. Same tool calls, same code path — only the domain and facilitator
    change.
+
+Done for real: a funded wallet paid a live `/api/*` rule through the
+actual `x402.org/facilitator`, and the resulting `0x`-prefixed
+settlement transaction was independently confirmed on Base Sepolia —
+payer balance dropped by exactly the rule's price, receiver balance
+rose by the same amount. This run is also what caught a real bug: the
+`accepts[].extra` field needs `name`/`version` (the EIP-712 domain
+Circle's USDC contract expects), not the `symbol`/`decimals` shape V1
+shipped with — the mock facilitator never checks this, so it only
+surfaced against a real one.
 
 Mainnet is the same again with the mainnet USDC address
 (`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` on Base) and a
