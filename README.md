@@ -391,10 +391,15 @@ roadmap.
 
 ## Security notes & limitations
 
-- **No caller authentication on this Worker's own MCP/REST surface.**
-  Anyone who finds the URL can currently create rules/coupons/tiers.
-  Put this behind Cloudflare Access, a shared-secret header check, or
-  your MCP client's own auth before exposing it beyond trusted callers.
+- **Tool calls require a shared secret.** Every `tools/call` (over
+  `/mcp` or REST `/call`) needs `Authorization: Bearer <token>`
+  matching the `MCP_AUTH_TOKEN` Cloudflare secret. Discovery endpoints
+  (`tools/list`, `GET /status`, `GET /tools`) stay public since they
+  carry no sensitive data. If `MCP_AUTH_TOKEN` isn't set, every call is
+  denied by default rather than silently running open. This is a
+  single shared secret, not per-caller auth or RBAC — anyone with the
+  token has full access to every tool. Rotate it (set a new Cloudflare
+  secret value) if it's ever exposed.
 - **Raw SQL is never exposed as a tool.** All writes go through
   parameterized statements in `worker.js` — there is no `query_d1`-style
   escape hatch.
