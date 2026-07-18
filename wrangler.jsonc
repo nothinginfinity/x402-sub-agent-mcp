@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "x402-sub-agent-mcp",
+  "main": "worker.js",
+  "compatibility_date": "2026-07-18",
+  "workers_dev": true,
+  "vars": {
+    "WORKER_NAME": "x402-sub-agent-mcp",
+    "X402_FACILITATOR_URL": "https://x402.org/facilitator"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "x402-sub-agent-db",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+    }
+  ]
+}
