@@ -403,9 +403,15 @@ roadmap.
 - **Raw SQL is never exposed as a tool.** All writes go through
   parameterized statements in `worker.js` — there is no `query_d1`-style
   escape hatch.
-- **`pay_to` and `asset_address` are taken as given.** V1 doesn't
-  validate checksum or format. Double-check them yourself before
-  pointing a rule at a real wallet.
+- **`pay_to` and `asset_address` get format validation, not checksum
+  validation.** Every write path rejects anything that isn't a
+  `0x`-prefixed 40-hex-character string, and rejects the null address
+  (`0x000...000`) outright. This catches typos, truncation, and
+  garbage input. It does **not** verify EIP-55 mixed-case checksums
+  (that needs Keccak-256, which isn't in Workers' Web Crypto without
+  adding a dependency) — a single transposed character that keeps
+  valid hex shape and case will still pass. Double-check addresses
+  yourself before pointing a rule at a real wallet.
 - **The mock facilitator never checks balance.** A signature from an
   empty wallet passes `/verify` and `/settle` there. It proves the x402
   plumbing works; it proves nothing about custody. Don't mistake a
