@@ -29,6 +29,16 @@ const KNOWN_ASSETS = {
   'base-sepolia:USDC': '0x036CbD53842c5426634e7929541eC2318f3dCF7e'
 };
 
+// Public RPC endpoints used only for the optional balance pre-check in
+// evaluateRequest() below. Best-effort and read-only — never used for
+// anything that requires trust (verification/settlement always goes
+// through the facilitator). A network with no entry here just skips the
+// pre-check and relies on the facilitator's /verify as V1 always did.
+const KNOWN_RPCS = {
+  'base': 'https://mainnet.base.org',
+  'base-sepolia': 'https://sepolia.base.org'
+};
+
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
@@ -356,6 +366,27 @@ const WORKERS_DEV_SERVICE_BINDINGS = {
   'x402-mock-facilitator.jaredtechfit.workers.dev': 'MOCK_FACILITATOR'
 };
 
+// Best-effort ERC-20 balanceOf() read via a public RPC. Returns null
+// (never throws) on any failure — this is a fast-fail optimization,
+// not a trust boundary; the facilitator's /verify remains the
+// authoritative check regardless of what this returns.
+async function getOnChainBalance(rpcUrl, tokenAddress, ownerAddress) {
+  try {
+    const ownerHex = ownerAddress.toLowerCase().replace(/^0x/, '').padStart(64, '0');
+    const data = '0x70a08231' + ownerHex;
+    const res = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: tokenAddress, data }, 'latest'] })
+    });
+    const json = await res.json();
+    if (!json || !json.result || json.result === '0x') return null;
+    return BigInt(json.result);
+  } catch (e) {
+    return null;
+  }
+}
+
 async function facilitatorCall(env, facilitatorUrl, path, body) {
   const base = clean(facilitatorUrl) || env.X402_FACILITATOR_URL || DEFAULT_FACILITATOR;
   const url = base.replace(/\/$/, '') + path;
@@ -522,6 +553,28 @@ async function evaluateRequest(env, a) {
   // 3. Payment already attached?
   if (a.x_payment) {
     const paymentPayload = decodePaymentHeader(clean(a.x_payment));
+
+    // Best-effort on-chain balance pre-check: if we can resolve a known
+    // RPC for this network and the payer's balance is clearly below the
+    // price, fail fast with a clear reason instead of spending a round
+    // trip on the facilitator. Never blocks on RPC failure or an
+    // unrecognized network/asset — the facilitator's /verify remains
+    // authoritative either way.
+    const rpcUrl = KNOWN_RPCS[rule.network];
+    const payerAddress = paymentPayload && paymentPayload.payload && paymentPayload.payload.authorization && paymentPayload.payload.authorization.from;
+    const tokenAddress = accepts[0].asset;
+    if (rpcUrl && payerAddress && /^0x[0-9a-fA-F]{40}$/.test(String(tokenAddress))) {
+      const balance = await getOnChainBalance(rpcUrl, tokenAddress, payerAddress);
+      if (balance !== null && balance < BigInt(priceAtomic)) {
+        await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'denied', price_atomic: priceAtomic, tier_id: tierId, note: 'insufficient_balance_precheck' });
+        return {
+          ok: true, status: 402, access: 'denied',
+          reason: `insufficient on-chain balance: payer has ${balance.toString()} but needs ${priceAtomic} (atomic units, ${rule.asset} on ${rule.network})`,
+          x402Version: X402_VERSION, accepts
+        };
+      }
+    }
+
     const verify = await facilitatorCall(env, a.facilitator_url, '/verify', {
       x402Version: X402_VERSION, paymentPayload, paymentRequirements: accepts[0]
     });
