@@ -609,18 +609,38 @@ async function callTool(env, name, args) {
   }
 }
 
+// MCP clients (including Claude's interactive tool-call path) send
+// `Accept: application/json, text/event-stream` and expect SSE framing
+// back on the Streamable HTTP transport. Returning plain JSON to that
+// Accept header causes the client to silently abandon the session right
+// after `initialize`. wantsSse() + mcpResponse() detect that and frame
+// the same JSON-RPC payload as a single SSE `message` event when asked.
+function wantsSse(req) {
+  const accept = req.headers.get('accept') || '';
+  return accept.includes('text/event-stream');
+}
+
+function mcpResponse(req, payload) {
+  if (!wantsSse(req)) return j(payload);
+  const body = 'event: message\ndata: ' + JSON.stringify(payload) + '\n\n';
+  return new Response(body, {
+    status: 200,
+    headers: { ...CORS, 'content-type': 'text/event-stream;charset=utf-8', 'cache-control': 'no-store' }
+  });
+}
+
 async function handleMcp(req, env) {
   const rpc = await readJson(req);
   const id = rpc.id == null ? null : rpc.id;
   try {
     if (rpc.method === 'initialize') {
-      return j({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: WORKER, version: VERSION } } });
+      return mcpResponse(req, { jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: WORKER, version: VERSION } } });
     }
     if (rpc.method === 'notifications/initialized') {
       return new Response(null, { status: 204, headers: CORS });
     }
-    if (rpc.method === 'ping') return j({ jsonrpc: '2.0', id, result: {} });
-    if (rpc.method === 'tools/list') return j({ jsonrpc: '2.0', id, result: { tools: toolSchemas } });
+    if (rpc.method === 'ping') return mcpResponse(req, { jsonrpc: '2.0', id, result: {} });
+    if (rpc.method === 'tools/list') return mcpResponse(req, { jsonrpc: '2.0', id, result: { tools: toolSchemas } });
     if (rpc.method === 'tools/call') {
       let result;
       try {
@@ -628,11 +648,11 @@ async function handleMcp(req, env) {
       } catch (e) {
         result = { ok: false, error: String(e.message || e) };
       }
-      return j({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result && result.ok === false } });
+      return mcpResponse(req, { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result && result.ok === false } });
     }
-    return j({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
+    return mcpResponse(req, { jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
   } catch (e) {
-    return j({ jsonrpc: '2.0', id, error: { code: -32603, message: String(e.message || e) } });
+    return mcpResponse(req, { jsonrpc: '2.0', id, error: { code: -32603, message: String(e.message || e) } });
   }
 }
 
