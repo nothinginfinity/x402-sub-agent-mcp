@@ -6,6 +6,7 @@ dates would just be wrong.
 
 - [V1 — shipped](#v1--shipped)
 - [V1.1–V1.2 — near-term](#v11v12--near-term)
+- [V1.3 — agent operating balances & denomination UX](#v13--agent-operating-balances--denomination-ux)
 - [V2 — enterprise reserve memberships (mid-term)](#v2--enterprise-reserve-memberships-mid-term)
 - [V3+ — longer-term](#v3--longer-term)
 - [Risks & open questions](#risks--open-questions)
@@ -78,6 +79,58 @@ left open.
       tools.
 - [ ] **Address validation.** Checksum/format validation on `pay_to` and
       `asset_address` at write time, not just "trust the caller."
+
+## V1.3 — agent operating balances & denomination UX
+
+Model the consumable payment side of the agent economy without turning this Worker into a wallet, bank, custodian, stablecoin issuer, or canonical customer-balance ledger.
+
+The product distinction is mandatory:
+
+- **Agent operating balance:** consumable prepaid value. Tool calls reduce it.
+- **Enterprise membership reserve:** refundable principal for a fixed term. Ordinary tool calls do not reduce it; the reserve unlocks fixed entitlements and preferred pricing.
+- **Settlement asset:** the external asset or payment rail used to fund, settle, or redeem balances.
+- **Branded denomination:** a display and marketing label mapped to atomic value; it is not automatically a separate token or liability.
+
+A single balance may be shown as dollars, cents, a Penny/Nickel/Quarter interface, or machine-readable atomic units. A mill is $0.001. Human presentation must never alter settlement math.
+
+### V1.3A — display and policy abstraction
+
+- [ ] Add explicit settlement-asset metadata: asset identifier, network, decimals, facilitator, provider, status, and jurisdiction notes.
+- [ ] Add display-denomination metadata such as `name`, `symbol`, `atomic_value`, `settlement_asset_ref`, and `marketing_only`.
+- [ ] Keep all arithmetic integer-based. Never use floating-point values as the canonical balance or settlement amount.
+- [ ] Let `evaluate_request` return both machine amounts and optional human-display amounts without changing the x402 payment requirement.
+- [ ] Do not reinterpret the existing `internal_tokens` table as a customer-money ledger or proof that this project issued a stablecoin.
+
+### V1.3B — synthetic/testnet operating-balance flow
+
+- [ ] Build or connect a separate mock balance service with signed `authorize`, `reserve`, `commit`, `release`, and `get_receipt` operations.
+- [ ] Keep the canonical balance and double-entry ledger outside this policy Worker. This Worker may cache signed authorization state and settlement receipts only.
+- [ ] Add idempotency keys, expiration, replay protection, maximum-spend limits, and partial-usage settlement.
+- [ ] Test the lifecycle: fund synthetic account → authorize ceiling → execute tool → commit actual usage → release remainder → reconcile receipt.
+- [ ] Support budget policies per agent, organization, tool, route, time period, and maximum single transaction.
+
+### V1.3C — approved settlement partner pilot
+
+This stage begins only after the security and legal gates relevant to stored value, custody, payment transmission, sanctions, fraud, accounting, refunds, and unclaimed property have written answers.
+
+- [ ] Integrate one approved external asset and provider first rather than launching a proprietary token.
+- [ ] Treat USDC, USDT, tokenized deposits, fiat accounts, and any later asset as different adapters with different issuer, custody, redemption, availability, and jurisdiction rules.
+- [ ] Use signed provider attestations and receipts. Do not place custody credentials, private keys, or canonical customer balances in this Worker.
+- [ ] Reconcile customer liabilities, processor/custodian assets, platform fees, compute expense, developer payables, and withdrawals in an independent accounting service.
+- [ ] Prohibit claims that an asset is government-backed, government-issued, official, insured, or deposit-protected unless the exact claim is verified for that asset, issuer, account structure, and jurisdiction.
+
+### V1.3D — marketplace and developer settlement
+
+- [ ] Keep tool discovery, pricing, authorization, usage attribution, developer payable calculation, and actual payout as separate services or modules.
+- [ ] Begin with first-party tools and a small approved partner set before open marketplace onboarding.
+- [ ] Record platform fee and developer payable independently for every call.
+- [ ] Add dispute, refund, fraud, sanctions, tax-document, and negative-balance workflows before broad developer payouts.
+
+### Optional branded on-chain unit research — separate project
+
+A future branded Penny, Quarter, or other on-chain unit may be useful for distribution and marketing, but it is not required for sub-cent x402 pricing. Research it only through a separate issuer/custody/legal project or an approved issuing partner. Branding must not be used to imply government backing, deposit insurance, independent redemption rights, or a new asset when the product is only a display denomination mapped to an existing settlement asset.
+
+See [docs/AGENT-OPERATING-BALANCES.md](./docs/AGENT-OPERATING-BALANCES.md) for the full conceptual architecture.
 
 ## V2 — enterprise reserve memberships (mid-term)
 
@@ -325,6 +378,9 @@ control — not the name used in code.
 - **International expansion multiplies obligations.** Do not infer that
   a U.S. structure works for customers, custodians, or assets in other
   countries.
+- **Operating balances and membership reserves are different liabilities.** A spendable balance decreases through purchases and may create developer payables; a membership reserve remains refundable under its service contract. Do not combine them in product language, accounting, liquidity assumptions, or customer dashboards.
+- **Branding does not change legal or accounting substance.** Calling a unit a Penny, Quarter, credit, token, point, or membership balance does not determine its classification. Transferability, redemption, custody, third-party acceptance, fund flows, and marketing control the real analysis.
+- **Government-backing and insurance claims require exact support.** Reserve assets that include government securities do not make a privately issued stablecoin government-backed. Do not imply sovereign issuance, guarantee, FDIC/SIPC protection, or equivalent protection unless it actually applies to the specific customer claim.
 - **Economics must survive low rates and zero treasury income.** At
   ordinary reserve sizes, treasury income is modest. The service should
   be viable from its fees and metered usage; reserve earnings are a
