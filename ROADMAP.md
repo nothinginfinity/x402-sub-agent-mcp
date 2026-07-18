@@ -62,11 +62,16 @@ left open.
       instead) — the mock facilitator didn't care, but a real one
       correctly rejected it with `invalid_exact_evm_missing_eip712_domain`
       until fixed. First real balance-aware test, and it found a spec bug.
-- [ ] **Basic on-chain balance checks.** Right now `evaluate_request`
-      trusts the facilitator's `/verify` response entirely — add an
-      optional pre-check (RPC `balanceOf` call) so a request with an
-      obviously-insufficient balance can fail fast with a clearer error
-      before hitting the facilitator round-trip.
+- [x] **Basic on-chain balance checks.** ✅ Shipped and verified live:
+      `evaluate_request` now does a best-effort `balanceOf` RPC read
+      (`base`/`base-sepolia` mapped to public RPCs) before calling the
+      facilitator, and denies fast with a clear reason if the payer's
+      balance is obviously below the price. Tested against the real
+      funded wallet — correctly read the true on-chain balance
+      (19990000 atomic, matching independently-verified 19.99 USDC) and
+      denied a $50 request without ever reaching the facilitator. Never
+      blocks on RPC failure or an unrecognized network/asset; the
+      facilitator's `/verify` remains authoritative regardless.
 - [ ] **Enforce `mode: 'upto'` for real.** Currently stored but treated
       identically to `exact`. Needs: resource Worker reports actual
       usage after the fact, sub-agent settles a variable amount up to
