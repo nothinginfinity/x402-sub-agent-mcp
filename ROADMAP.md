@@ -81,8 +81,12 @@ left open.
       if the secret isn't configured. Discovery endpoints (`tools/list`,
       `GET /status`, `GET /tools`) stay public. This is a single shared
       secret, not per-caller auth/RBAC — that's still open for later.
-- [ ] **Address validation.** Checksum/format validation on `pay_to` and
-      `asset_address` at write time, not just "trust the caller."
+- [x] **Address validation.** ✅ Shipped: format validation (`0x` +
+      40 hex chars, null-address rejected) on `pay_to`/`asset_address`
+      across `create_payment_rule`, `update_payment_rule`, and
+      `register_internal_token`. Deliberately format-only, not full
+      EIP-55 checksum — that needs Keccak-256, which would break the
+      worker's zero-dependency design. See README security notes.
 
 ## V1.3 — agent operating balances & denomination UX
 
