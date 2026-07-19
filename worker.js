@@ -418,15 +418,18 @@ async function settlePayment(env, a) {
   const paymentPayload = a.payment_payload || decodePaymentHeader(clean(a.x_payment));
   if (!paymentPayload) throw new Error('x_payment (X-PAYMENT header value) or payment_payload is required');
   if (!a.payment_requirements) throw new Error('payment_requirements is required');
+  const settleStart = Date.now();
   const result = await facilitatorCall(env, a.facilitator_url, '/settle', {
     x402Version: X402_VERSION, paymentPayload, paymentRequirements: a.payment_requirements
   });
+  const settleLatencyMs = Date.now() - settleStart;
   if (result.data && result.data.success) {
     await logUsage(env, {
       route: a.payment_requirements.resource || 'unknown', method: clean(a.method) || '*',
       caller_id: clean(a.caller_id) || null, outcome: 'paid',
       price_atomic: a.payment_requirements.maxAmountRequired, asset: a.payment_requirements.asset,
-      network: a.payment_requirements.network, payment_id: result.data.txHash || null
+      network: a.payment_requirements.network, payment_id: result.data.txHash || null,
+      facilitator_latency_ms: settleLatencyMs, facilitator_http_status: result.httpStatus, facilitator_url: result.facilitator
     });
   }
   return { ok: true, settle: result };
@@ -458,11 +461,16 @@ function buildAccepts(rule, priceAtomic, payTo, path, description) {
 async function logUsage(env, fields) {
   try {
     await dbRun(env, `INSERT INTO usage_events
-        (id, ts, route, method, caller_id, outcome, price_atomic, asset, network, coupon_code, tier_id, payment_id, note)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        (id, ts, route, method, caller_id, outcome, price_atomic, asset, network, coupon_code, tier_id, payment_id, note,
+         duration_ms, facilitator_latency_ms, facilitator_http_status, facilitator_url)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [uid('evt'), nowIso(), fields.route || '', fields.method || '*', fields.caller_id || null, fields.outcome,
         fields.price_atomic || null, fields.asset || null, fields.network || null, fields.coupon_code || null,
-        fields.tier_id || null, fields.payment_id || null, fields.note || null]);
+        fields.tier_id || null, fields.payment_id || null, fields.note || null,
+        fields.duration_ms != null ? Math.round(fields.duration_ms) : null,
+        fields.facilitator_latency_ms != null ? Math.round(fields.facilitator_latency_ms) : null,
+        fields.facilitator_http_status != null ? fields.facilitator_http_status : null,
+        fields.facilitator_url || null]);
   } catch (e) {
     // Usage logging must never break the evaluate/settle path.
   }
@@ -499,6 +507,7 @@ async function findTier(env, callerId, path) {
 }
 
 async function evaluateRequest(env, a) {
+  const requestStart = Date.now();
   const path = clean(a.path);
   const method = (clean(a.method) || 'GET').toUpperCase();
   if (!path) throw new Error('path is required');
@@ -519,7 +528,7 @@ async function evaluateRequest(env, a) {
     if (check.valid) {
       if (coupon.kind === 'free' || coupon.kind === 'trial') {
         await dbRun(env, 'UPDATE coupons SET uses_count = uses_count + 1, updated_at = ? WHERE id = ?', [nowIso(), coupon.id]);
-        await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'coupon_free', coupon_code: coupon.code });
+        await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'coupon_free', coupon_code: coupon.code, duration_ms: Date.now() - requestStart });
         return { ok: true, status: 200, access: 'coupon', coupon_kind: coupon.kind, coupon_code: coupon.code };
       }
       // discount: fall through to paid flow with an adjusted price
@@ -575,7 +584,7 @@ async function evaluateRequest(env, a) {
   }
 
   if (BigInt(priceAtomic || '0') === 0n) {
-    await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'free_rule', tier_id: tierId });
+    await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'free_rule', tier_id: tierId, duration_ms: Date.now() - requestStart });
     return { ok: true, status: 200, access: tierId ? 'free_tier' : 'free_rule', tier_id: tierId };
   }
 
@@ -597,7 +606,7 @@ async function evaluateRequest(env, a) {
     if (rpcUrl && payerAddress && /^0x[0-9a-fA-F]{40}$/.test(String(tokenAddress))) {
       const balance = await getOnChainBalance(rpcUrl, tokenAddress, payerAddress);
       if (balance !== null && balance < BigInt(priceAtomic)) {
-        await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'denied', price_atomic: priceAtomic, tier_id: tierId, note: 'insufficient_balance_precheck' });
+        await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'denied', price_atomic: priceAtomic, tier_id: tierId, note: 'insufficient_balance_precheck', duration_ms: Date.now() - requestStart });
         return {
           ok: true, status: 402, access: 'denied',
           reason: `insufficient on-chain balance: payer has ${balance.toString()} but needs ${priceAtomic} (atomic units, ${rule.asset} on ${rule.network})`,
@@ -608,21 +617,31 @@ async function evaluateRequest(env, a) {
 
     const facilitatorUrl = await resolveFacilitatorUrl(env, a.facilitator_url, rule.network, rule.asset);
 
+    const verifyStart = Date.now();
     const verify = await facilitatorCall(env, facilitatorUrl, '/verify', {
       x402Version: X402_VERSION, paymentPayload, paymentRequirements: accepts[0]
     });
+    const verifyLatencyMs = Date.now() - verifyStart;
     if (!(verify.data && verify.data.isValid !== false && verify.httpOk)) {
-      await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'denied', price_atomic: priceAtomic, tier_id: tierId, note: 'verify_failed' });
+      await logUsage(env, {
+        route: path, method, caller_id: callerId, outcome: 'denied', price_atomic: priceAtomic, tier_id: tierId, note: 'verify_failed',
+        duration_ms: Date.now() - requestStart, facilitator_latency_ms: verifyLatencyMs,
+        facilitator_http_status: verify.httpStatus, facilitator_url: verify.facilitator
+      });
       return { ok: true, status: 402, access: 'denied', reason: 'payment verification failed', verify: verify.data, x402Version: X402_VERSION, accepts };
     }
+    const settleStart = Date.now();
     const settle = await facilitatorCall(env, facilitatorUrl, '/settle', {
       x402Version: X402_VERSION, paymentPayload, paymentRequirements: accepts[0]
     });
+    const settleLatencyMs = Date.now() - settleStart;
     const outcome = settle.data && settle.data.success ? 'paid' : 'denied';
     await logUsage(env, {
       route: path, method, caller_id: callerId, outcome, price_atomic: priceAtomic, asset: rule.asset,
       network: rule.network, coupon_code: appliedCouponCode || null, tier_id: tierId,
-      payment_id: settle.data && settle.data.txHash || null
+      payment_id: settle.data && settle.data.txHash || null,
+      duration_ms: Date.now() - requestStart, facilitator_latency_ms: verifyLatencyMs + settleLatencyMs,
+      facilitator_http_status: settle.httpStatus, facilitator_url: settle.facilitator
     });
     if (outcome !== 'paid') {
       return { ok: true, status: 402, access: 'denied', reason: 'settlement failed', settle: settle.data, x402Version: X402_VERSION, accepts };
@@ -631,7 +650,7 @@ async function evaluateRequest(env, a) {
   }
 
   // 4. No payment attached yet: return the 402 challenge.
-  await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'challenge_402', price_atomic: priceAtomic, tier_id: tierId });
+  await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'challenge_402', price_atomic: priceAtomic, tier_id: tierId, duration_ms: Date.now() - requestStart });
   return { ok: true, status: 402, access: 'payment_required', x402Version: X402_VERSION, error: 'X-PAYMENT-REQUIRED', accepts };
 }
 
@@ -645,17 +664,28 @@ async function getUsageStats(env, a) {
   const byOutcome = {};
   const byRoute = {};
   let paidAtomicTotal = 0n;
+  let facilitatorLatencySum = 0;
+  let facilitatorLatencyCount = 0;
+  let facilitatorLatencyMax = 0;
   for (const r of rows) {
     byOutcome[r.outcome] = (byOutcome[r.outcome] || 0) + 1;
     byRoute[r.route] = (byRoute[r.route] || 0) + 1;
     if (r.outcome === 'paid' && r.price_atomic) {
       try { paidAtomicTotal += BigInt(r.price_atomic); } catch { /* skip non-numeric */ }
     }
+    if (r.facilitator_latency_ms != null) {
+      facilitatorLatencySum += r.facilitator_latency_ms;
+      facilitatorLatencyCount += 1;
+      if (r.facilitator_latency_ms > facilitatorLatencyMax) facilitatorLatencyMax = r.facilitator_latency_ms;
+    }
   }
   return {
     ok: true, window_days: days, event_count: rows.length, by_outcome: byOutcome,
     top_routes: Object.entries(byRoute).sort((a2, b2) => b2[1] - a2[1]).slice(0, 20),
     paid_atomic_total: paidAtomicTotal.toString(),
+    facilitator_latency_ms: facilitatorLatencyCount
+      ? { avg: Math.round(facilitatorLatencySum / facilitatorLatencyCount), max: facilitatorLatencyMax, sample_count: facilitatorLatencyCount }
+      : null,
     recent_events: rows.slice(0, limitNum(a.recent, 25, 0, 200))
   };
 }
