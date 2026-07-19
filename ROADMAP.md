@@ -86,12 +86,17 @@ left open.
       outcome + price but not request duration, facilitator latency, or
       HTTP status from the facilitator call — useful for debugging slow
       or flaky facilitators in production.
-- [ ] **Link `internal_tokens` into rule evaluation automatically.**
-      Right now `register_internal_token` is pure bookkeeping —
-      `evaluate_request` only uses a custom facilitator if you pass
-      `facilitator_url` explicitly per-call. Add a lookup so a rule
-      whose `network`/`asset` matches a registered internal token picks
-      up that token's `facilitator_url` by default.
+- [x] **Link `internal_tokens` into rule evaluation automatically.** ✅
+      Shipped and verified live: `evaluate_request` now resolves
+      `facilitator_url` via a matching `internal_tokens` row
+      (`network`+`asset`, enabled, `facilitator_url` set) whenever the
+      caller doesn't pass one explicitly. Verified two ways against a
+      live registered token pointing at a deliberately-nonexistent
+      domain: (1) omitting `facilitator_url` produced Cloudflare error
+      1016 (DNS failure), proving the auto-resolved bogus URL was
+      actually hit; (2) passing `facilitator_url` explicitly produced a
+      real structured rejection from `x402.org/facilitator` instead —
+      confirming explicit always overrides the internal_token default.
 - [x] **Basic MCP-surface auth.** ✅ Shipped: every `tools/call` (over
       `/mcp` JSON-RPC or REST `/call`) requires `Authorization: Bearer
       <token>`, checked against the `MCP_AUTH_TOKEN` Cloudflare secret
