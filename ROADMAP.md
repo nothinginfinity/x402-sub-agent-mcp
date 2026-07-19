@@ -72,11 +72,16 @@ left open.
       denied a $50 request without ever reaching the facilitator. Never
       blocks on RPC failure or an unrecognized network/asset; the
       facilitator's `/verify` remains authoritative regardless.
-- [ ] **Enforce `mode: 'upto'` for real.** Currently stored but treated
-      identically to `exact`. Needs: resource Worker reports actual
-      usage after the fact, sub-agent settles a variable amount up to
-      the ceiling. Blocks any per-compute-unit or metered pricing from
-      being fully honest.
+- [x] **Enforce `mode: 'upto'` for real.** ✅ Shipped and verified live:
+      an `upto` rule's `price_atomic` is now a ceiling, not a fixed
+      charge. `evaluate_request` accepts `actual_amount_atomic`; when
+      present the charge is clamped to `min(actual, ceiling)` (never
+      more than the ceiling, even if a caller reports more; never
+      negative). Omitting it keeps `upto` behaving exactly like `exact`
+      — fully backward compatible. Tested all four paths live: no
+      actual amount → full ceiling; below ceiling → exact reported
+      amount; above ceiling → clamped down; zero → falls through to the
+      existing free-rule path correctly.
 - [ ] **Improve logging detail.** `usage_events` currently logs
       outcome + price but not request duration, facilitator latency, or
       HTTP status from the facilitator call — useful for debugging slow
