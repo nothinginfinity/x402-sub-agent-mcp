@@ -82,10 +82,20 @@ left open.
       actual amount → full ceiling; below ceiling → exact reported
       amount; above ceiling → clamped down; zero → falls through to the
       existing free-rule path correctly.
-- [ ] **Improve logging detail.** `usage_events` currently logs
-      outcome + price but not request duration, facilitator latency, or
-      HTTP status from the facilitator call — useful for debugging slow
-      or flaky facilitators in production.
+- [x] **Improve logging detail.** ✅ Shipped and verified live:
+      `usage_events` now has `duration_ms`, `facilitator_latency_ms`,
+      `facilitator_http_status`, and `facilitator_url` (D1 migration
+      applied directly, committed as `migrations/0002_...sql` for
+      docs). `evaluateRequest` and `settlePayment` are both
+      instrumented; `get_usage_stats` surfaces avg/max facilitator
+      latency across the window. Verified against real rows: a
+      `challenge_402` event correctly shows a fast `duration_ms` with
+      null facilitator fields (no facilitator touched), and a
+      `verify_failed` event against the real `x402.org/facilitator`
+      shows the full breakdown — 729ms total, 584ms of that specifically
+      the facilitator round-trip, HTTP 200, and which facilitator URL
+      was used. Older rows predating the migration have NULL for the
+      new columns, as expected.
 - [x] **Link `internal_tokens` into rule evaluation automatically.** ✅
       Shipped and verified live: `evaluate_request` now resolves
       `facilitator_url` via a matching `internal_tokens` row
