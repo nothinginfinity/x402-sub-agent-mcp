@@ -620,14 +620,26 @@ async function findMatchingRule(env, path, method) {
 // its own facilitator_url — if so, use that as the default instead of
 // silently falling through to the global default facilitator. This is
 // what makes register_internal_token do something beyond bookkeeping.
-// An explicit facilitator_url always wins; this only fills a gap.
+// Falling short of that, check settlement_assets the same way: it's
+// general "this is how we settle this asset" metadata (V1.3A), whereas
+// internal_tokens represents a more deliberate, specific company-owned
+// override, so internal_tokens is checked first and wins on conflict.
+// A settlement_asset with status 'deprecated' is skipped even if
+// enabled, since 'deprecated' is a stronger signal than 'enabled' that
+// it shouldn't be actively routed through. An explicit facilitator_url
+// passed by the caller always wins over both of these.
 async function resolveFacilitatorUrl(env, explicit, network, asset) {
   const given = clean(explicit);
   if (given) return given;
   const token = await dbFirst(env,
     'SELECT facilitator_url FROM internal_tokens WHERE network = ? AND asset = ? AND enabled = 1 AND facilitator_url IS NOT NULL ORDER BY created_at DESC LIMIT 1',
     [network, asset]);
-  return (token && token.facilitator_url) || explicit;
+  if (token && token.facilitator_url) return token.facilitator_url;
+  const settlementAsset = await dbFirst(env,
+    "SELECT facilitator_url FROM settlement_assets WHERE network = ? AND asset = ? AND enabled = 1 AND status != 'deprecated' AND facilitator_url IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+    [network, asset]);
+  if (settlementAsset && settlementAsset.facilitator_url) return settlementAsset.facilitator_url;
+  return explicit;
 }
 
 async function findTier(env, callerId, path) {
@@ -886,7 +898,7 @@ const toolSchemas = [
   { name: 'list_display_denominations', description: 'List registered display denominations.', inputSchema: obj({ limit: num }) },
   { name: 'update_display_denomination', description: 'Patch a display denomination by id. Changing a label never changes the atomic amount.', inputSchema: obj({ id: str, name: str, symbol: str, atomic_value: str, settlement_asset_ref: str, locale: str, singular_label: str, plural_label: str, marketing_only: boolT, note: str, enabled: boolT }, ['id']) },
 
-  { name: 'evaluate_request', description: "ONE-CALL policy decision for a single incoming request. Given path/method (+ optional caller_id, coupon_code, x_payment header value, bot_auth_verified, compute_units, actual_amount_atomic), returns either status 200 with the access reason (unprotected/free_rule/free_tier/coupon/paid) or status 402/401 with the x402 `accepts` challenge to hand back to the caller. actual_amount_atomic only applies to rules with mode='upto': it reports real usage so the rule's stored price acts as a ceiling rather than a fixed charge (clamped so it never exceeds the ceiling); omit it and an 'upto' rule behaves like 'exact'. facilitator_url is optional: if omitted, a registered internal_token matching the rule's network/asset supplies its facilitator_url automatically; explicit facilitator_url always wins. Machine amounts (price_atomic/asset/network) are always included on priced outcomes; passing display_denomination_id additionally returns a human-readable 'display' block (via a registered display denomination) without changing the machine amount or the x402 payment requirement itself. This is what a protected Worker should call per-request.",
+  { name: 'evaluate_request', description: "ONE-CALL policy decision for a single incoming request. Given path/method (+ optional caller_id, coupon_code, x_payment header value, bot_auth_verified, compute_units, actual_amount_atomic), returns either status 200 with the access reason (unprotected/free_rule/free_tier/coupon/paid) or status 402/401 with the x402 `accepts` challenge to hand back to the caller. actual_amount_atomic only applies to rules with mode='upto': it reports real usage so the rule's stored price acts as a ceiling rather than a fixed charge (clamped so it never exceeds the ceiling); omit it and an 'upto' rule behaves like 'exact'. facilitator_url is optional: if omitted, resolution falls through explicit facilitator_url -> a registered internal_token matching the rule's network/asset -> a registered settlement_asset matching the rule's network/asset (skipped if status='deprecated') -> the global default facilitator; the first one found wins. Machine amounts (price_atomic/asset/network) are always included on priced outcomes; passing display_denomination_id additionally returns a human-readable 'display' block (via a registered display denomination) without changing the machine amount or the x402 payment requirement itself. This is what a protected Worker should call per-request.",
     inputSchema: obj({ path: str, method: str, caller_id: str, coupon_code: str, x_payment: str, bot_auth_verified: boolT, compute_units: num, actual_amount_atomic: str, facilitator_url: str, display_denomination_id: str }, ['path']) },
   { name: 'verify_payment', description: 'Proxy a raw X-PAYMENT payload + payment_requirements to the facilitator /verify endpoint.', inputSchema: obj({ x_payment: str, payment_payload: obj({}), payment_requirements: obj({}), facilitator_url: str }, ['payment_requirements']) },
   { name: 'settle_payment', description: 'Proxy a raw X-PAYMENT payload + payment_requirements to the facilitator /settle endpoint and log the outcome.', inputSchema: obj({ x_payment: str, payment_payload: obj({}), payment_requirements: obj({}), facilitator_url: str, caller_id: str, method: str }, ['payment_requirements']) },
