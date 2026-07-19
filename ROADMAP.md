@@ -142,9 +142,19 @@ A single balance may be shown as dollars, cents, a Penny/Nickel/Quarter interfac
 - [x] Let `evaluate_request` return both machine amounts and optional human-display amounts without changing the x402 payment requirement. Verified live: a $0.80 rule now always returns top-level `price_atomic`/`asset`/`network`; passing `display_denomination_id` additionally returns a `display` block (tested against a registered "Quarter" = 250000 atomic units, correctly returned `"3 quarters + 50000 atomic remainder"`, matching the worked example in docs/AGENT-OPERATING-BALANCES.md). `accepts[]` was confirmed byte-identical with and without `display_denomination_id` passed.
 - [x] Do not reinterpret the existing `internal_tokens` table as a customer-money ledger or proof that this project issued a stablecoin. No code changes to `internal_tokens`; added an explicit code comment at the new settlement/denomination section clarifying the distinction.
 
+### V1.3B.0 — bridge: architecture decision + wiring (before V1.3B)
+
+**Architecture decision (2026-07-19, decided in writing before any code, following the V1.4 MPC-vs-custom precedent):** the V1.3B balance ledger will live in a **new, dedicated sibling Worker** — not folded into `x402-mock-facilitator` and not into this policy Worker's own tables.
+
+Option considered and rejected: extending `x402-mock-facilitator` (which already does real EIP-712 signature verification + fake settlement, stateless, no D1/KV/storage) to also hold balance state. Rejected because it conflates two separable concerns — payment-rail simulation (facilitator) and balance-ledger simulation — that the plane model in docs/AGENT-OPERATING-BALANCES.md deliberately keeps apart. When V1.3C swaps in a real settlement provider, the facilitator piece should be swappable without touching the ledger piece; a merged worker makes that harder to unwind later for a small deploy-count saving now.
+
+- [ ] Scaffold a new empty sibling Worker (name TBD, e.g. `x402-balance-ledger-mock`) at Stage-0 maturity: health check, D1 binding, deploy pipeline green — zero authorize/reserve/commit logic yet. Verify it deploys and responds live before writing any balance code, the same way V1 itself started.
+- [ ] Make `settlement_assets` (shipped in V1.3A) actually load-bearing: let `resolveFacilitatorUrl`/`evaluate_request` optionally consult it for provider/facilitator resolution, the same pattern `internal_tokens` already uses. Closes the loop on V1.3A before more metadata gets layered on top of metadata that nothing reads yet.
+- [ ] Confirm the new sibling Worker's relationship to `x402-mock-facilitator` explicitly: they are peers on the money plane serving different concerns (payment-rail simulation vs. balance-ledger simulation), not a dependency of one on the other. Document this in the new Worker's README before V1.3B logic is added.
+
 ### V1.3B — synthetic/testnet operating-balance flow
 
-- [ ] Build or connect a separate mock balance service with signed `authorize`, `reserve`, `commit`, `release`, and `get_receipt` operations.
+- [ ] Build or connect a separate mock balance service (the sibling Worker scaffolded in V1.3B.0) with signed `authorize`, `reserve`, `commit`, `release`, and `get_receipt` operations.
 - [ ] Keep the canonical balance and double-entry ledger outside this policy Worker. This Worker may cache signed authorization state and settlement receipts only.
 - [ ] Add idempotency keys, expiration, replay protection, maximum-spend limits, and partial-usage settlement.
 - [ ] Test the lifecycle: fund synthetic account → authorize ceiling → execute tool → commit actual usage → release remainder → reconcile receipt.
