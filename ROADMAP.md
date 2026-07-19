@@ -134,13 +134,13 @@ The product distinction is mandatory:
 
 A single balance may be shown as dollars, cents, a Penny/Nickel/Quarter interface, or machine-readable atomic units. A mill is $0.001. Human presentation must never alter settlement math.
 
-### V1.3A — display and policy abstraction
+### V1.3A — display and policy abstraction ✅ shipped 2026-07-19
 
-- [ ] Add explicit settlement-asset metadata: asset identifier, network, decimals, facilitator, provider, status, and jurisdiction notes.
-- [ ] Add display-denomination metadata such as `name`, `symbol`, `atomic_value`, `settlement_asset_ref`, and `marketing_only`.
-- [ ] Keep all arithmetic integer-based. Never use floating-point values as the canonical balance or settlement amount.
-- [ ] Let `evaluate_request` return both machine amounts and optional human-display amounts without changing the x402 payment requirement.
-- [ ] Do not reinterpret the existing `internal_tokens` table as a customer-money ledger or proof that this project issued a stablecoin.
+- [x] Add explicit settlement-asset metadata: asset identifier, network, decimals, facilitator, provider, status, and jurisdiction notes. Shipped as `settlement_assets` table (`migrations/0003_settlement_assets_and_denominations.sql`) + `register/list/update_settlement_asset` tools. Verified live: registered a testnet USDC/base-sepolia entry, confirmed round-trip via `list_settlement_assets`.
+- [x] Add display-denomination metadata such as `name`, `symbol`, `atomic_value`, `settlement_asset_ref`, and `marketing_only`. Shipped as `display_denominations` table + `register/list/update_display_denomination` tools. `marketing_only` defaults to true.
+- [x] Keep all arithmetic integer-based. Never use floating-point values as the canonical balance or settlement amount. `atomic_value` is validated as an integer string (`/^\d+$/`) on both create and update; `buildDisplayAmount()` uses `BigInt` division/modulo only, no floats anywhere in the path.
+- [x] Let `evaluate_request` return both machine amounts and optional human-display amounts without changing the x402 payment requirement. Verified live: a $0.80 rule now always returns top-level `price_atomic`/`asset`/`network`; passing `display_denomination_id` additionally returns a `display` block (tested against a registered "Quarter" = 250000 atomic units, correctly returned `"3 quarters + 50000 atomic remainder"`, matching the worked example in docs/AGENT-OPERATING-BALANCES.md). `accepts[]` was confirmed byte-identical with and without `display_denomination_id` passed.
+- [x] Do not reinterpret the existing `internal_tokens` table as a customer-money ledger or proof that this project issued a stablecoin. No code changes to `internal_tokens`; added an explicit code comment at the new settlement/denomination section clarifying the distinction.
 
 ### V1.3B — synthetic/testnet operating-balance flow
 
