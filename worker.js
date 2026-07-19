@@ -477,6 +477,21 @@ async function findMatchingRule(env, path, method) {
   return null;
 }
 
+// If the caller didn't pass facilitator_url explicitly, check whether a
+// registered internal_token matches this rule's network/asset and has
+// its own facilitator_url — if so, use that as the default instead of
+// silently falling through to the global default facilitator. This is
+// what makes register_internal_token do something beyond bookkeeping.
+// An explicit facilitator_url always wins; this only fills a gap.
+async function resolveFacilitatorUrl(env, explicit, network, asset) {
+  const given = clean(explicit);
+  if (given) return given;
+  const token = await dbFirst(env,
+    'SELECT facilitator_url FROM internal_tokens WHERE network = ? AND asset = ? AND enabled = 1 AND facilitator_url IS NOT NULL ORDER BY created_at DESC LIMIT 1',
+    [network, asset]);
+  return (token && token.facilitator_url) || explicit;
+}
+
 async function findTier(env, callerId, path) {
   if (!callerId) return null;
   const rows = await dbAll(env, 'SELECT * FROM pricing_tiers WHERE caller_id = ? AND enabled = 1 ORDER BY created_at DESC', [callerId]);
@@ -591,14 +606,16 @@ async function evaluateRequest(env, a) {
       }
     }
 
-    const verify = await facilitatorCall(env, a.facilitator_url, '/verify', {
+    const facilitatorUrl = await resolveFacilitatorUrl(env, a.facilitator_url, rule.network, rule.asset);
+
+    const verify = await facilitatorCall(env, facilitatorUrl, '/verify', {
       x402Version: X402_VERSION, paymentPayload, paymentRequirements: accepts[0]
     });
     if (!(verify.data && verify.data.isValid !== false && verify.httpOk)) {
       await logUsage(env, { route: path, method, caller_id: callerId, outcome: 'denied', price_atomic: priceAtomic, tier_id: tierId, note: 'verify_failed' });
       return { ok: true, status: 402, access: 'denied', reason: 'payment verification failed', verify: verify.data, x402Version: X402_VERSION, accepts };
     }
-    const settle = await facilitatorCall(env, a.facilitator_url, '/settle', {
+    const settle = await facilitatorCall(env, facilitatorUrl, '/settle', {
       x402Version: X402_VERSION, paymentPayload, paymentRequirements: accepts[0]
     });
     const outcome = settle.data && settle.data.success ? 'paid' : 'denied';
@@ -694,7 +711,7 @@ const toolSchemas = [
   { name: 'register_internal_token', description: 'Register a company-owned token / internal payment scheme (custom asset + network, optionally your own facilitator_url).', inputSchema: obj({ name: str, scheme: str, network: str, asset: str, asset_address: str, facilitator_url: str, note: str }, ['name', 'network', 'asset']) },
   { name: 'list_internal_tokens', description: 'List registered internal tokens.', inputSchema: obj({ limit: num }) },
 
-  { name: 'evaluate_request', description: "ONE-CALL policy decision for a single incoming request. Given path/method (+ optional caller_id, coupon_code, x_payment header value, bot_auth_verified, compute_units, actual_amount_atomic), returns either status 200 with the access reason (unprotected/free_rule/free_tier/coupon/paid) or status 402/401 with the x402 `accepts` challenge to hand back to the caller. actual_amount_atomic only applies to rules with mode='upto': it reports real usage so the rule's stored price acts as a ceiling rather than a fixed charge (clamped so it never exceeds the ceiling); omit it and an 'upto' rule behaves like 'exact'. This is what a protected Worker should call per-request.",
+  { name: 'evaluate_request', description: "ONE-CALL policy decision for a single incoming request. Given path/method (+ optional caller_id, coupon_code, x_payment header value, bot_auth_verified, compute_units, actual_amount_atomic), returns either status 200 with the access reason (unprotected/free_rule/free_tier/coupon/paid) or status 402/401 with the x402 `accepts` challenge to hand back to the caller. actual_amount_atomic only applies to rules with mode='upto': it reports real usage so the rule's stored price acts as a ceiling rather than a fixed charge (clamped so it never exceeds the ceiling); omit it and an 'upto' rule behaves like 'exact'. facilitator_url is optional: if omitted, a registered internal_token matching the rule's network/asset supplies its facilitator_url automatically; explicit facilitator_url always wins. This is what a protected Worker should call per-request.",
     inputSchema: obj({ path: str, method: str, caller_id: str, coupon_code: str, x_payment: str, bot_auth_verified: boolT, compute_units: num, actual_amount_atomic: str, facilitator_url: str }, ['path']) },
   { name: 'verify_payment', description: 'Proxy a raw X-PAYMENT payload + payment_requirements to the facilitator /verify endpoint.', inputSchema: obj({ x_payment: str, payment_payload: obj({}), payment_requirements: obj({}), facilitator_url: str }, ['payment_requirements']) },
   { name: 'settle_payment', description: 'Proxy a raw X-PAYMENT payload + payment_requirements to the facilitator /settle endpoint and log the outcome.', inputSchema: obj({ x_payment: str, payment_payload: obj({}), payment_requirements: obj({}), facilitator_url: str, caller_id: str, method: str }, ['payment_requirements']) },
