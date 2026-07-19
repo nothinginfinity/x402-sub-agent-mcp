@@ -536,6 +536,22 @@ async function evaluateRequest(env, a) {
     priceAtomic = (BigInt(priceAtomic) * BigInt(100 - discountPct) / 100n).toString();
   }
 
+  // Variable/"upto" pricing: for an 'upto' rule, price_atomic (after any
+  // tier/discount adjustment above) is a ceiling, not a fixed charge. If
+  // the caller reports actual usage via actual_amount_atomic, charge
+  // that instead — clamped so it can never exceed the ceiling and never
+  // go negative. Rules default to the ceiling (identical to 'exact')
+  // when no actual amount is reported, so this stays fully backward
+  // compatible with callers that don't participate in metering.
+  if (rule.mode === 'upto' && a.actual_amount_atomic != null) {
+    const ceiling = BigInt(priceAtomic);
+    let actual = null;
+    try { actual = BigInt(clean(a.actual_amount_atomic)); } catch { /* ignore malformed input, fall back to ceiling */ }
+    if (actual !== null && actual >= 0n) {
+      priceAtomic = (actual > ceiling ? ceiling : actual).toString();
+    }
+  }
+
   if (requiresIdentity && !callerId) {
     return { ok: true, status: 401, access: 'denied', reason: 'this route requires an authenticated caller_id before payment is evaluated' };
   }
@@ -678,8 +694,8 @@ const toolSchemas = [
   { name: 'register_internal_token', description: 'Register a company-owned token / internal payment scheme (custom asset + network, optionally your own facilitator_url).', inputSchema: obj({ name: str, scheme: str, network: str, asset: str, asset_address: str, facilitator_url: str, note: str }, ['name', 'network', 'asset']) },
   { name: 'list_internal_tokens', description: 'List registered internal tokens.', inputSchema: obj({ limit: num }) },
 
-  { name: 'evaluate_request', description: "ONE-CALL policy decision for a single incoming request. Given path/method (+ optional caller_id, coupon_code, x_payment header value, bot_auth_verified, compute_units), returns either status 200 with the access reason (unprotected/free_rule/free_tier/coupon/paid) or status 402/401 with the x402 `accepts` challenge to hand back to the caller. This is what a protected Worker should call per-request.",
-    inputSchema: obj({ path: str, method: str, caller_id: str, coupon_code: str, x_payment: str, bot_auth_verified: boolT, compute_units: num, facilitator_url: str }, ['path']) },
+  { name: 'evaluate_request', description: "ONE-CALL policy decision for a single incoming request. Given path/method (+ optional caller_id, coupon_code, x_payment header value, bot_auth_verified, compute_units, actual_amount_atomic), returns either status 200 with the access reason (unprotected/free_rule/free_tier/coupon/paid) or status 402/401 with the x402 `accepts` challenge to hand back to the caller. actual_amount_atomic only applies to rules with mode='upto': it reports real usage so the rule's stored price acts as a ceiling rather than a fixed charge (clamped so it never exceeds the ceiling); omit it and an 'upto' rule behaves like 'exact'. This is what a protected Worker should call per-request.",
+    inputSchema: obj({ path: str, method: str, caller_id: str, coupon_code: str, x_payment: str, bot_auth_verified: boolT, compute_units: num, actual_amount_atomic: str, facilitator_url: str }, ['path']) },
   { name: 'verify_payment', description: 'Proxy a raw X-PAYMENT payload + payment_requirements to the facilitator /verify endpoint.', inputSchema: obj({ x_payment: str, payment_payload: obj({}), payment_requirements: obj({}), facilitator_url: str }, ['payment_requirements']) },
   { name: 'settle_payment', description: 'Proxy a raw X-PAYMENT payload + payment_requirements to the facilitator /settle endpoint and log the outcome.', inputSchema: obj({ x_payment: str, payment_payload: obj({}), payment_requirements: obj({}), facilitator_url: str, caller_id: str, method: str }, ['payment_requirements']) },
 
