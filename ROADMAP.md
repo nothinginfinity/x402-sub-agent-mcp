@@ -265,6 +265,110 @@ real design question, and it's where the decision below applies.
 - [ ] Don't build this speculatively — revisit once there's a concrete
       autonomous-payment use case in front of us.
 
+**Status (2026-07-19/20): the concrete use case arrived.** V1.4 shipped
+for real -- Circle Developer-Controlled Wallets (2-of-2 MPC, entity
+secret registered and RSA-OAEP-encrypted per call, never stored raw),
+two real testnet wallets created, and both a direct-send tool
+(`circle_transfer`) and the actually-correct gasless path
+(`circle_gasless_transfer`: EIP-3009 `TransferWithAuthorization` signed
+via Circle's `sign/typedData`, settled through the existing x402
+facilitator) live-verified end to end -- real signature, real
+facilitator verify/settle, real on-chain transfer, independently
+confirmed via direct RPC calls and basescan
+(`0xa5b1d89dc99d8d879d67dbaaba18c51a1374af27534d71eb72e289c5d53e1c0d`
+on Base Sepolia). Wallet A never held or needed native gas for this --
+proof the gasless path is the right default for every future agent
+wallet, not `circle_transfer`.
+
+### V1.4.5 -- multi-driver-LLM OAuth access (ChatGPT alongside Claude)
+
+Jared connected this Worker to Claude (already working, via Claude's
+custom-connector "Request headers" field carrying the existing static
+`MCP_AUTH_TOKEN`) and to ChatGPT (attempted). ChatGPT's connector UI
+only supports OAuth or no-auth for remote MCP -- no static bearer-token
+field exists there, confirmed against OpenAI's own docs and developer
+community reports, not assumed. ChatGPT connected with no auth, so
+every tool call correctly failed closed against the existing
+`MCP_AUTH_TOKEN` gate. Fixing this needs a real OAuth 2.1 layer on this
+Worker, not a settings change.
+
+**Decision (2026-07-20, decided in writing before any code, same
+precedent as every other fork in this doc): add a minimal single-user
+OAuth 2.1 compatibility layer, additive only.** The existing
+`MCP_AUTH_TOKEN` static-bearer path is NOT removed, weakened, or
+rotated as part of this work -- Claude keeps working exactly as it does
+today. The Worker's auth gate accepts EITHER the existing static token
+OR a valid OAuth access token issued by this Worker's own minimal
+authorization server, audience-bound to this MCP resource. "Single-user"
+means one login/consent page gated by a password only Jared knows --
+not real multi-tenant user management.
+
+**Scope model (deliberately narrow at launch):**
+- `wallet:read` -> `subagent_status`, `circle_list_wallet_sets`,
+  `circle_list_wallets`, `circle_get_wallet_balance`,
+  `circle_get_transaction`.
+- `wallet:transfer:testnet` -> `circle_gasless_transfer` only.
+- Explicitly NOT exposed via OAuth at launch, at all: `circle_transfer`
+  (the direct-send/gas-requiring path), wallet creation
+  (`circle_create_wallet_set`, `circle_create_wallets`),
+  `circle_fund_wallet`, and every payment-rule/coupon/pricing-tier/
+  internal-token/settlement-asset admin tool. These stay reachable only
+  via the existing static `MCP_AUTH_TOKEN` path (i.e. Claude, driven by
+  Jared) until explicitly widened later, in writing, not by default.
+
+**`circle_gasless_transfer` server-side limits when called via OAuth
+(on top of everything the tool already enforces):**
+- [ ] Testnet blockchain allowlist only -- no mainnet network name
+      accepted from an OAuth-authenticated caller, full stop.
+- [ ] Maximum 1 USDC per transfer operation.
+- [ ] Configurable daily aggregate cap per OAuth client.
+- [ ] `caller_id` defaults to `chatgpt-agent` when invoked through the
+      ChatGPT OAuth client specifically (matches the existing
+      `<driver>:<session>` convention already built into the ledger's
+      `get_caller_spend`/`get_tool_spend` tools).
+- [ ] Audit log entry per transfer: OAuth subject, client ID,
+      `caller_id`, wallet ID, destination, amount, timestamp, Circle
+      transaction ID, settlement result.
+- [ ] Never log or return Circle credentials, wallet secrets,
+      `MCP_AUTH_TOKEN`, signing material, or refresh tokens in any tool
+      output or log line.
+
+**Build components:** OAuth Protected Resource Metadata, OAuth
+Authorization Server Metadata, Authorization Code flow with PKCE
+(S256 only), single-user login/consent page, token exchange, short-lived
+access tokens, rotating refresh tokens with replay detection and
+revocation, `offline_access` support, dynamic client registration (with
+a securely pre-registered fallback if ChatGPT's DCR doesn't cooperate),
+resource/audience binding, state and redirect-URI validation, one-time
+authorization codes, correct `WWW-Authenticate` metadata on 401s. One-time
+codes, refresh-token families, and revocations live in **D1, not KV** --
+security-critical one-time state needs real transactional guarantees,
+not best-effort key-value storage.
+
+**Staged rollout -- each stage live-verified before the next starts:**
+- [ ] **Stage 1:** metadata endpoints, DCR, PKCE auth-code flow, D1-backed
+      token/refresh storage, `wallet:read` wired to its five tools.
+      `wallet:transfer:testnet` defined in the token model but wired to
+      no tool yet -- `circle_gasless_transfer` stays OAuth-unreachable.
+      Verify: discovery metadata, unauthenticated MCP access correctly
+      rejected, authenticated read access works, scope denial on the
+      transfer tool, refresh rotation, replay rejection all pass via
+      curl before calling this stage done.
+- [ ] **Stage 2:** enable `wallet:transfer:testnet`, wire the limits
+      above, then one real 0.01 USDC `circle_gasless_transfer` between
+      two known test wallets -- only after every Stage 1 check and the
+      transfer-limit rejection test have passed, not before.
+- [ ] **Stage 3:** confirm the Circle transaction, surface its
+      transaction ID and on-chain hash once confirmed, confirm the audit
+      event correctly identifies `chatgpt-agent` as the caller.
+
+Before any deployment: files/routes changed, the D1 migration, OAuth
+metadata JSON examples, threat-model notes, and the exact curl tests
+for each check above get written down and shown to Jared first --
+same live-verification discipline as every other change in this repo,
+just with a rollback procedure included given the higher stakes of an
+auth-server change.
+
 ## V2 — enterprise reserve memberships (mid-term)
 
 The V2 product is a **refundable enterprise membership reserve** that
