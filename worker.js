@@ -16,7 +16,7 @@
 // on this for real mainnet money movement — the protocol is still young
 // and facilitator wire formats vary slightly between providers.
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const WORKER = 'x402-sub-agent-mcp';
 const X402_VERSION = 1;
 const DEFAULT_FACILITATOR = 'https://x402.org/facilitator';
@@ -847,6 +847,165 @@ async function recordUsageEvent(env, a) {
 }
 
 // =======================================================================
+// Circle Developer-Controlled Wallets (V1.4 pilot, testnet-only)
+// =======================================================================
+// Real MPC-custodied wallets via Circle's Developer-Controlled Wallets
+// API, added to test the Case-2 (autonomous agent) signing path the
+// ROADMAP explicitly deferred until a concrete use case existed. This
+// is that use case: a small, real, on-chain-verifiable pilot before
+// deciding whether/how to scale the agent roster with real wallets.
+// Only two secrets are ever used: AFO_X402 (the Circle API key,
+// Bearer-authed on every call) and CIRCLE_ENTITY_SECRET (a 32-byte hex
+// value registered with Circle once; a FRESH RSA-OAEP-encrypted
+// ciphertext of it is required on every mutating call, so it's
+// re-encrypted per call below rather than cached). Neither this Worker
+// nor Claude ever sees a raw private key -- Circle's MPC network holds
+// key shares, this Worker only ever sends signing/creation requests.
+const CIRCLE_API_BASE = 'https://api.circle.com/v1/w3s';
+const CIRCLE_FAUCET_URL = 'https://api.circle.com/v1/faucet/drips';
+const DEFAULT_CIRCLE_BLOCKCHAIN = 'BASE-SEPOLIA';
+
+function requireCircleEnv(env) {
+  if (!env.AFO_X402) throw new Error('Circle API key (secret AFO_X402) is not configured on this Worker');
+  if (!env.CIRCLE_ENTITY_SECRET) throw new Error('CIRCLE_ENTITY_SECRET is not configured on this Worker -- register an entity secret with Circle first');
+}
+
+function hexToBytes(hex) {
+  const h = clean(hex).replace(/^0x/, '');
+  const bytes = new Uint8Array(h.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(h.substr(i * 2, 2), 16);
+  return bytes;
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  return btoa(binary);
+}
+
+function pemToDer(pem) {
+  const b64 = pem.replace(/-----BEGIN [^-]+-----/, '').replace(/-----END [^-]+-----/, '').replace(/\s+/g, '');
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function circleFetch(env, method, path, body) {
+  requireCircleEnv(env);
+  const res = await fetch(CIRCLE_API_BASE + path, {
+    method,
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + env.AFO_X402 },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  return { httpStatus: res.status, httpOk: res.ok, data };
+}
+
+// Circle mandates a FRESH entitySecretCiphertext on every mutating call
+// -- reusing one is rejected -- so this re-fetches Circle's current RSA
+// public key and re-encrypts on every call rather than caching a
+// ciphertext. The public key itself changes rarely, but re-fetching is
+// cheap and avoids ever serving a stale key after a rotation.
+async function getCircleEntitySecretCiphertext(env) {
+  requireCircleEnv(env);
+  const pubKeyResp = await circleFetch(env, 'GET', '/config/entity/publicKey');
+  const pem = pubKeyResp.data && pubKeyResp.data.data && pubKeyResp.data.data.publicKey;
+  if (!pem) throw new Error('Could not fetch Circle entity public key: ' + JSON.stringify(pubKeyResp.data));
+  const key = await crypto.subtle.importKey('spki', pemToDer(pem), { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['encrypt']);
+  const secretBytes = hexToBytes(env.CIRCLE_ENTITY_SECRET);
+  const ciphertext = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, key, secretBytes);
+  return bytesToBase64(new Uint8Array(ciphertext));
+}
+
+async function circleCreateWalletSet(env, a) {
+  const name = clean(a.name) || ('afo-set-' + Date.now());
+  const entitySecretCiphertext = await getCircleEntitySecretCiphertext(env);
+  const resp = await circleFetch(env, 'POST', '/developer/walletSets', {
+    idempotencyKey: crypto.randomUUID(), name, entitySecretCiphertext
+  });
+  return { ok: resp.httpOk, http_status: resp.httpStatus, result: resp.data };
+}
+
+async function circleListWalletSets(env, a) {
+  const resp = await circleFetch(env, 'GET', '/developer/walletSets?pageSize=' + limitNum(a.limit, 25, 1, 100));
+  return { ok: resp.httpOk, http_status: resp.httpStatus, result: resp.data };
+}
+
+async function circleCreateWallets(env, a) {
+  const walletSetId = clean(a.wallet_set_id);
+  if (!walletSetId) throw new Error('wallet_set_id is required (create one via circle_create_wallet_set first)');
+  const blockchain = clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN;
+  const count = limitNum(a.count, 1, 1, 20);
+  const entitySecretCiphertext = await getCircleEntitySecretCiphertext(env);
+  const resp = await circleFetch(env, 'POST', '/developer/wallets', {
+    idempotencyKey: crypto.randomUUID(), walletSetId, blockchains: [blockchain], count, entitySecretCiphertext
+  });
+  return { ok: resp.httpOk, http_status: resp.httpStatus, result: resp.data };
+}
+
+async function circleListWallets(env, a) {
+  const params = new URLSearchParams();
+  if (clean(a.wallet_set_id)) params.set('walletSetId', clean(a.wallet_set_id));
+  params.set('pageSize', String(limitNum(a.limit, 50, 1, 100)));
+  const resp = await circleFetch(env, 'GET', '/wallets?' + params.toString());
+  return { ok: resp.httpOk, http_status: resp.httpStatus, result: resp.data };
+}
+
+async function circleGetWalletBalance(env, a) {
+  const walletId = clean(a.wallet_id);
+  if (!walletId) throw new Error('wallet_id is required');
+  const resp = await circleFetch(env, 'GET', '/wallets/' + walletId + '/balances');
+  return { ok: resp.httpOk, http_status: resp.httpStatus, result: resp.data };
+}
+
+// Testnet-only faucet drip. Circle rate-limits this to 20 USDC per
+// address per blockchain every 2 hours -- fine for pilot funding, not a
+// bulk-funding mechanism for a full roster.
+async function circleFundWallet(env, a) {
+  const address = assertValidAddress(a.address, 'address');
+  const blockchain = clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN;
+  requireCircleEnv(env);
+  const res = await fetch(CIRCLE_FAUCET_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + env.AFO_X402 },
+    body: JSON.stringify({ address, blockchain, usdc: a.usdc === false ? false : true, native: a.native === false ? false : true })
+  });
+  const text = await res.text();
+  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  return { ok: res.ok, http_status: res.status, result: data };
+}
+
+async function circleTransfer(env, a) {
+  const walletId = clean(a.wallet_id);
+  if (!walletId) throw new Error('wallet_id (source) is required');
+  const destinationAddress = assertValidAddress(a.destination_address, 'destination_address');
+  const amount = clean(a.amount);
+  if (!amount || !Number.isFinite(Number(amount)) || Number(amount) <= 0) throw new Error('amount is required and must be a positive DECIMAL USDC string, e.g. "0.01" -- not atomic units');
+  const blockchain = clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN;
+  const tokenAddress = assetAddress(blockchain.toLowerCase(), 'USDC', clean(a.token_address) || null);
+  if (!tokenAddress) throw new Error(`No known USDC token address for blockchain '${blockchain}' -- pass token_address explicitly`);
+  const entitySecretCiphertext = await getCircleEntitySecretCiphertext(env);
+  const resp = await circleFetch(env, 'POST', '/developer/transactions/transfer', {
+    idempotencyKey: crypto.randomUUID(), walletId, tokenAddress, tokenBlockchain: blockchain,
+    destinationAddress, amounts: [amount],
+    fee: { type: 'level', config: { feeLevel: clean(a.fee_level) || 'MEDIUM' } },
+    entitySecretCiphertext
+  });
+  return { ok: resp.httpOk, http_status: resp.httpStatus, result: resp.data };
+}
+
+async function circleGetTransaction(env, a) {
+  const transactionId = clean(a.transaction_id);
+  if (!transactionId) throw new Error('transaction_id is required');
+  const resp = await circleFetch(env, 'GET', '/transactions/' + transactionId);
+  return { ok: resp.httpOk, http_status: resp.httpStatus, result: resp.data };
+}
+
+// =======================================================================
 // MCP plumbing
 // =======================================================================
 function status(env) {
@@ -857,7 +1016,7 @@ function status(env) {
     version: VERSION,
     mode: 'x402_policy_engine',
     facilitator_default: env.X402_FACILITATOR_URL || DEFAULT_FACILITATOR,
-    bindings: { DB: !!env.DB, AI: !!env.AI, WORKER_NAME: !!env.WORKER_NAME },
+    bindings: { DB: !!env.DB, AI: !!env.AI, WORKER_NAME: !!env.WORKER_NAME, AFO_X402: !!env.AFO_X402, CIRCLE_ENTITY_SECRET: !!env.CIRCLE_ENTITY_SECRET },
     auth_configured: !!env.MCP_AUTH_TOKEN,
     tools: toolSchemas.map(t => t.name)
   };
@@ -904,7 +1063,20 @@ const toolSchemas = [
   { name: 'settle_payment', description: 'Proxy a raw X-PAYMENT payload + payment_requirements to the facilitator /settle endpoint and log the outcome.', inputSchema: obj({ x_payment: str, payment_payload: obj({}), payment_requirements: obj({}), facilitator_url: str, caller_id: str, method: str }, ['payment_requirements']) },
 
   { name: 'get_usage_stats', description: 'Summarize usage_events over a trailing window: counts by outcome, top routes, total paid (atomic units), and recent events.', inputSchema: obj({ days: num, recent: num }) },
-  { name: 'record_usage_event', description: 'Manually log a usage event (route, outcome, etc) — for cases where settlement happened outside evaluate_request/settle_payment.', inputSchema: obj({ route: str, method: str, caller_id: str, outcome: str, price_atomic: str, asset: str, network: str, coupon_code: str, tier_id: str, payment_id: str, note: str }, ['route', 'outcome']) }
+  { name: 'record_usage_event', description: 'Manually log a usage event (route, outcome, etc) — for cases where settlement happened outside evaluate_request/settle_payment.', inputSchema: obj({ route: str, method: str, caller_id: str, outcome: str, price_atomic: str, asset: str, network: str, coupon_code: str, tier_id: str, payment_id: str, note: str }, ['route', 'outcome']) },
+
+  { name: 'circle_create_wallet_set', description: 'Create a Circle Developer-Controlled Wallets "wallet set" (a named group of MPC wallets sharing one HD seed). Create one before creating wallets. Testnet/sandbox only in this deployment.',
+    inputSchema: obj({ name: str }) },
+  { name: 'circle_list_wallet_sets', description: 'List existing Circle wallet sets.', inputSchema: obj({ limit: num }) },
+  { name: 'circle_create_wallets', description: 'Create one or more real Circle-custodied (MPC) wallets inside a wallet_set_id, on a given blockchain (default BASE-SEPOLIA). Each wallet gets a real on-chain address; no private key is ever exposed to this Worker. count defaults to 1, max 20 per call.',
+    inputSchema: obj({ wallet_set_id: str, count: num, blockchain: str }, ['wallet_set_id']) },
+  { name: 'circle_list_wallets', description: 'List Circle wallets, optionally filtered to one wallet_set_id.', inputSchema: obj({ wallet_set_id: str, limit: num }) },
+  { name: 'circle_get_wallet_balance', description: "Get a Circle wallet's on-chain token balances (by wallet_id).", inputSchema: obj({ wallet_id: str }, ['wallet_id']) },
+  { name: 'circle_fund_wallet', description: "Testnet-only: request free testnet USDC (and native gas token, by default) for a wallet address from Circle's faucet. Rate-limited by Circle to 20 USDC per address per blockchain every 2 hours.",
+    inputSchema: obj({ address: str, blockchain: str, usdc: boolT, native: boolT }, ['address']) },
+  { name: 'circle_transfer', description: 'Send a real on-chain USDC transfer from a Circle-custodied wallet (wallet_id) to any address, on a given blockchain (default BASE-SEPOLIA). amount is a DECIMAL USDC string (e.g. "0.01"), not atomic units. Returns a transaction id -- poll circle_get_transaction for the on-chain tx hash once it confirms (verifiable on a block explorer like basescan).',
+    inputSchema: obj({ wallet_id: str, destination_address: str, amount: str, blockchain: str, token_address: str, fee_level: str }, ['wallet_id', 'destination_address', 'amount']) },
+  { name: 'circle_get_transaction', description: 'Look up a Circle transaction by id -- returns status and, once confirmed, the on-chain txHash you can check on a block explorer.', inputSchema: obj({ transaction_id: str }, ['transaction_id']) }
 ];
 
 async function callTool(env, name, args) {
@@ -935,6 +1107,14 @@ async function callTool(env, name, args) {
     case 'settle_payment': return settlePayment(env, a);
     case 'get_usage_stats': return getUsageStats(env, a);
     case 'record_usage_event': return recordUsageEvent(env, a);
+    case 'circle_create_wallet_set': return circleCreateWalletSet(env, a);
+    case 'circle_list_wallet_sets': return circleListWalletSets(env, a);
+    case 'circle_create_wallets': return circleCreateWallets(env, a);
+    case 'circle_list_wallets': return circleListWallets(env, a);
+    case 'circle_get_wallet_balance': return circleGetWalletBalance(env, a);
+    case 'circle_fund_wallet': return circleFundWallet(env, a);
+    case 'circle_transfer': return circleTransfer(env, a);
+    case 'circle_get_transaction': return circleGetTransaction(env, a);
     default: throw new Error('Unknown tool: ' + name);
   }
 }
