@@ -989,10 +989,16 @@ async function circleTransfer(env, a) {
   const tokenAddress = assetAddress(blockchain.toLowerCase(), 'USDC', clean(a.token_address) || null);
   if (!tokenAddress) throw new Error(`No known USDC token address for blockchain '${blockchain}' -- pass token_address explicitly`);
   const entitySecretCiphertext = await getCircleEntitySecretCiphertext(env);
+  // Note: the raw REST endpoint's field names differ from the SDK's
+  // client-method parameter names (which the earlier version of this
+  // function mistakenly followed) -- confirmed empirically against a
+  // live 400 response: the wire format wants a flat `blockchain` field
+  // paired with `tokenAddress` (not `tokenBlockchain`), and a top-level
+  // `feeLevel` string (not a nested `fee: {type, config}` object).
   const resp = await circleFetch(env, 'POST', '/developer/transactions/transfer', {
-    idempotencyKey: crypto.randomUUID(), walletId, tokenAddress, tokenBlockchain: blockchain,
+    idempotencyKey: crypto.randomUUID(), walletId, tokenAddress, blockchain,
     destinationAddress, amounts: [amount],
-    fee: { type: 'level', config: { feeLevel: clean(a.fee_level) || 'MEDIUM' } },
+    feeLevel: clean(a.fee_level) || 'MEDIUM',
     entitySecretCiphertext
   });
   return { ok: resp.httpOk, http_status: resp.httpStatus, result: resp.data };
