@@ -362,8 +362,9 @@ not best-effort key-value storage.
       two known test wallets -- only after every Stage 1 check and the
       transfer-limit rejection test have passed, not before.
 - [ ] **Stage 3:** confirm the Circle transaction, surface its
-      transaction ID and on-chain hash once confirmed, confirm the audit
-      event correctly identifies `chatgpt-agent` as the caller.
+      transaction ID and on-chain hash once confirmed, and confirm the
+      audit event uses the stable privacy-preserving caller convention
+      `chatgpt:<oauth-subject>` rather than a vague shared identifier.
 - [ ] **Stage 4:** extend the proven pattern into a multi-agent economic
       loop: stable caller identities, budgets, tool-spend attribution,
       and receipts for Claude, ChatGPT, Cloudflare/AFO subagents, and
