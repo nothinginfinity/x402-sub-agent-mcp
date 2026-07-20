@@ -1012,6 +1012,127 @@ async function circleGetTransaction(env, a) {
 }
 
 // =======================================================================
+// Gasless transfers via x402 (EIP-3009 TransferWithAuthorization)
+// =======================================================================
+// This is the actually-correct way to move USDC from a Circle wallet in
+// this system: the wallet SIGNS an authorization (via Circle's
+// sign/typedData endpoint) but never submits anything to the chain
+// itself, so it never needs native gas. A facilitator (the same
+// facilitatorCall() used by verify_payment/settle_payment/
+// evaluate_request) takes the signature and pays gas to submit it. This
+// replaces circle_transfer's direct-send approach (which requires the
+// wallet to hold native gas) for any wallet meant to represent an
+// autonomous agent -- gas-funding every new agent wallet doesn't scale,
+// gasless signing does.
+const CIRCLE_CHAIN_IDS = { 'base': 8453, 'base-sepolia': 84532 };
+
+async function circleGetWallet(env, walletId) {
+  const resp = await circleFetch(env, 'GET', '/wallets/' + walletId);
+  const wallet = resp.data && resp.data.data && resp.data.data.wallet;
+  if (!wallet || !wallet.address) throw new Error('Could not resolve wallet address for wallet_id ' + walletId + ': ' + JSON.stringify(resp.data));
+  return wallet;
+}
+
+async function circleSignTypedData(env, walletId, typedData) {
+  const entitySecretCiphertext = await getCircleEntitySecretCiphertext(env);
+  const resp = await circleFetch(env, 'POST', '/developer/sign/typedData', {
+    walletId, data: JSON.stringify(typedData), entitySecretCiphertext
+  });
+  const signature = resp.data && resp.data.data && resp.data.data.signature;
+  if (!signature) throw new Error('Circle sign/typedData did not return a signature: ' + JSON.stringify(resp.data));
+  return signature;
+}
+
+async function circleGaslessTransfer(env, a) {
+  const walletId = clean(a.wallet_id);
+  if (!walletId) throw new Error('wallet_id (payer) is required');
+  const destinationAddress = assertValidAddress(a.destination_address, 'destination_address');
+  const amount = clean(a.amount);
+  if (!amount || !Number.isFinite(Number(amount)) || Number(amount) <= 0) throw new Error('amount is required and must be a positive decimal USD string, e.g. "0.01"');
+  const blockchain = clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN;
+  const network = blockchain.toLowerCase(); // matches x402/KNOWN_ASSETS network naming
+  const tokenAddress = assetAddress(network, 'USDC', clean(a.token_address) || null);
+  if (!tokenAddress) throw new Error(`No known USDC token address for blockchain '${blockchain}' -- pass token_address explicitly`);
+  const chainId = CIRCLE_CHAIN_IDS[network];
+  if (!chainId) throw new Error(`No known chainId for network '${network}' -- add it to CIRCLE_CHAIN_IDS`);
+
+  const payerWallet = await circleGetWallet(env, walletId);
+  const payerAddress = payerWallet.address;
+
+  const atomicValue = toAtomic(amount, 6);
+  const validAfter = 0;
+  const validBeforeSeconds = limitNum(a.valid_for_seconds, 300, 30, 3600);
+  const validBefore = Math.floor(Date.now() / 1000) + validBeforeSeconds;
+  const nonceBytes = crypto.getRandomValues(new Uint8Array(32));
+  const nonce = '0x' + Array.from(nonceBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  // Standard EIP-3009 TransferWithAuthorization typed data. USDC (and
+  // Circle's EURC, same FiatTokenV2 base) use domain version "2" -- same
+  // constant already relied on in buildAccepts() above.
+  const typedData = {
+    types: {
+      EIP712Domain: [
+        { name: 'name', type: 'string' },
+        { name: 'version', type: 'string' },
+        { name: 'chainId', type: 'uint256' },
+        { name: 'verifyingContract', type: 'address' }
+      ],
+      TransferWithAuthorization: [
+        { name: 'from', type: 'address' },
+        { name: 'to', type: 'address' },
+        { name: 'value', type: 'uint256' },
+        { name: 'validAfter', type: 'uint256' },
+        { name: 'validBefore', type: 'uint256' },
+        { name: 'nonce', type: 'bytes32' }
+      ]
+    },
+    primaryType: 'TransferWithAuthorization',
+    domain: { name: 'USDC', version: '2', chainId, verifyingContract: tokenAddress },
+    message: { from: payerAddress, to: destinationAddress, value: atomicValue, validAfter: String(validAfter), validBefore: String(validBefore), nonce }
+  };
+
+  const signature = await circleSignTypedData(env, walletId, typedData);
+
+  const paymentPayload = {
+    x402Version: X402_VERSION,
+    scheme: 'exact',
+    network,
+    payload: {
+      signature,
+      authorization: { from: payerAddress, to: destinationAddress, value: atomicValue, validAfter: String(validAfter), validBefore: String(validBefore), nonce }
+    }
+  };
+  const paymentRequirements = {
+    scheme: 'exact', network, maxAmountRequired: atomicValue,
+    resource: clean(a.resource) || 'circle-gasless-transfer',
+    description: 'Gasless USDC transfer, signed by a Circle wallet, settled through an x402 facilitator',
+    mimeType: 'application/json', payTo: destinationAddress, maxTimeoutSeconds: 60,
+    asset: tokenAddress, extra: { name: 'USDC', version: '2', decimals: 6 }
+  };
+
+  const verify = await facilitatorCall(env, a.facilitator_url, '/verify', {
+    x402Version: X402_VERSION, paymentPayload, paymentRequirements
+  });
+  if (!(verify.data && verify.data.isValid !== false && verify.httpOk)) {
+    return { ok: false, error: 'payment verification failed', verify: verify.data, payer_address: payerAddress };
+  }
+  const settle = await facilitatorCall(env, a.facilitator_url, '/settle', {
+    x402Version: X402_VERSION, paymentPayload, paymentRequirements
+  });
+  const success = !!(settle.data && settle.data.success);
+  await logUsage(env, {
+    route: paymentRequirements.resource, method: 'CIRCLE_GASLESS', caller_id: clean(a.caller_id) || null,
+    outcome: success ? 'paid' : 'denied', price_atomic: atomicValue, asset: 'USDC', network,
+    payment_id: (settle.data && settle.data.txHash) || null,
+    facilitator_http_status: settle.httpStatus, facilitator_url: settle.facilitator
+  });
+  return {
+    ok: success, payer_address: payerAddress, destination_address: destinationAddress,
+    amount_atomic: atomicValue, verify: verify.data, settle: settle.data
+  };
+}
+
+// =======================================================================
 // MCP plumbing
 // =======================================================================
 function status(env) {
@@ -1082,7 +1203,9 @@ const toolSchemas = [
     inputSchema: obj({ address: str, blockchain: str, usdc: boolT, native: boolT }, ['address']) },
   { name: 'circle_transfer', description: 'Send a real on-chain USDC transfer from a Circle-custodied wallet (wallet_id) to any address, on a given blockchain (default BASE-SEPOLIA). amount is a DECIMAL USDC string (e.g. "0.01"), not atomic units. Returns a transaction id -- poll circle_get_transaction for the on-chain tx hash once it confirms (verifiable on a block explorer like basescan).',
     inputSchema: obj({ wallet_id: str, destination_address: str, amount: str, blockchain: str, token_address: str, fee_level: str }, ['wallet_id', 'destination_address', 'amount']) },
-  { name: 'circle_get_transaction', description: 'Look up a Circle transaction by id -- returns status and, once confirmed, the on-chain txHash you can check on a block explorer.', inputSchema: obj({ transaction_id: str }, ['transaction_id']) }
+  { name: 'circle_get_transaction', description: 'Look up a Circle transaction by id -- returns status and, once confirmed, the on-chain txHash you can check on a block explorer.', inputSchema: obj({ transaction_id: str }, ['transaction_id']) },
+  { name: 'circle_gasless_transfer', description: "Gasless USDC transfer: a Circle wallet SIGNS an EIP-3009 TransferWithAuthorization (via Circle's sign/typedData) but never submits a transaction itself, so it never needs native gas -- an x402 facilitator (default: the same one evaluate_request/settle_payment use) submits it and pays gas. This is the correct way to move funds from an agent's Circle wallet; circle_transfer (direct on-chain send) requires the wallet to hold native gas and should be avoided for agent wallets. amount is a decimal USDC string (e.g. \"0.01\"). Optional valid_for_seconds (default 300, 30-3600) bounds how long the signed authorization remains valid before the facilitator must have submitted it.",
+    inputSchema: obj({ wallet_id: str, destination_address: str, amount: str, blockchain: str, token_address: str, facilitator_url: str, caller_id: str, resource: str, valid_for_seconds: num }, ['wallet_id', 'destination_address', 'amount']) }
 ];
 
 async function callTool(env, name, args) {
@@ -1121,6 +1244,7 @@ async function callTool(env, name, args) {
     case 'circle_fund_wallet': return circleFundWallet(env, a);
     case 'circle_transfer': return circleTransfer(env, a);
     case 'circle_get_transaction': return circleGetTransaction(env, a);
+    case 'circle_gasless_transfer': return circleGaslessTransfer(env, a);
     default: throw new Error('Unknown tool: ' + name);
   }
 }
