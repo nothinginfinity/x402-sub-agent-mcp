@@ -4,6 +4,8 @@ Where `x402-sub-agent-mcp` is now, and where it's headed. Organized by
 milestone rather than a fixed calendar, since this is a solo project and
 dates would just be wrong.
 
+Development and handoff procedure is defined in [DEVFLOW.md](./DEVFLOW.md). The roadmap remains the canonical record of product direction and milestone status; DEVFLOW is the canonical operating guide for Jared and all human or software contributors.
+
 - [V1 — shipped](#v1--shipped)
 - [V1.1–V1.2 — near-term](#v11v12--near-term)
 - [V1.3 — agent operating balances & denomination UX](#v13--agent-operating-balances--denomination-ux)
@@ -322,10 +324,11 @@ not real multi-tenant user management.
       accepted from an OAuth-authenticated caller, full stop.
 - [ ] Maximum 1 USDC per transfer operation.
 - [ ] Configurable daily aggregate cap per OAuth client.
-- [ ] `caller_id` defaults to `chatgpt-agent` when invoked through the
-      ChatGPT OAuth client specifically (matches the existing
-      `<driver>:<session>` convention already built into the ledger's
-      `get_caller_spend`/`get_tool_spend` tools).
+- [ ] `caller_id` defaults to a stable value using the existing
+      `<driver>:<session>` convention when invoked through the ChatGPT
+      OAuth client, for example `chatgpt:oauth-<subject>`, so ledger
+      attribution remains compatible with `get_caller_spend` and
+      `get_tool_spend`.
 - [ ] Audit log entry per transfer: OAuth subject, client ID,
       `caller_id`, wallet ID, destination, amount, timestamp, Circle
       transaction ID, settlement result.
@@ -361,6 +364,16 @@ not best-effort key-value storage.
 - [ ] **Stage 3:** confirm the Circle transaction, surface its
       transaction ID and on-chain hash once confirmed, confirm the audit
       event correctly identifies `chatgpt-agent` as the caller.
+- [ ] **Stage 4:** extend the proven pattern into a multi-agent economic
+      loop: stable caller identities, budgets, tool-spend attribution,
+      and receipts for Claude, ChatGPT, Cloudflare/AFO subagents, and
+      later drivers. Ownership and review are assigned per bounded work
+      item under DEVFLOW, not permanently by model.
+- [ ] **Stage 5:** after the multi-agent loop works, rotate prototype
+      credentials and establish the next security baseline: review token
+      storage and logs, tighten limits, and preserve the verified testnet
+      behavior. Hardening is a graduation gate, not a prerequisite for
+      the personal testnet proof.
 
 Before any deployment: files/routes changed, the D1 migration, OAuth
 metadata JSON examples, threat-model notes, and the exact curl tests
@@ -368,6 +381,12 @@ for each check above get written down and shown to Jared first --
 same live-verification discipline as every other change in this repo,
 just with a rollback procedure included given the higher stakes of an
 auth-server change.
+
+Implementation continuity, contributor signatures, takeover after context
+limits, same-file conflict handling, review roles, and CairnStone recording
+rules are defined in [DEVFLOW.md](./DEVFLOW.md). Contributors may freely
+continue or revise one another's work as long as the source SHA, runtime
+HEAD, semantic change signature, and verification status remain traceable.
 
 ## V2 — enterprise reserve memberships (mid-term)
 
