@@ -1528,7 +1528,13 @@ async function validateAuthorizeRequest(env, params, origin) {
   if (params.resource && !allowedResources.includes(normalizedResource)) {
     return { ok: false, safe_redirect: true, client, redirect_uri: params.redirect_uri, error: 'invalid_target', error_description: 'resource must be ' + origin + ' or ' + origin + '/mcp' };
   }
-  return { ok: true, client, scopes: requestedScopes };
+  // Return the canonical (trailing-slash-stripped) resource so the auth code
+  // and tokens store exactly the form the audience check compares against.
+  // (2026-07-23: Claude.ai sent resource=<origin>/ with a trailing slash;
+  // validation normalized it for the check but the raw slashed value was
+  // stored, so every issued token then failed the audience check -> 401 ->
+  // Claude burned refresh rotations in a loop with zero tool calls.)
+  return { ok: true, client, scopes: requestedScopes, resource: normalizedResource || origin };
 }
 
 function oauthAuthorizeErrorResponse(v, params) {
@@ -1610,7 +1616,7 @@ async function handleAuthorizePost(req, env, origin) {
   await dbRun(env, `INSERT INTO oauth_auth_codes
       (code, client_id, subject, redirect_uri, scope, resource, code_challenge, code_challenge_method, used, expires_at, created_at)
      VALUES (?,?,?,?,?,?,?,?,0,?,?)`,
-    [code, v.client.client_id, subjectRow.subject, params.redirect_uri, grantedScopes.join(' '), params.resource || origin,
+    [code, v.client.client_id, subjectRow.subject, params.redirect_uri, grantedScopes.join(' '), v.resource,
       params.code_challenge, params.code_challenge_method, expiresAt, nowIso()]);
   await oauthAudit(env, 'login_ok', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'code_issued scope=' + grantedScopes.join(' ') });
 
@@ -1755,7 +1761,10 @@ async function authenticate(req, env) {
   // /mcp endpoint URL MCP clients bind to per RFC 8707) -- must mirror the
   // allowedResources set in validateAuthorizeRequest or tokens issued for
   // origin + '/mcp' would be unusable.
-  if (row.resource && row.resource !== origin && row.resource !== origin + '/mcp') return { ok: false }; // audience mismatch
+  // Normalize the STORED value too: tokens issued before the canonical-store
+  // fix carry a trailing slash and must keep working without a re-login.
+  const tokenResource = row.resource ? String(row.resource).replace(/\/+$/, '') : '';
+  if (tokenResource && tokenResource !== origin && tokenResource !== origin + '/mcp') return { ok: false }; // audience mismatch
   // Honest driver attribution per DEVFLOW.local: <driver>:<subject>, driver
   // derived from the registered client name (claude, chatgpt, ...), never a
   // vague shared label. Non [a-z0-9_-] chars (incl. colons) are stripped so
