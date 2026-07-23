@@ -1336,7 +1336,8 @@ const OAUTH_AUTH_CODE_TTL_S = 120;                     // 2 minutes
 const OAUTH_LOGIN_LOCKOUT_THRESHOLD = 5;
 const OAUTH_LOGIN_LOCKOUT_SECONDS = 15 * 60;
 
-const OAUTH_SCOPES_SUPPORTED = ['wallet:read', 'wallet:transfer:testnet', 'offline_access'];
+const OAUTH_ADMIN_SCOPE = 'mcp:admin'; // static-token equivalence; grantable ONLY via the consent-page checkbox, never by client request
+const OAUTH_SCOPES_SUPPORTED = ['wallet:read', 'wallet:transfer:testnet', 'offline_access', OAUTH_ADMIN_SCOPE];
 
 // wallet:read is wired to exactly these 5 read-only tools. wallet:transfer:testnet
 // is intentionally mapped to an EMPTY list this stage.
@@ -1346,7 +1347,13 @@ const OAUTH_SCOPE_TOOLS = {
 };
 
 function oauthToolAllowedForScopes(toolName, grantedScopes) {
-  for (const scope of (grantedScopes || [])) {
+  const scopes = grantedScopes || [];
+  // mcp:admin = static-token equivalence (every tool this Worker exposes),
+  // approved by Jared in writing 2026-07-23. It can only enter a grant via
+  // the consent-page checkbox in handleAuthorizePost --
+  // validateAuthorizeRequest strips it from every client-requested scope.
+  if (scopes.includes(OAUTH_ADMIN_SCOPE)) return true;
+  for (const scope of scopes) {
     const allowed = OAUTH_SCOPE_TOOLS[scope];
     if (allowed && allowed.includes(toolName)) return true;
   }
@@ -1501,11 +1508,16 @@ async function validateAuthorizeRequest(env, params, origin) {
   if (!params.code_challenge || params.code_challenge_method !== 'S256') {
     return { ok: false, safe_redirect: true, client, redirect_uri: params.redirect_uri, error: 'invalid_request', error_description: 'PKCE with code_challenge_method=S256 is required; plain and missing challenges are rejected' };
   }
-  const requestedScopes = (params.scope || 'wallet:read').split(/\s+/).filter(Boolean);
-  const invalidScope = requestedScopes.find(s => !OAUTH_SCOPES_SUPPORTED.includes(s));
-  if (invalidScope || !requestedScopes.length) {
-    return { ok: false, safe_redirect: true, client, redirect_uri: params.redirect_uri, error: 'invalid_scope', error_description: 'unsupported scope: ' + (invalidScope || '(empty)') };
-  }
+  // Interop scope negotiation (2026-07-23): clients like Claude.ai send
+  // proprietary scope strings (Claude sends literally "claudeai") and abort
+  // the whole connector flow when the server answers invalid_scope. Filter
+  // the request down to supported scopes instead of hard-failing; if nothing
+  // supported remains, fall back to the read-only default. mcp:admin is
+  // stripped here unconditionally -- a client cannot request its way into
+  // admin; only the human checkbox on the consent page can add it.
+  const rawScopes = (params.scope || '').split(/\s+/).filter(Boolean);
+  let requestedScopes = rawScopes.filter(s => OAUTH_SCOPES_SUPPORTED.includes(s) && s !== OAUTH_ADMIN_SCOPE);
+  if (!requestedScopes.length) requestedScopes = ['wallet:read', 'offline_access'];
   if (params.resource && params.resource !== origin) {
     return { ok: false, safe_redirect: true, client, redirect_uri: params.redirect_uri, error: 'invalid_target', error_description: 'resource must be ' + origin };
   }
@@ -1534,6 +1546,7 @@ function renderLoginForm(params, client, errorMsg) {
   button { width: 100%; padding: 10px; font-size: 16px; }
   .err { color: #b00020; }
   .scope { color: #444; font-size: 14px; }
+  .admin { display: block; margin: 8px 0 14px; font-size: 14px; color: #444; }
 </style></head><body>
   <h2>Authorize ${escapeHtml(client.client_name || client.client_id)}</h2>
   <p class="scope">Requesting scope: <b>${escapeHtml(params.scope || 'wallet:read')}</b></p>
@@ -1541,6 +1554,7 @@ function renderLoginForm(params, client, errorMsg) {
   <form method="POST" action="/authorize">
     ${hidden}
     <input type="password" name="password" placeholder="Password" autofocus required>
+    <label class="admin"><input type="checkbox" name="grant_admin" value="1"> Also grant full admin access (mcp:admin — every tool, static-token equivalence)</label>
     <button type="submit">Authorize</button>
   </form>
 </body></html>`;
@@ -1579,14 +1593,19 @@ async function handleAuthorizePost(req, env, origin) {
   }
   await dbRun(env, 'UPDATE oauth_subjects SET failed_attempts = 0, locked_until = NULL WHERE subject = ?', [subjectRow.subject]);
 
+  // The admin grant comes ONLY from this human-submitted checkbox -- it is
+  // never accepted from the client's requested scope string.
+  const grantAdmin = String(form.get('grant_admin') || '') === '1';
+  const grantedScopes = grantAdmin ? [...v.scopes, OAUTH_ADMIN_SCOPE] : v.scopes;
+
   const code = randomB64url(32);
   const expiresAt = new Date(nowMs + OAUTH_AUTH_CODE_TTL_S * 1000).toISOString();
   await dbRun(env, `INSERT INTO oauth_auth_codes
       (code, client_id, subject, redirect_uri, scope, resource, code_challenge, code_challenge_method, used, expires_at, created_at)
      VALUES (?,?,?,?,?,?,?,?,0,?,?)`,
-    [code, v.client.client_id, subjectRow.subject, params.redirect_uri, v.scopes.join(' '), params.resource || origin,
+    [code, v.client.client_id, subjectRow.subject, params.redirect_uri, grantedScopes.join(' '), params.resource || origin,
       params.code_challenge, params.code_challenge_method, expiresAt, nowIso()]);
-  await oauthAudit(env, 'login_ok', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'code_issued scope=' + v.scopes.join(' ') });
+  await oauthAudit(env, 'login_ok', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'code_issued scope=' + grantedScopes.join(' ') });
 
   const redirectUrl = new URL(params.redirect_uri);
   redirectUrl.searchParams.set('code', code);
@@ -1708,7 +1727,7 @@ async function handleRevokeEndpoint(req, env) {
 // ---- access-token verification + combined auth gate ----
 async function verifyOauthAccessToken(env, rawToken) {
   const tokenHash = await sha256Hex(rawToken);
-  const row = await dbFirst(env, 'SELECT * FROM oauth_access_tokens WHERE token_hash = ?', [tokenHash]);
+  const row = await dbFirst(env, 'SELECT t.*, c.client_name FROM oauth_access_tokens t LEFT JOIN oauth_clients c ON c.client_id = t.client_id WHERE t.token_hash = ?', [tokenHash]);
   if (!row) return null;
   if (row.revoked) return null;
   if (new Date(row.expires_at).getTime() < Date.now()) return null;
@@ -1726,7 +1745,12 @@ async function authenticate(req, env) {
   if (!row) return { ok: false };
   const origin = new URL(req.url).origin;
   if (row.resource && row.resource !== origin) return { ok: false }; // audience mismatch
-  return { ok: true, mode: 'oauth', subject: row.subject, client_id: row.client_id, scope: (row.scope || '').split(/\s+/).filter(Boolean) };
+  // Honest driver attribution per DEVFLOW.local: <driver>:<subject>, driver
+  // derived from the registered client name (claude, chatgpt, ...), never a
+  // vague shared label. Non [a-z0-9_-] chars (incl. colons) are stripped so
+  // the <driver>:<subject> convention stays unambiguous.
+  const driver = String(row.client_name || 'oauth').toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'oauth';
+  return { ok: true, mode: 'oauth', subject: row.subject, client_id: row.client_id, driver, scope: (row.scope || '').split(/\s+/).filter(Boolean) };
 }
 
 
@@ -1762,10 +1786,10 @@ async function handleMcp(req, env) {
       let result;
       try {
         result = await callTool(env, toolName, (rpc.params && rpc.params.arguments) || {});
-        if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=chatgpt:' + auth.subject + ' outcome=ok' });
+        if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=' + auth.driver + ':' + auth.subject + ' outcome=ok' });
       } catch (e) {
         result = { ok: false, error: String(e.message || e) };
-        if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=chatgpt:' + auth.subject + ' outcome=error: ' + result.error });
+        if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=' + auth.driver + ':' + auth.subject + ' outcome=error: ' + result.error });
       }
       return mcpResponse(req, { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result && result.ok === false } });
     }
@@ -1827,7 +1851,7 @@ export default {
         }
         try {
           const result = await callTool(env, body.name, body.arguments || {});
-          if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: body.name, detail: 'caller_id=chatgpt:' + auth.subject + ' outcome=ok' });
+          if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: body.name, detail: 'caller_id=' + auth.driver + ':' + auth.subject + ' outcome=ok' });
           return j(result);
         } catch (e) { return j({ ok: false, error: String(e.message || e) }, 200); }
       }
