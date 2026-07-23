@@ -6,6 +6,8 @@ dates would just be wrong.
 
 Development and handoff procedure is defined in [DEVFLOW.md](./DEVFLOW.md). The roadmap remains the canonical record of product direction and milestone status; DEVFLOW is the canonical operating guide for Jared and all human or software contributors.
 
+**Standing decision (2026-07-20, Jared):** `nothinginfinity/afo-devflow` is a deliberate, permanent cross-repo pattern, not a one-off for this project. It exists so any new AFO repo -- and any agent (Claude, ChatGPT, or otherwise) working in one -- gets the same continuity/verification/HEAD discipline by adopting the canonical spec via a short `DEVFLOW.md` pointer, instead of re-deriving or re-explaining these conventions per repo. New AFO repos going forward should adopt `afo-devflow` the same way this one does, rather than growing their own bespoke process docs from scratch.
+
 - [V1 — shipped](#v1--shipped)
 - [V1.1–V1.2 — near-term](#v11v12--near-term)
 - [V1.3 — agent operating balances & denomination UX](#v13--agent-operating-balances--denomination-ux)
