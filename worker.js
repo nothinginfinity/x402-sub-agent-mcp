@@ -1754,27 +1754,47 @@ async function authenticate(req, env) {
 }
 
 
+// Unauthenticated 401 helper: every gated MCP method must answer with a
+// WWW-Authenticate header pointing at the protected-resource metadata, or
+// clients (Claude.ai included) never learn this server speaks OAuth and so
+// never start the authorization flow.
+function mcpUnauthorized(req, id, origin) {
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32001, message: 'unauthorized: missing or invalid bearer token' } }), {
+    status: 401,
+    headers: { ...CORS, 'content-type': 'application/json;charset=utf-8', 'cache-control': 'no-store', 'www-authenticate': wwwAuthenticateHeader(origin) }
+  });
+}
+
 async function handleMcp(req, env) {
   const rpc = await readJson(req);
   const id = rpc.id == null ? null : rpc.id;
   try {
-    if (rpc.method === 'initialize') {
-      return mcpResponse(req, { jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: WORKER, version: VERSION } } });
-    }
+    const origin = new URL(req.url).origin;
+
+    // notifications/initialized and ping stay open: the first is a fire-and-
+    // forget notification sent before a token is ever held, the second is a
+    // liveness probe that leaks nothing.
     if (rpc.method === 'notifications/initialized') {
       return new Response(null, { status: 204, headers: CORS });
     }
     if (rpc.method === 'ping') return mcpResponse(req, { jsonrpc: '2.0', id, result: {} });
-    if (rpc.method === 'tools/list') return mcpResponse(req, { jsonrpc: '2.0', id, result: { tools: toolSchemas } });
-    if (rpc.method === 'tools/call') {
-      const origin = new URL(req.url).origin;
+
+    // initialize and tools/list are gated. initialize especially: returning
+    // 200 here made the handshake look complete, so discovery never ran and
+    // the client registered a server whose every tool call then 401'd.
+    if (rpc.method === 'initialize') {
       const auth = await authenticate(req, env);
-      if (!auth.ok) {
-        return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32001, message: 'unauthorized: missing or invalid bearer token' } }), {
-          status: 401,
-          headers: { ...CORS, 'content-type': 'application/json;charset=utf-8', 'cache-control': 'no-store', 'www-authenticate': wwwAuthenticateHeader(origin) }
-        });
-      }
+      if (!auth.ok) return mcpUnauthorized(req, id, origin);
+      return mcpResponse(req, { jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: WORKER, version: VERSION } } });
+    }
+    if (rpc.method === 'tools/list') {
+      const auth = await authenticate(req, env);
+      if (!auth.ok) return mcpUnauthorized(req, id, origin);
+      return mcpResponse(req, { jsonrpc: '2.0', id, result: { tools: toolSchemas } });
+    }
+    if (rpc.method === 'tools/call') {
+      const auth = await authenticate(req, env);
+      if (!auth.ok) return mcpUnauthorized(req, id, origin);
       const toolName = rpc.params && rpc.params.name;
       if (auth.mode === 'oauth' && !oauthToolAllowedForScopes(toolName, auth.scope)) {
         await oauthAudit(env, 'scope_denied', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'scope=' + auth.scope.join(' ') });
@@ -1806,13 +1826,21 @@ export default {
     try {
       if (url.pathname === '/' || url.pathname === '/status' || url.pathname === '/health') return j(status(env));
       if (url.pathname === '/tools') return j({ ok: true, tools: toolSchemas });
-      if (url.pathname === '/mcp') return handleMcp(req, env);
+      if (url.pathname === '/mcp') {
+        // GET has no JSON-RPC body: routing it into handleMcp produced a
+        // bogus -32601 'Method not found' frame. 405 is the correct answer
+        // for a server that exposes no server-initiated SSE stream.
+        if (req.method === 'GET') {
+          return new Response('Method Not Allowed', { status: 405, headers: { ...CORS, 'Allow': 'POST, OPTIONS' } });
+        }
+        return handleMcp(req, env);
+      }
 
       // ---- OAuth 2.1 Stage 1 (V1.4.5) -----------------------------------
       if (url.pathname === '/.well-known/oauth-protected-resource' || url.pathname === '/.well-known/oauth-protected-resource/mcp') {
         return j(protectedResourceMetadata(url.origin));
       }
-      if (url.pathname === '/.well-known/oauth-authorization-server') {
+      if (url.pathname === '/.well-known/oauth-authorization-server' || url.pathname === '/.well-known/oauth-authorization-server/mcp') {
         return j(authServerMetadata(url.origin));
       }
       if (url.pathname === '/register' && req.method === 'POST') {
