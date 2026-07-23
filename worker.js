@@ -1401,9 +1401,9 @@ function wwwAuthenticateHeader(origin, error, description) {
 }
 
 // ---- discovery metadata ----
-function protectedResourceMetadata(origin) {
+function protectedResourceMetadata(origin, resource) {
   return {
-    resource: origin,
+    resource: resource || origin,
     authorization_servers: [origin],
     bearer_methods_supported: ['header'],
     scopes_supported: OAUTH_SCOPES_SUPPORTED
@@ -1518,8 +1518,15 @@ async function validateAuthorizeRequest(env, params, origin) {
   const rawScopes = (params.scope || '').split(/\s+/).filter(Boolean);
   let requestedScopes = rawScopes.filter(s => OAUTH_SCOPES_SUPPORTED.includes(s) && s !== OAUTH_ADMIN_SCOPE);
   if (!requestedScopes.length) requestedScopes = ['wallet:read', 'offline_access'];
-  if (params.resource && params.resource !== origin) {
-    return { ok: false, safe_redirect: true, client, redirect_uri: params.redirect_uri, error: 'invalid_target', error_description: 'resource must be ' + origin };
+  // RFC 8707 resource indicators (2026-07-23): MCP clients -- Claude.ai
+  // observed live -- send the full MCP endpoint URL (origin + '/mcp') as the
+  // resource, not the bare origin. Stage 1 only accepted the bare origin,
+  // which 302-aborted Claude's flow with invalid_target before the login
+  // page ever rendered. Accept both canonical forms; reject anything else.
+  const allowedResources = [origin, origin + '/mcp'];
+  const normalizedResource = params.resource ? params.resource.replace(/\/+$/, '') : '';
+  if (params.resource && !allowedResources.includes(normalizedResource)) {
+    return { ok: false, safe_redirect: true, client, redirect_uri: params.redirect_uri, error: 'invalid_target', error_description: 'resource must be ' + origin + ' or ' + origin + '/mcp' };
   }
   return { ok: true, client, scopes: requestedScopes };
 }
@@ -1744,7 +1751,11 @@ async function authenticate(req, env) {
   const row = await verifyOauthAccessToken(env, token);
   if (!row) return { ok: false };
   const origin = new URL(req.url).origin;
-  if (row.resource && row.resource !== origin) return { ok: false }; // audience mismatch
+  // Audience: accept both canonical resource forms (bare origin and the
+  // /mcp endpoint URL MCP clients bind to per RFC 8707) -- must mirror the
+  // allowedResources set in validateAuthorizeRequest or tokens issued for
+  // origin + '/mcp' would be unusable.
+  if (row.resource && row.resource !== origin && row.resource !== origin + '/mcp') return { ok: false }; // audience mismatch
   // Honest driver attribution per DEVFLOW.local: <driver>:<subject>, driver
   // derived from the registered client name (claude, chatgpt, ...), never a
   // vague shared label. Non [a-z0-9_-] chars (incl. colons) are stripped so
@@ -1838,7 +1849,10 @@ export default {
 
       // ---- OAuth 2.1 Stage 1 (V1.4.5) -----------------------------------
       if (url.pathname === '/.well-known/oauth-protected-resource' || url.pathname === '/.well-known/oauth-protected-resource/mcp') {
-        return j(protectedResourceMetadata(url.origin));
+        // RFC 9728 path-aware metadata: the /mcp variant describes the /mcp
+        // resource, matching what MCP clients will send as their resource
+        // indicator. The bare variant keeps describing the bare origin.
+        return j(protectedResourceMetadata(url.origin, url.pathname.endsWith('/mcp') ? url.origin + '/mcp' : url.origin));
       }
       if (url.pathname === '/.well-known/oauth-authorization-server' || url.pathname === '/.well-known/oauth-authorization-server/mcp') {
         return j(authServerMetadata(url.origin));
