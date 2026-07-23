@@ -1145,6 +1145,7 @@ function status(env) {
     facilitator_default: env.X402_FACILITATOR_URL || DEFAULT_FACILITATOR,
     bindings: { DB: !!env.DB, AI: !!env.AI, WORKER_NAME: !!env.WORKER_NAME, AFO_X402: !!env.AFO_X402, CIRCLE_ENTITY_SECRET: !!env.CIRCLE_ENTITY_SECRET },
     auth_configured: !!env.MCP_AUTH_TOKEN,
+    oauth_configured: !!env.OAUTH_LOGIN_PASSWORD,
     tools: toolSchemas.map(t => t.name)
   };
 }
@@ -1301,10 +1302,433 @@ function authErrorPayload(env) {
   return {
     ok: false,
     error: configured
-      ? 'unauthorized: missing or invalid Authorization: Bearer <token> header'
+      ? 'unauthorized: missing or invalid Authorization: Bearer <token> header, OR a valid OAuth access token'
       : 'unauthorized: MCP_AUTH_TOKEN is not configured on this Worker yet, so all tool calls are denied by default'
   };
 }
+
+// =======================================================================
+// V1.4.5 Stage 1 -- minimal single-user OAuth 2.1 compatibility layer
+// =======================================================================
+// Additive only. MCP_AUTH_TOKEN keeps working completely unchanged --
+// authenticate() below accepts EITHER the static bearer OR a valid OAuth
+// access token issued by this Worker's own minimal authorization server.
+//
+// Scope model (deliberately narrow):
+//   wallet:read              -> subagent_status, circle_list_wallet_sets,
+//                                circle_list_wallets, circle_get_wallet_balance,
+//                                circle_get_transaction.
+//   wallet:transfer:testnet  -> defined in the token model, wired to NO tool
+//                                this stage. circle_gasless_transfer and every
+//                                other tool stay OAuth-unreachable; they remain
+//                                reachable only via the existing static
+//                                MCP_AUTH_TOKEN path (Claude, driven by Jared).
+//
+// One-time state (authorization codes, refresh-token families, revocations)
+// lives in D1, never KV, for real transactional guarantees. Tokens are
+// stored as SHA-256 hashes only -- the raw value is returned to the client
+// once and never persisted or logged in plaintext.
+// =======================================================================
+
+const OAUTH_ACCESS_TOKEN_TTL_S = 900;                  // 15 minutes
+const OAUTH_REFRESH_TOKEN_TTL_S = 60 * 60 * 24 * 30;   // 30 days
+const OAUTH_AUTH_CODE_TTL_S = 120;                     // 2 minutes
+const OAUTH_LOGIN_LOCKOUT_THRESHOLD = 5;
+const OAUTH_LOGIN_LOCKOUT_SECONDS = 15 * 60;
+
+const OAUTH_SCOPES_SUPPORTED = ['wallet:read', 'wallet:transfer:testnet', 'offline_access'];
+
+// wallet:read is wired to exactly these 5 read-only tools. wallet:transfer:testnet
+// is intentionally mapped to an EMPTY list this stage.
+const OAUTH_SCOPE_TOOLS = {
+  'wallet:read': ['subagent_status', 'circle_list_wallet_sets', 'circle_list_wallets', 'circle_get_wallet_balance', 'circle_get_transaction'],
+  'wallet:transfer:testnet': []
+};
+
+function oauthToolAllowedForScopes(toolName, grantedScopes) {
+  for (const scope of (grantedScopes || [])) {
+    const allowed = OAUTH_SCOPE_TOOLS[scope];
+    if (allowed && allowed.includes(toolName)) return true;
+  }
+  return false;
+}
+
+// ---- crypto / encoding helpers ----
+function b64urlFromBytes(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function randomB64url(numBytes) {
+  const bytes = new Uint8Array(numBytes);
+  crypto.getRandomValues(bytes);
+  return b64urlFromBytes(bytes);
+}
+function randomHex(numBytes) {
+  const bytes = new Uint8Array(numBytes);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function sha256B64url(input) {
+  const data = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+  const digestBuf = await crypto.subtle.digest('SHA-256', data);
+  return b64urlFromBytes(new Uint8Array(digestBuf));
+}
+async function sha256Hex(input) {
+  const data = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+  const digestBuf = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digestBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function htmlResponse(bodyHtml, status = 200) {
+  return new Response(bodyHtml, { status, headers: { ...CORS, 'content-type': 'text/html;charset=utf-8', 'cache-control': 'no-store' } });
+}
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function wwwAuthenticateHeader(origin, error, description) {
+  let v = 'Bearer resource_metadata="' + origin + '/.well-known/oauth-protected-resource"';
+  if (error) v += ', error="' + error + '"';
+  if (description) v += ', error_description="' + String(description).replace(/"/g, "'") + '"';
+  return v;
+}
+
+// ---- discovery metadata ----
+function protectedResourceMetadata(origin) {
+  return {
+    resource: origin,
+    authorization_servers: [origin],
+    bearer_methods_supported: ['header'],
+    scopes_supported: OAUTH_SCOPES_SUPPORTED
+  };
+}
+function authServerMetadata(origin) {
+  return {
+    issuer: origin,
+    authorization_endpoint: origin + '/authorize',
+    token_endpoint: origin + '/token',
+    registration_endpoint: origin + '/register',
+    revocation_endpoint: origin + '/revoke',
+    scopes_supported: OAUTH_SCOPES_SUPPORTED,
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_post']
+  };
+}
+
+// ---- subject (single opaque user record) ----
+async function getOrCreateSubject(env) {
+  let row = await dbFirst(env, 'SELECT * FROM oauth_subjects LIMIT 1');
+  if (row) return row;
+  const subject = randomHex(16); // 128-bit -> lowercase 32-hex
+  await dbRun(env, 'INSERT INTO oauth_subjects (subject, label, failed_attempts, locked_until, created_at) VALUES (?,?,0,NULL,?)', [subject, 'jared', nowIso()]);
+  return await dbFirst(env, 'SELECT * FROM oauth_subjects WHERE subject = ?', [subject]);
+}
+
+// ---- audit (best-effort; must never break the request it's logging) ----
+async function oauthAudit(env, event, opts) {
+  const o = opts || {};
+  try {
+    await dbRun(env, 'INSERT INTO oauth_audit_log (id, event, subject, client_id, tool_name, detail, created_at) VALUES (?,?,?,?,?,?,?)',
+      [uid('oaud'), event, o.subject || null, o.client_id || null, o.tool_name || null, o.detail || null, nowIso()]);
+  } catch (e) { /* audit logging is best-effort */ }
+}
+
+// ---- dynamic client registration (RFC 7591) ----
+async function registerOauthClient(env, body) {
+  const b = body || {};
+  const redirectUris = Array.isArray(b.redirect_uris) ? b.redirect_uris.filter(Boolean) : [];
+  if (!redirectUris.length) throw new Error('redirect_uris is required and must be a non-empty array');
+  for (const uriStr of redirectUris) {
+    let parsed;
+    try { parsed = new URL(uriStr); } catch { throw new Error('invalid redirect_uri: ' + uriStr); }
+    const isLocalHttp = parsed.protocol === 'http:' && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1');
+    if (parsed.protocol !== 'https:' && !isLocalHttp) throw new Error('redirect_uri must be https (or http on localhost): ' + uriStr);
+  }
+  const authMethod = clean(b.token_endpoint_auth_method) || 'none';
+  if (!['none', 'client_secret_post'].includes(authMethod)) throw new Error("token_endpoint_auth_method must be 'none' or 'client_secret_post'");
+  const clientId = 'oauth_' + randomB64url(12);
+  let clientSecretHash = null;
+  let clientSecretPlain = null;
+  if (authMethod === 'client_secret_post') {
+    clientSecretPlain = randomB64url(32);
+    clientSecretHash = await sha256Hex(clientSecretPlain);
+  }
+  const clientName = clean(b.client_name) || 'OAuth client';
+  await dbRun(env, `INSERT INTO oauth_clients
+      (client_id, client_name, client_secret_hash, redirect_uris, token_endpoint_auth_method, grant_types, response_types, registration_source, enabled, created_at)
+     VALUES (?,?,?,?,?,?,?,?,1,?)`,
+    [clientId, clientName, clientSecretHash, JSON.stringify(redirectUris), authMethod,
+      JSON.stringify(['authorization_code', 'refresh_token']), JSON.stringify(['code']), 'dcr', nowIso()]);
+  const out = {
+    client_id: clientId, client_name: clientName, redirect_uris: redirectUris,
+    token_endpoint_auth_method: authMethod, grant_types: ['authorization_code', 'refresh_token'], response_types: ['code']
+  };
+  if (clientSecretPlain) out.client_secret = clientSecretPlain; // returned once; only the hash is stored
+  await oauthAudit(env, 'client_registered', { client_id: clientId, detail: 'source=dcr auth_method=' + authMethod });
+  return out;
+}
+
+// ---- /authorize request validation ----
+function loadOauthRequestParams(url) {
+  const p = url.searchParams;
+  return {
+    response_type: clean(p.get('response_type')),
+    client_id: clean(p.get('client_id')),
+    redirect_uri: clean(p.get('redirect_uri')),
+    scope: clean(p.get('scope')),
+    state: clean(p.get('state')),
+    code_challenge: clean(p.get('code_challenge')),
+    code_challenge_method: clean(p.get('code_challenge_method')),
+    resource: clean(p.get('resource'))
+  };
+}
+
+async function validateAuthorizeRequest(env, params, origin) {
+  if (params.response_type !== 'code') {
+    return { ok: false, safe_redirect: false, error: 'unsupported_response_type', error_description: 'response_type must be code' };
+  }
+  const client = await dbFirst(env, 'SELECT * FROM oauth_clients WHERE client_id = ? AND enabled = 1', [params.client_id]);
+  if (!client) return { ok: false, safe_redirect: false, error: 'invalid_client', error_description: 'unknown client_id' };
+  let redirectUris = [];
+  try { redirectUris = JSON.parse(client.redirect_uris); } catch { redirectUris = []; }
+  if (!params.redirect_uri || !redirectUris.includes(params.redirect_uri)) {
+    return { ok: false, safe_redirect: false, error: 'invalid_request', error_description: 'redirect_uri not registered for this client' };
+  }
+  // From here on redirect_uri is a trusted, registered value -- errors may be
+  // delivered back to the client via redirect rather than shown in-page.
+  if (!params.code_challenge || params.code_challenge_method !== 'S256') {
+    return { ok: false, safe_redirect: true, client, redirect_uri: params.redirect_uri, error: 'invalid_request', error_description: 'PKCE with code_challenge_method=S256 is required; plain and missing challenges are rejected' };
+  }
+  const requestedScopes = (params.scope || 'wallet:read').split(/\s+/).filter(Boolean);
+  const invalidScope = requestedScopes.find(s => !OAUTH_SCOPES_SUPPORTED.includes(s));
+  if (invalidScope || !requestedScopes.length) {
+    return { ok: false, safe_redirect: true, client, redirect_uri: params.redirect_uri, error: 'invalid_scope', error_description: 'unsupported scope: ' + (invalidScope || '(empty)') };
+  }
+  if (params.resource && params.resource !== origin) {
+    return { ok: false, safe_redirect: true, client, redirect_uri: params.redirect_uri, error: 'invalid_target', error_description: 'resource must be ' + origin };
+  }
+  return { ok: true, client, scopes: requestedScopes };
+}
+
+function oauthAuthorizeErrorResponse(v, params) {
+  if (v.safe_redirect) {
+    const redirectUrl = new URL(v.redirect_uri);
+    redirectUrl.searchParams.set('error', v.error);
+    redirectUrl.searchParams.set('error_description', v.error_description);
+    if (params.state) redirectUrl.searchParams.set('state', params.state);
+    return Response.redirect(redirectUrl.toString(), 302);
+  }
+  return htmlResponse('<h1>Authorization error</h1><p>' + escapeHtml(v.error) + ': ' + escapeHtml(v.error_description) + '</p>', 400);
+}
+
+function renderLoginForm(params, client, errorMsg) {
+  const hidden = ['response_type', 'client_id', 'redirect_uri', 'scope', 'state', 'code_challenge', 'code_challenge_method', 'resource']
+    .map(k => '<input type="hidden" name="' + k + '" value="' + escapeHtml(params[k] || '') + '">').join('\n    ');
+  return `<!doctype html><html><head><meta charset="utf-8"><title>x402-sub-agent-mcp authorization</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 420px; margin: 60px auto; padding: 0 16px; color: #1a1a1a; }
+  input[type=password] { width: 100%; padding: 10px; font-size: 16px; margin: 10px 0; box-sizing: border-box; }
+  button { width: 100%; padding: 10px; font-size: 16px; }
+  .err { color: #b00020; }
+  .scope { color: #444; font-size: 14px; }
+</style></head><body>
+  <h2>Authorize ${escapeHtml(client.client_name || client.client_id)}</h2>
+  <p class="scope">Requesting scope: <b>${escapeHtml(params.scope || 'wallet:read')}</b></p>
+  ${errorMsg ? '<p class="err">' + escapeHtml(errorMsg) + '</p>' : ''}
+  <form method="POST" action="/authorize">
+    ${hidden}
+    <input type="password" name="password" placeholder="Password" autofocus required>
+    <button type="submit">Authorize</button>
+  </form>
+</body></html>`;
+}
+
+async function handleAuthorizePost(req, env, origin) {
+  const form = await req.formData();
+  const params = {
+    response_type: clean(form.get('response_type')),
+    client_id: clean(form.get('client_id')),
+    redirect_uri: clean(form.get('redirect_uri')),
+    scope: clean(form.get('scope')),
+    state: clean(form.get('state')),
+    code_challenge: clean(form.get('code_challenge')),
+    code_challenge_method: clean(form.get('code_challenge_method')),
+    resource: clean(form.get('resource'))
+  };
+  const password = String(form.get('password') || '');
+  const v = await validateAuthorizeRequest(env, params, origin);
+  if (!v.ok) return oauthAuthorizeErrorResponse(v, params);
+
+  if (!env.OAUTH_LOGIN_PASSWORD) {
+    return htmlResponse('<h1>Authorization not configured</h1><p>OAUTH_LOGIN_PASSWORD is not set on this Worker.</p>', 503);
+  }
+  const subjectRow = await getOrCreateSubject(env);
+  const nowMs = Date.now();
+  if (subjectRow.locked_until && new Date(subjectRow.locked_until).getTime() > nowMs) {
+    return htmlResponse(renderLoginForm(params, v.client, 'Too many failed attempts. Try again later.'), 429);
+  }
+  if (!timingSafeEqual(password, env.OAUTH_LOGIN_PASSWORD)) {
+    const attempts = (subjectRow.failed_attempts || 0) + 1;
+    const lockedUntil = attempts >= OAUTH_LOGIN_LOCKOUT_THRESHOLD ? new Date(nowMs + OAUTH_LOGIN_LOCKOUT_SECONDS * 1000).toISOString() : null;
+    await dbRun(env, 'UPDATE oauth_subjects SET failed_attempts = ?, locked_until = ? WHERE subject = ?', [attempts, lockedUntil, subjectRow.subject]);
+    await oauthAudit(env, 'login_fail', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'attempt ' + attempts });
+    return htmlResponse(renderLoginForm(params, v.client, 'Incorrect password.'), 401);
+  }
+  await dbRun(env, 'UPDATE oauth_subjects SET failed_attempts = 0, locked_until = NULL WHERE subject = ?', [subjectRow.subject]);
+
+  const code = randomB64url(32);
+  const expiresAt = new Date(nowMs + OAUTH_AUTH_CODE_TTL_S * 1000).toISOString();
+  await dbRun(env, `INSERT INTO oauth_auth_codes
+      (code, client_id, subject, redirect_uri, scope, resource, code_challenge, code_challenge_method, used, expires_at, created_at)
+     VALUES (?,?,?,?,?,?,?,?,0,?,?)`,
+    [code, v.client.client_id, subjectRow.subject, params.redirect_uri, v.scopes.join(' '), params.resource || origin,
+      params.code_challenge, params.code_challenge_method, expiresAt, nowIso()]);
+  await oauthAudit(env, 'login_ok', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'code_issued scope=' + v.scopes.join(' ') });
+
+  const redirectUrl = new URL(params.redirect_uri);
+  redirectUrl.searchParams.set('code', code);
+  if (params.state) redirectUrl.searchParams.set('state', params.state);
+  return Response.redirect(redirectUrl.toString(), 302);
+}
+
+// ---- token issuance ----
+async function issueTokenPair(env, opts) {
+  const { clientId, subject, scope, resource, includeRefresh, familyId } = opts;
+  const accessToken = randomB64url(32);
+  const accessHash = await sha256Hex(accessToken);
+  const accessExpiresAt = new Date(Date.now() + OAUTH_ACCESS_TOKEN_TTL_S * 1000).toISOString();
+  await dbRun(env, `INSERT INTO oauth_access_tokens (token_hash, client_id, subject, scope, resource, revoked, expires_at, created_at)
+     VALUES (?,?,?,?,?,0,?,?)`, [accessHash, clientId, subject, scope, resource || null, accessExpiresAt, nowIso()]);
+  const out = { access_token: accessToken, token_type: 'Bearer', expires_in: OAUTH_ACCESS_TOKEN_TTL_S, scope };
+  if (includeRefresh) {
+    const refreshToken = randomB64url(32);
+    const refreshHash = await sha256Hex(refreshToken);
+    const refreshExpiresAt = new Date(Date.now() + OAUTH_REFRESH_TOKEN_TTL_S * 1000).toISOString();
+    const family = familyId || randomB64url(16);
+    await dbRun(env, `INSERT INTO oauth_refresh_tokens (token_hash, family_id, client_id, subject, scope, resource, rotated_at, revoked, expires_at, created_at)
+       VALUES (?,?,?,?,?,?,NULL,0,?,?)`, [refreshHash, family, clientId, subject, scope, resource || null, refreshExpiresAt, nowIso()]);
+    out.refresh_token = refreshToken;
+  }
+  return out;
+}
+
+async function handleTokenEndpoint(req, env) {
+  const ct = req.headers.get('content-type') || '';
+  let get;
+  if (ct.includes('application/json')) {
+    const body = await readJson(req);
+    get = k => clean(body[k]);
+  } else {
+    const fd = await req.formData();
+    get = k => clean(fd.get(k));
+  }
+
+  const clientId = get('client_id');
+  const clientSecret = get('client_secret');
+  const client = await dbFirst(env, 'SELECT * FROM oauth_clients WHERE client_id = ? AND enabled = 1', [clientId]);
+  if (!client) return j({ error: 'invalid_client', error_description: 'unknown client_id' }, 401);
+  if (client.token_endpoint_auth_method === 'client_secret_post') {
+    if (!clientSecret || (await sha256Hex(clientSecret)) !== client.client_secret_hash) {
+      return j({ error: 'invalid_client', error_description: 'invalid client_secret' }, 401);
+    }
+  }
+
+  const grantType = get('grant_type');
+
+  if (grantType === 'authorization_code') {
+    const code = get('code');
+    const redirectUri = get('redirect_uri');
+    const codeVerifier = get('code_verifier');
+    if (!code || !redirectUri || !codeVerifier) {
+      return j({ error: 'invalid_request', error_description: 'code, redirect_uri, and code_verifier are required' }, 400);
+    }
+    // Atomic one-time claim -- succeeds exactly once even under a concurrent replay.
+    const claim = await dbRun(env, 'UPDATE oauth_auth_codes SET used = 1 WHERE code = ? AND used = 0', [code]);
+    if (!claim.meta || claim.meta.changes !== 1) {
+      return j({ error: 'invalid_grant', error_description: 'authorization code is invalid, expired, or already used' }, 400);
+    }
+    const codeRow = await dbFirst(env, 'SELECT * FROM oauth_auth_codes WHERE code = ?', [code]);
+    if (!codeRow || codeRow.client_id !== clientId || codeRow.redirect_uri !== redirectUri) {
+      return j({ error: 'invalid_grant', error_description: 'code does not match client_id/redirect_uri' }, 400);
+    }
+    if (new Date(codeRow.expires_at).getTime() < Date.now()) {
+      return j({ error: 'invalid_grant', error_description: 'authorization code expired' }, 400);
+    }
+    const computedChallenge = await sha256B64url(codeVerifier);
+    if (computedChallenge !== codeRow.code_challenge) {
+      return j({ error: 'invalid_grant', error_description: 'code_verifier does not match code_challenge' }, 400);
+    }
+    const scopes = codeRow.scope.split(/\s+/).filter(Boolean);
+    const wantsRefresh = scopes.includes('offline_access');
+    const tokens = await issueTokenPair(env, { clientId, subject: codeRow.subject, scope: codeRow.scope, resource: codeRow.resource, includeRefresh: wantsRefresh, familyId: null });
+    await oauthAudit(env, 'token_issued', { subject: codeRow.subject, client_id: clientId, detail: 'grant=authorization_code scope=' + codeRow.scope });
+    return j(tokens);
+  }
+
+  if (grantType === 'refresh_token') {
+    const refreshToken = get('refresh_token');
+    if (!refreshToken) return j({ error: 'invalid_request', error_description: 'refresh_token is required' }, 400);
+    const tokenHash = await sha256Hex(refreshToken);
+    const row = await dbFirst(env, 'SELECT * FROM oauth_refresh_tokens WHERE token_hash = ?', [tokenHash]);
+    if (!row || row.client_id !== clientId) return j({ error: 'invalid_grant', error_description: 'unknown refresh token' }, 400);
+    if (row.revoked) return j({ error: 'invalid_grant', error_description: 'refresh token revoked' }, 400);
+    if (new Date(row.expires_at).getTime() < Date.now()) return j({ error: 'invalid_grant', error_description: 'refresh token expired' }, 400);
+    if (row.rotated_at) {
+      // REPLAY: an already-rotated (previously exchanged) refresh token was
+      // presented again -- revoke the whole family, the standard response to
+      // suspected rotating-refresh-token compromise.
+      await dbRun(env, 'UPDATE oauth_refresh_tokens SET revoked = 1 WHERE family_id = ?', [row.family_id]);
+      await dbRun(env, 'UPDATE oauth_access_tokens SET revoked = 1 WHERE client_id = ? AND subject = ?', [row.client_id, row.subject]);
+      await oauthAudit(env, 'refresh_replay_detected', { subject: row.subject, client_id: clientId, detail: 'family=' + row.family_id });
+      return j({ error: 'invalid_grant', error_description: 'refresh token reuse detected; token family revoked' }, 400);
+    }
+    await dbRun(env, 'UPDATE oauth_refresh_tokens SET rotated_at = ? WHERE token_hash = ?', [nowIso(), tokenHash]);
+    const tokens = await issueTokenPair(env, { clientId, subject: row.subject, scope: row.scope, resource: row.resource, includeRefresh: true, familyId: row.family_id });
+    await oauthAudit(env, 'refresh_rotated', { subject: row.subject, client_id: clientId, detail: 'family=' + row.family_id });
+    return j(tokens);
+  }
+
+  return j({ error: 'unsupported_grant_type', error_description: 'only authorization_code and refresh_token are supported' }, 400);
+}
+
+async function handleRevokeEndpoint(req, env) {
+  const fd = await req.formData();
+  const token = clean(fd.get('token'));
+  const clientId = clean(fd.get('client_id'));
+  if (!token) return j({ error: 'invalid_request' }, 400);
+  const tokenHash = await sha256Hex(token);
+  await dbRun(env, 'UPDATE oauth_access_tokens SET revoked = 1 WHERE token_hash = ? AND client_id = ?', [tokenHash, clientId]);
+  await dbRun(env, 'UPDATE oauth_refresh_tokens SET revoked = 1 WHERE token_hash = ? AND client_id = ?', [tokenHash, clientId]);
+  return j({ ok: true });
+}
+
+// ---- access-token verification + combined auth gate ----
+async function verifyOauthAccessToken(env, rawToken) {
+  const tokenHash = await sha256Hex(rawToken);
+  const row = await dbFirst(env, 'SELECT * FROM oauth_access_tokens WHERE token_hash = ?', [tokenHash]);
+  if (!row) return null;
+  if (row.revoked) return null;
+  if (new Date(row.expires_at).getTime() < Date.now()) return null;
+  return row;
+}
+
+// authenticate() is the combined gate: static MCP_AUTH_TOKEN (unchanged,
+// full access) OR a valid OAuth access token (scope-limited, audience-bound
+// to this exact origin/resource).
+async function authenticate(req, env) {
+  const token = extractBearer(req);
+  if (!token) return { ok: false };
+  if (env.MCP_AUTH_TOKEN && timingSafeEqual(token, env.MCP_AUTH_TOKEN)) return { ok: true, mode: 'static' };
+  const row = await verifyOauthAccessToken(env, token);
+  if (!row) return { ok: false };
+  const origin = new URL(req.url).origin;
+  if (row.resource && row.resource !== origin) return { ok: false }; // audience mismatch
+  return { ok: true, mode: 'oauth', subject: row.subject, client_id: row.client_id, scope: (row.scope || '').split(/\s+/).filter(Boolean) };
+}
+
 
 async function handleMcp(req, env) {
   const rpc = await readJson(req);
@@ -1319,14 +1743,29 @@ async function handleMcp(req, env) {
     if (rpc.method === 'ping') return mcpResponse(req, { jsonrpc: '2.0', id, result: {} });
     if (rpc.method === 'tools/list') return mcpResponse(req, { jsonrpc: '2.0', id, result: { tools: toolSchemas } });
     if (rpc.method === 'tools/call') {
-      if (!isAuthed(req, env)) {
-        return mcpResponse(req, { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(authErrorPayload(env), null, 2) }], isError: true } });
+      const origin = new URL(req.url).origin;
+      const auth = await authenticate(req, env);
+      if (!auth.ok) {
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32001, message: 'unauthorized: missing or invalid bearer token' } }), {
+          status: 401,
+          headers: { ...CORS, 'content-type': 'application/json;charset=utf-8', 'cache-control': 'no-store', 'www-authenticate': wwwAuthenticateHeader(origin) }
+        });
+      }
+      const toolName = rpc.params && rpc.params.name;
+      if (auth.mode === 'oauth' && !oauthToolAllowedForScopes(toolName, auth.scope)) {
+        await oauthAudit(env, 'scope_denied', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'scope=' + auth.scope.join(' ') });
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32002, message: 'insufficient_scope: this OAuth token cannot call ' + toolName } }), {
+          status: 403,
+          headers: { ...CORS, 'content-type': 'application/json;charset=utf-8', 'cache-control': 'no-store', 'www-authenticate': wwwAuthenticateHeader(origin, 'insufficient_scope', 'token lacks scope for ' + toolName) }
+        });
       }
       let result;
       try {
-        result = await callTool(env, rpc.params && rpc.params.name, (rpc.params && rpc.params.arguments) || {});
+        result = await callTool(env, toolName, (rpc.params && rpc.params.arguments) || {});
+        if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=chatgpt:' + auth.subject + ' outcome=ok' });
       } catch (e) {
         result = { ok: false, error: String(e.message || e) };
+        if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=chatgpt:' + auth.subject + ' outcome=error: ' + result.error });
       }
       return mcpResponse(req, { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result && result.ok === false } });
     }
@@ -1344,11 +1783,53 @@ export default {
       if (url.pathname === '/' || url.pathname === '/status' || url.pathname === '/health') return j(status(env));
       if (url.pathname === '/tools') return j({ ok: true, tools: toolSchemas });
       if (url.pathname === '/mcp') return handleMcp(req, env);
+
+      // ---- OAuth 2.1 Stage 1 (V1.4.5) -----------------------------------
+      if (url.pathname === '/.well-known/oauth-protected-resource' || url.pathname === '/.well-known/oauth-protected-resource/mcp') {
+        return j(protectedResourceMetadata(url.origin));
+      }
+      if (url.pathname === '/.well-known/oauth-authorization-server') {
+        return j(authServerMetadata(url.origin));
+      }
+      if (url.pathname === '/register' && req.method === 'POST') {
+        try { return j(await registerOauthClient(env, await readJson(req)), 201); }
+        catch (e) { return j({ error: 'invalid_client_metadata', error_description: String(e.message || e) }, 400); }
+      }
+      if (url.pathname === '/authorize' && req.method === 'GET') {
+        const params = loadOauthRequestParams(url);
+        const v = await validateAuthorizeRequest(env, params, url.origin);
+        if (!v.ok) return oauthAuthorizeErrorResponse(v, params);
+        return htmlResponse(renderLoginForm(params, v.client, null));
+      }
+      if (url.pathname === '/authorize' && req.method === 'POST') {
+        return handleAuthorizePost(req, env, url.origin);
+      }
+      if (url.pathname === '/token' && req.method === 'POST') {
+        return handleTokenEndpoint(req, env);
+      }
+      if (url.pathname === '/revoke' && req.method === 'POST') {
+        return handleRevokeEndpoint(req, env);
+      }
+      // ---------------------------------------------------------------------
+
       if (req.method === 'POST' && url.pathname === '/call') {
-        if (!isAuthed(req, env)) return j(authErrorPayload(env), 401);
+        const auth = await authenticate(req, env);
+        if (!auth.ok) {
+          return new Response(JSON.stringify(authErrorPayload(env)), {
+            status: 401,
+            headers: { ...CORS, 'content-type': 'application/json;charset=utf-8', 'cache-control': 'no-store', 'www-authenticate': wwwAuthenticateHeader(url.origin) }
+          });
+        }
         const body = await readJson(req);
-        try { return j(await callTool(env, body.name, body.arguments || {})); }
-        catch (e) { return j({ ok: false, error: String(e.message || e) }, 200); }
+        if (auth.mode === 'oauth' && !oauthToolAllowedForScopes(body.name, auth.scope)) {
+          await oauthAudit(env, 'scope_denied', { subject: auth.subject, client_id: auth.client_id, tool_name: body.name, detail: 'scope=' + auth.scope.join(' ') });
+          return j({ ok: false, error: 'insufficient_scope: this OAuth token cannot call ' + body.name }, 403);
+        }
+        try {
+          const result = await callTool(env, body.name, body.arguments || {});
+          if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: body.name, detail: 'caller_id=chatgpt:' + auth.subject + ' outcome=ok' });
+          return j(result);
+        } catch (e) { return j({ ok: false, error: String(e.message || e) }, 200); }
       }
       return j({ ok: false, error: 'not_found', worker: WORKER }, 404);
     } catch (e) {
