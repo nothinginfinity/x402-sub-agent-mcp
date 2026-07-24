@@ -931,7 +931,7 @@ async function circleCreateWalletSet(env, a) {
 }
 
 async function circleListWalletSets(env, a) {
-  const resp = await circleFetch(env, 'GET', '/developer/walletSets?pageSize=' + limitNum(a.limit, 25, 1, 100));
+  const resp = await circleFetch(env, 'GET', '/walletSets?pageSize=' + limitNum(a.limit, 25, 1, 100));
   return { ok: resp.httpOk, http_status: resp.httpStatus, result: resp.data };
 }
 
