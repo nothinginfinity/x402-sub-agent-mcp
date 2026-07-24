@@ -678,6 +678,8 @@ Three candidate shapes. Decide before writing code; this choice is expensive to 
 
 **Recommendation: prototype (a) on ONE server first**, because it is the only option that proves the mechanism end-to-end without committing to fleet-wide rollout. Choose between (b) and (c) for the actual rollout *after* the prototype produces real latency numbers (see V1.5.2).
 
+**UPDATE 2026-07-24 — evidence now favors (b), the gateway.** The prototype (a) shipped as `x402-cairnstone` (V1.5.1, stone a45c7ba7d9a0) and the wrapper mechanics work. But building it surfaced a constraint that argues against (a) at fleet scale: **Claude.ai's connector UI accepts only OAuth client id/secret — no static bearer token field.** So per-server bearer auth cannot reach the Claude.ai connector path at all. Making each server usable as a connector would mean implementing OAuth in `x402-cairnstone`, then again in the next server, and again — ~35 times. A gateway (`afo-agent-gateway` / `afo-agent-router-mcp`) fronting these servers with OAuth **once** lets every server behind it inherit identity. Per-server auth does not scale, and it bit on server one. The wrapper logic transfers to either architecture, so the prototype was not wasted.
+
 ### V1.5.1 — Prototype on a single server
 
 - [ ] Pick one server. Suggested: an `AFO SubAgent Repo Investigator` or `CairnStone V5` worker — real work, clear success/failure, low blast radius.
@@ -699,6 +701,27 @@ This gates fleet rollout. Do not skip.
 - [ ] Every metered call logs whether the tool **succeeded**, not merely that it was charged and attempted.
 - [ ] Rationale: a payment proves a call was authorized and charged. It does NOT prove the tool ran or returned anything useful. An agent stuck in a retry loop generates high volume on a *broken* tool; "paid = used" would rank it most valuable. Retry storms must be visible as failure clusters, not popularity.
 - [ ] **This cannot be retrofitted.** Unrecorded outcomes are gone forever. Charge on attempt, but log outcome.
+
+### V1.5.5 — Paid stone operations: prove the loop end-to-end (BUILDABLE NOW — START HERE)
+
+**This is the immediate next build.** V1.5.1 shipped metering (observation only); `price_atomic` and `payment_id` are NULL in every `metered_calls` row. V1.5.5 makes them real: an actual stone operation, actually paid for, on-chain, verifiable.
+
+**Why this and not "just start using it":** Claude.ai's custom connector UI accepts ONLY OAuth client id/secret — there is no static bearer token field (see Finding 3, stone a45c7ba7d9a0). So `x402-cairnstone` CANNOT be added as a Claude.ai connector with `MCP_AUTH_TOKENS`. Day-to-day use as your working CairnStone requires OAuth, which is the per-server build that does not scale. **Proving payment does not require OAuth** — it can be driven programmatically (curl / another worker / a script). Split the two and build the provable half now.
+
+#### Steps
+
+- [ ] **Create a payment rule for CairnStone tools.** Pattern `/tool/*` (or per-tool patterns to enable tiering later), `pay_to` = Circle Wallet B `0xa3b8d584302b8f4004aef518bc7ed2f43abf2c8d`, asset USDC `0x036CbD53842c5426634e7929541eC2318f3dCF7e`, network `base-sepolia`. Model on `rule_8e7df0abed1b4249b21c` from CIRCLE-LIVE-02 (stone 465902b511d5), which is verified working.
+- [ ] **Walk facilitator resolution BEFORE signing** — all four tiers, as in CIRCLE-LIVE-02. Confirm the MOCKUSD near-miss (`tok_5a9652468f4142d98626`) does not intercept. See V1.5.4; this is why that item is a prerequisite in practice even though it is listed after.
+- [ ] **Extend `meteredCallMcpTool` in `x402-cairnstone/src/index.js`** to call `evaluate_request` on `x402-sub-agent-mcp`, then sign a gasless EIP-3009 from Circle Wallet A (`6b3af813-59c5-57e9-9dcf-bde05fc24aa2`) and settle. The wrapper already has the try/finally and the outcome taxonomy; this adds the charge and backfills `price_atomic` + `payment_id` on the ledger row.
+- [ ] **Drive a small number of real paid stone operations deliberately — NOT always-on.** Confirm: ledger rows carry real `payment_id`/tx hash, and Wallet B's balance climbs.
+- [ ] **Confirm balance with the CIRCLE-LIVE-02 lag rule in mind:** `settle.transaction` (tx hash) is the IMMEDIATE confirmation; wallet balance LAGS by minutes with a stale `updateDate`. Do not treat a same-minute balance read as a failure.
+
+#### The expected finding (capture it, do not skip past it)
+
+- [ ] **Measure and record the latency delta.** Today `cairnstone_health` meters in **0ms** — the D1 ledger write costs nothing. CIRCLE-LIVE-02's settle was a real network round-trip taking **seconds**. Per-call on-chain settlement is therefore likely to be **too slow for a tool called constantly**.
+- [ ] That is not a failure of the build — it is the **V1.5.2 gate arriving with real numbers**, and it is precisely the evidence that justifies **leases (V1.6.0) or batched/deferred settlement**. Better learned deliberately on a handful of calls than by making the vault sluggish in daily use.
+
+---
 
 ### V1.5.4 — Harden facilitator matching (prerequisite, see open item)
 
