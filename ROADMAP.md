@@ -653,3 +653,127 @@ V1.1/V1.2 and the synthetic V2A entitlement prototype may proceed
 without custody. A real V2B pilot begins only after the launch gates have
 written approvals, verified integrations, and tested operational
 controls.
+
+---
+
+## V1.5 — Metering Interception Layer (THE FOUNDATION)
+
+**Status: NOT STARTED. This is the next step and everything below it depends on it.**
+
+### The finding that motivates this (2026-07-24)
+
+An account-wide GitHub code search for `evaluate_request` returned 8 matches, ALL inside `x402-sub-agent-mcp` (worker.js, README.md, ROADMAP.md, docs/DEPLOY.md, docs/MCP-TOOL-CALLS.md) plus `x402-balance-ledger-mock/worker.js`. **Zero matches in any of the ~35 AFO tool servers.**
+
+Every payment proven to date (CIRCLE-LIVE-01, CIRCLE-LIVE-02, stone 465902b511d5) was driven by an agent calling `evaluate_request` **explicitly as an MCP tool**. No tool server calls it in its own request path. Nothing is metered today. The policy engine is a service that must be *asked*; it is not yet a toll booth that anything drives through.
+
+This means metering tools is **not a configuration task**. It requires code in each server, or a shared interception point. That distinction is the whole of V1.5.
+
+### V1.5.0 — Choose the interception architecture (DECISION, blocking)
+
+Three candidate shapes. Decide before writing code; this choice is expensive to reverse.
+
+- [ ] **(a) In-server middleware.** Each tool server calls `evaluate_request` at the top of its MCP `tools/call` handler. Most accurate (knows the exact tool name and arguments). Cost: a code change + redeploy in every server, and every new server must remember to do it. Metering is opt-in and can silently be forgotten.
+- [ ] **(b) Gateway / router interception.** Route calls through an existing front door (see `afo-agent-gateway`, `afo-agent-router-mcp`) which meters centrally before dispatching. One code change, uniform coverage, cannot be forgotten. Cost: only meters traffic that actually goes through the gateway — direct calls to a server bypass it entirely. Bypass is the correctness risk.
+- [ ] **(c) Shared library / template.** A small module imported by each server, plus adding it to `afo-mcp-factory` so new servers are metered at birth. Middle ground: still per-server deploys, but one implementation to maintain.
+
+**Recommendation: prototype (a) on ONE server first**, because it is the only option that proves the mechanism end-to-end without committing to fleet-wide rollout. Choose between (b) and (c) for the actual rollout *after* the prototype produces real latency numbers (see V1.5.2).
+
+### V1.5.1 — Prototype on a single server
+
+- [ ] Pick one server. Suggested: an `AFO SubAgent Repo Investigator` or `CairnStone V5` worker — real work, clear success/failure, low blast radius.
+- [ ] Add the `evaluate_request` call to its `tools/call` path, keyed on tool name (route pattern e.g. `/tool/<tool_name>`).
+- [ ] Decide and implement the **unpaid-call behavior**: hard 402 (refuse) vs. meter-and-allow (log, serve anyway). **Start with meter-and-allow.** A hard 402 on a server you depend on daily can brick your own workflow; observation first, enforcement later.
+- [ ] Pass honest `caller_id` through from the OAuth `<driver>:<subject>` attribution already shipped in stone ff7e86269eaa.
+- [ ] Live-verify: call the tool, confirm a `usage_events` row appears with correct route, caller, and outcome.
+
+### V1.5.2 — Measure the cost of metering itself (GATE)
+
+This gates fleet rollout. Do not skip.
+
+- [ ] Record added latency per metered call (the `usage_events` detail logging from stone 475f9ba742f8 already captures duration and facilitator latency).
+- [ ] Answer explicitly: **is a real EIP-3009 signature + facilitator round-trip per tool call economically and latency-wise viable?** CIRCLE-LIVE-02's settle was a real network hop. At 1/1000-cent pricing the payment may cost more in latency and facilitator load than it is worth.
+- [ ] If per-call settlement is too expensive, this is the evidence that forces **leases (V1.6) or batched/deferred settlement** *before* rollout, not after.
+
+### V1.5.3 — Record outcome, not just payment (do this from day one)
+
+- [ ] Every metered call logs whether the tool **succeeded**, not merely that it was charged and attempted.
+- [ ] Rationale: a payment proves a call was authorized and charged. It does NOT prove the tool ran or returned anything useful. An agent stuck in a retry loop generates high volume on a *broken* tool; "paid = used" would rank it most valuable. Retry storms must be visible as failure clusters, not popularity.
+- [ ] **This cannot be retrofitted.** Unrecorded outcomes are gone forever. Charge on attempt, but log outcome.
+
+### V1.5.4 — Harden facilitator matching (prerequisite, see open item)
+
+- [ ] `tok_5a9652468f4142d98626` (Mock USD) is **enabled**, on `base-sepolia`, pointing at a settlement-FAKE facilitator. It is inert today only because matching requires network AND asset.
+- [ ] Metering broadly means far more calls flowing through facilitator resolution. If any resolves to the fake facilitator, the ledger fills with successful-looking payments that never moved money — discovered only at reconciliation.
+- [ ] Add an explicit guard, or disable the token, before fleet rollout.
+
+---
+
+## V1.6 — Billing models (BUILT ON V1.5, do not start first)
+
+Each item here assumes interception exists. Detail deliberately left thin; expand as V1.5 lands and produces data.
+
+### V1.6.0 — Time-boxed leases (retry-inflation fix)
+
+- [ ] Charge per **lease** (e.g. 15 minutes of access to a tool), not per call. A 1000-call retry loop then costs exactly one lease and cannot inflate apparent value.
+- [ ] Requires new state: a leases table (issued_at, expires_at, scope, holder) and a check in the request path. **This is the first genuinely stateful piece of the metering side** — everything to date is evaluated per-request.
+- [ ] Caution: leases collapse the demand curve. A lease with 1 call and one with 900 look identical in revenue. The ledger must still record every call inside the lease, un-priced, or the usage census that motivated all of this is lost. **Billing unit and measurement unit become two different things that must stay in sync.**
+- [ ] Caution: fixed-duration leases are gameable toward batching. Rational agents batch everything into one lease — fine for cheap reads, inverted economics for expensive compute.
+
+### V1.6.1 — Per-tool billing model selection
+
+- [ ] Not lease-or-per-call globally; **choose per tool**.
+- [ ] Cheap, high-frequency, loop-prone (status/manifest reads) → **lease**.
+- [ ] Expensive, unit-of-work (`compress_repo_v4`, subagent calls) → **per-call**, ideally `mode: 'upto'` so actual cost clamps against a ceiling. NOTE: `upto` + `actual_amount_atomic` clamping was built and verified in stone ed403badf9d6 and has never had a real use. This is its use.
+
+### V1.6.2 — Tiered pricing for variance (price discovery)
+
+- [ ] Do NOT price all tools uniformly. Uniform pricing is the one configuration that cannot discover anything — it flattens the signal that price differences are supposed to reveal.
+- [ ] Seed three rough buckets, guessed not agonized over, to create variance to learn from: status/read ~1/1000¢, real work ~1/100¢, expensive compute ~1/10¢.
+- [ ] The 1/1000-cent default convention is already recorded in V1.3B.5 Phase 3 (stone cbeb6ebb3d7a).
+
+### V1.6.3 — Tool failure after payment (THE ROBUSTNESS HOLE)
+
+- [ ] **Nothing in the chain covers this today.** What happens when a caller pays and the tool then errors, times out, or returns partial work?
+- [ ] Options: refund, partial charge via `upto`, or hold/escrow until success.
+- [ ] This is the antifragile core — the failure mode that a real request path will produce and test fixtures never did.
+
+### V1.6.4 — Demand-based auto-pricing (LAST, needs data)
+
+- [ ] Adjust price from demand — but key off **successful** calls, never attempts. Attempt-keyed pricing raises the price of a broken tool for being broken.
+- [ ] Agents typically lack budget elasticity: they call what they need. Raising price may not reduce demand, only drain wallets faster until a budget policy trips and everything stops.
+- [ ] Requires: slow movement, a hard ceiling, and the Phase 3 budget policies as circuit breaker.
+- [ ] Cannot be tuned without the usage data V1.5 produces. Genuinely last.
+
+---
+
+## V1.7 — Wallet topology & spend visibility (BUILT ON V1.5/V1.6)
+
+### V1.7.0 — Wallet grain decision
+
+- [ ] Circle dev account supports up to **1000 wallets**, so per-tool wallets are feasible.
+- [ ] Argument FOR atomic per-tool wallets: a balance is settled on-chain; a D1 row is a claim our own code wrote. Divergence between ledger and chain is **diagnostic** — it is how a silent settlement failure gets caught. Atomic wallets are an independent check on our own bookkeeping.
+- [ ] Argument AGAINST: attribution still comes from `caller_id` in the ledger either way. A wallet balance says a tool earned X, not who paid or whether the call succeeded. Better audit trail, not better data. Plus ~1000 wallets to provision while `circle_fund_wallet` still 403s (faucet permission open item), one rule per wallet, and reconciliation tooling.
+- [ ] **Decision: atomic wallets for the pilot (~5 tools, 5 wallets).** Learn whether reconciliation is pleasant at n=5 before discovering it at n=1000. Scale if clean; fall back to per-server if fiddly.
+
+### V1.7.1 — Name the wallet hierarchy explicitly
+
+- [ ] **Human → Agent is delegation** (someone accepting that a program spends on their behalf): wants limits, expiry, revocation.
+- [ ] **Agent → Tool is payment** (value for work): wants speed, no human in the loop.
+- [ ] Much of this already exists unnamed: budget policies (Phase 3) are delegation limits; the OAuth consent screen with the `mcp:admin` checkbox is the human authorizing an agent; `<driver>:<subject>` distinguishes who acts.
+- [ ] **Open modeling question:** if tools also *pay* (a subagent calling another tool), it is not a three-level hierarchy — it is a graph, and an agent is just a tool a human called. Decide whether "agent" and "tool" are distinct schema types or one type with different callers.
+- [ ] **The real design question is not funding, it is exhaustion:** what happens when an agent's wallet runs dry mid-task? Stop? Block on top-up? Standing allowance that refills? This determines whether the system is usable or maddening.
+
+### V1.7.2 — Spend-visibility UI (NOT a dashboard, and not yet)
+
+- [ ] The first UI that matters is **not** analytics for the operator. It is the consent and spend-visibility surface for whoever's money is being spent: "this agent wants to spend up to X on your behalf," plus a spend log.
+- [ ] That is a **trust artifact**, and it is what makes the system sellable — nobody hands an agent a wallet without it.
+- [ ] The seed already exists: the OAuth consent page with the checkbox-gated `mcp:admin` scope (stone ff7e86269eaa).
+- [ ] **Build only after real usage exists.** Dashboards built on synthetic data get rebuilt.
+
+---
+
+## Standing guidance for this arc
+
+- **Narrowing is the value.** "Endless possibilities" is the trap. What makes this valuable is being the thing that meters *agent tool calls*, specifically, better than anyone. The generality is already in the architecture and does not need chasing.
+- **Every item above V1.5 rests on interception existing.** Confirmed absent 2026-07-24. Do not design further billing mechanics on an unverified foundation.
+- **Testnet / BASE-SEPOLIA only.** Verify stepwise; stop at first failure and capture the exact error before fixing. A settle success is not proof without independent confirmation — and mind the balance lag (stone 465902b511d5) when choosing that confirmation.
