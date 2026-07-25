@@ -795,6 +795,44 @@ Each item here assumes interception exists. Detail deliberately left thin; expan
 
 ---
 
+## Repo & worker map (as of 2026-07-25)
+
+The project now spans multiple repos/workers. A new chat should know all of them.
+
+- **nothinginfinity/x402-sub-agent-mcp** -- the policy engine + Circle wallet tools + facilitator config. Holds evaluate_request, circle_gasless_transfer, the payment rules DB, and the ROADMAP. worker.js HEAD unchanged since CIRCLE-LIVE-02 (commit 38289ac / stone 97e358a06e5e). Gated by its own MCP_AUTH_TOKEN. Reads Circle key from secret AFO_X402.
+- **nothinginfinity/cairnstone-v5** -- the ORIGINAL stone vault (D1 60b8210c-7d5a-4d54-b0aa-7411fb4b9b95, R2 cairnstone-v5-raw). STILL an open, unauthenticated write endpoint. Unmetered. This is the working CairnStone in daily use.
+- **nothinginfinity/x402-cairnstone** -- metered + paid clone of cairnstone-v5. SHARES the same D1/R2 vault (migration = connector URL swap). Adds: MCP_AUTH_TOKENS inbound gate, meteredCallMcpTool wrapper, metered_calls table, serve-then-settle payment via PAYMENT_WORKER service binding -> x402-sub-agent-mcp, and GET /wallets (per-agent ledger+balance join). Secrets: MCP_AUTH_TOKENS, X402_MCP_AUTH_TOKEN, GITHUB_TOKEN.
+- **nothinginfinity/agent-wallets-console** -- NEW. The wallet UI worker. Serves index.html (Text module) at https://agent-wallets-console.jaredtechfit.workers.dev/. Calls x402-cairnstone /wallets from the browser with a localStorage token. No secrets on the worker; needs CLOUDFLARE_API_TOKEN as a REPO secret for deploy.
+- **x402-balance-ledger-mock** -- older mock, referenced only.
+
+Two parallel tracks are now in flight. Do not let one bury the other:
+- **Payment refinement (V1.5.6 / V1.6):** clean latency number -> price-from-402 -> leases. Named by handoff 69341f145c15. UNSTARTED.
+- **Spend-visibility UI (V1.7):** the wallet console. V1.7.0 shipped (below).
+
+---
+
+## V1.7 -- Spend-visibility UI
+
+### V1.7.0 -- Agent Wallets Console (SHIPPED 2026-07-25, stone d246bbb96b7e)
+
+Live: https://agent-wallets-console.jaredtechfit.workers.dev/ . Phone-first console; each wallet shown as an AGENT (name + role) with live Circle balance fused with metered_calls activity/spend -- a join Circle's own console cannot do. Backed by GET /wallets on x402-cairnstone. Auth via localStorage token (dev-grade). Read-only.
+
+### V1.7.1 -- Agent-identity table (THE NEXT UI BUILD)
+
+- [ ] Replace the static WALLET_REGISTRY map in x402-cairnstone (walletsConsole) with a D1 table: wallet_id -> display name, role, caller_id, assigned agent. This is why only 2 of the ~4+ Circle wallets currently show. It is also the seed of the per-agent identity layer everything downstream (per-agent chat, pricing, task assignment) hangs from -- keep caller_id stable and first-class.
+- [ ] Adding/renaming an agent must NOT require a code deploy.
+
+### V1.7.2 -- Control surface (LATER, needs real traffic)
+
+- [ ] The console is read-only today. Set pricing, assign tasks, and (Jared's vision) a per-agent chat inside the wallet -- the wallet as the agent's home/identity, not just its balance. This WRITES, so it needs real auth (OAuth/gateway, not a localStorage token). Build against real usage, not synthetic data.
+
+### UI lessons already learned (stone d246bbb96b7e)
+
+- A browser UI that calls an external endpoint CANNOT live in a Claude artifact sandbox (its fetch is blocked, which masquerades as a token failure). It needs a real origin -- hence the dedicated worker.
+- A new GitHub repo does NOT inherit other repos' Actions secrets; set CLOUDFLARE_API_TOKEN per repo (or as an org secret once).
+
+---
+
 ## Standing guidance for this arc
 
 - **Narrowing is the value.** "Endless possibilities" is the trap. What makes this valuable is being the thing that meters *agent tool calls*, specifically, better than anyone. The generality is already in the architecture and does not need chasing.
