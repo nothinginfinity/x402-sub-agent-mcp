@@ -1612,11 +1612,12 @@ async function handleAuthorizePost(req, env, origin) {
   const grantedScopes = grantAdmin ? [...v.scopes, OAUTH_ADMIN_SCOPE] : v.scopes;
 
   const code = randomB64url(32);
+  const codeHash = await sha256Hex(code);
   const expiresAt = new Date(nowMs + OAUTH_AUTH_CODE_TTL_S * 1000).toISOString();
   await dbRun(env, `INSERT INTO oauth_auth_codes
       (code, client_id, subject, redirect_uri, scope, resource, code_challenge, code_challenge_method, used, expires_at, created_at)
      VALUES (?,?,?,?,?,?,?,?,0,?,?)`,
-    [code, v.client.client_id, subjectRow.subject, params.redirect_uri, grantedScopes.join(' '), v.resource,
+    [codeHash, v.client.client_id, subjectRow.subject, params.redirect_uri, grantedScopes.join(' '), v.resource,
       params.code_challenge, params.code_challenge_method, expiresAt, nowIso()]);
   await oauthAudit(env, 'login_ok', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'code_issued scope=' + grantedScopes.join(' ') });
 
@@ -1677,12 +1678,13 @@ async function handleTokenEndpoint(req, env) {
     if (!code || !redirectUri || !codeVerifier) {
       return j({ error: 'invalid_request', error_description: 'code, redirect_uri, and code_verifier are required' }, 400);
     }
+    const codeHash = await sha256Hex(code);
     // Atomic one-time claim -- succeeds exactly once even under a concurrent replay.
-    const claim = await dbRun(env, 'UPDATE oauth_auth_codes SET used = 1 WHERE code = ? AND used = 0', [code]);
+    const claim = await dbRun(env, 'UPDATE oauth_auth_codes SET used = 1 WHERE code = ? AND used = 0', [codeHash]);
     if (!claim.meta || claim.meta.changes !== 1) {
       return j({ error: 'invalid_grant', error_description: 'authorization code is invalid, expired, or already used' }, 400);
     }
-    const codeRow = await dbFirst(env, 'SELECT * FROM oauth_auth_codes WHERE code = ?', [code]);
+    const codeRow = await dbFirst(env, 'SELECT * FROM oauth_auth_codes WHERE code = ?', [codeHash]);
     if (!codeRow || codeRow.client_id !== clientId || codeRow.redirect_uri !== redirectUri) {
       return j({ error: 'invalid_grant', error_description: 'code does not match client_id/redirect_uri' }, 400);
     }
