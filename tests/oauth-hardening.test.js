@@ -107,6 +107,8 @@ class MemoryStatement {
       return clauses.every(clause => {
         let m = /^(\w+) = \?$/.exec(clause);
         if (m) return row[m[1]] === this.params[paramIndex++];
+        m = /^(\w+) = (\d+)$/.exec(clause);
+        if (m) return Number(row[m[1]]) === Number(m[2]);
         m = /^(\w+) != '([^']+)'$/.exec(clause);
         if (m) return row[m[1]] !== m[2];
         m = /^(\w+) IS NOT NULL$/i.exec(clause);
