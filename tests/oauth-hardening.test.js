@@ -40,6 +40,14 @@ function projectRow(row, select) {
   return out;
 }
 
+const PRIMARY_KEYS = {
+  oauth_subjects: 'subject',
+  oauth_clients: 'client_id',
+  oauth_auth_codes: 'code',
+  oauth_access_tokens: 'token_hash',
+  oauth_refresh_tokens: 'token_hash'
+};
+
 class MemoryD1 {
   constructor() {
     this.tables = new Map();
@@ -141,8 +149,10 @@ class MemoryStatement {
         else throw new Error('Unsupported INSERT value in test D1 mock: ' + token);
       });
       const table = this.db.table(tableName);
-      const key = ['client_id', 'code', 'token_hash', 'subject', 'id'].find(column => Object.hasOwn(row, column));
-      if (key && table.some(existing => existing[key] === row[key])) throw new Error('UNIQUE constraint failed: ' + tableName + '.' + key);
+      const key = PRIMARY_KEYS[tableName];
+      if (key && Object.hasOwn(row, key) && table.some(existing => existing[key] === row[key])) {
+        throw new Error('UNIQUE constraint failed: ' + tableName + '.' + key);
+      }
       table.push(row);
       return { meta: { changes: 1 } };
     }
