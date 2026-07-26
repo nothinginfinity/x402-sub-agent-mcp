@@ -31,7 +31,20 @@ jobs:
         run: npm run check
 
       - name: OAuth integration tests
-        run: npm run test:oauth
+        id: oauth_tests
+        continue-on-error: true
+        run: npm run test:oauth 2>&1 | tee oauth-test-output.txt
+
+      - name: Publish OAuth test diagnostics
+        if: steps.oauth_tests.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: oauth-test-output
+          path: oauth-test-output.txt
+
+      - name: Fail after diagnostics
+        if: steps.oauth_tests.outcome == 'failure'
+        run: exit 1
 
       - name: Full regression suite
         run: npm test
