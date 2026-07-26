@@ -157,6 +157,8 @@ class MemoryStatement {
         if (m) return { column: m[1], value: this.params[paramIndex++] };
         m = /^(\w+) = (\d+)$/.exec(clause);
         if (m) return { column: m[1], value: Number(m[2]) };
+        m = /^(\w+) = NULL$/i.exec(clause);
+        if (m) return { column: m[1], value: null };
         m = /^(\w+) = \1 \+ 1$/.exec(clause);
         if (m) return { column: m[1], increment: 1 };
         throw new Error('Unsupported UPDATE setter in test D1 mock: ' + clause);
