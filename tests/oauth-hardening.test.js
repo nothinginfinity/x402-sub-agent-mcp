@@ -32,6 +32,20 @@ function splitCsv(value) {
   return value.split(',').map(part => part.trim()).filter(Boolean);
 }
 
+function compareValues(left, op, right) {
+  // ISO timestamp / string comparisons are lexicographic, matching SQLite
+  // TEXT ordering for the ISO 8601 timestamps this recorder stores.
+  const a = String(left);
+  const b = String(right);
+  switch (op) {
+    case '>=': return a >= b;
+    case '<=': return a <= b;
+    case '<': return a < b;
+    case '>': return a > b;
+    default: return false;
+  }
+}
+
 function projectRow(row, select) {
   if (select === '*') return clone(row);
   const out = {};
@@ -50,7 +64,9 @@ const PRIMARY_KEYS = {
   oauth_auth_codes: 'code',
   oauth_access_tokens: 'token_hash',
   oauth_refresh_tokens: 'token_hash',
-  oauth_audit_log: 'id'
+  oauth_audit_log: 'id',
+  oauth_trace_events: 'id',
+  oauth_trace_config: 'name'
 };
 
 class MemoryD1 {
@@ -113,24 +129,40 @@ class MemoryStatement {
     const match = /^SELECT (.+?) FROM (\w+)(?: WHERE (.+?))?(?: ORDER BY .+?)?(?: LIMIT (\?|\d+))?$/i.exec(this.sql);
     if (!match) throw new Error('Unsupported SELECT in test D1 mock: ' + this.sql);
     const [, select, tableName, whereClause, limitToken] = match;
-    let paramIndex = 0;
-    let rows = this.db.table(tableName).filter(row => {
-      if (!whereClause) return true;
-      const clauses = whereClause.split(/\s+AND\s+/i);
-      return clauses.every(clause => {
-        let m = /^(\w+) = \?$/.exec(clause);
-        if (m) return row[m[1]] === this.params[paramIndex++];
-        m = /^(\w+) = (\d+)$/.exec(clause);
-        if (m) return Number(row[m[1]]) === Number(m[2]);
-        m = /^(\w+) != '([^']+)'$/.exec(clause);
-        if (m) return row[m[1]] !== m[2];
-        m = /^(\w+) IS NOT NULL$/i.exec(clause);
-        if (m) return row[m[1]] != null;
-        throw new Error('Unsupported WHERE clause in test D1 mock: ' + clause);
-      });
-    });
+    // Pre-bind the WHERE predicates ONCE, in clause order, so placeholder
+    // params are consumed a single time -- not re-consumed per row (the naive
+    // per-row mutation silently mis-binds any query that scans >1 row).
+    let whereParamIndex = 0;
+    const predicates = whereClause ? whereClause.split(/\s+AND\s+/i).map(clause => {
+      let m = /^(\w+) = \?$/.exec(clause);
+      if (m) return { column: m[1], op: '=', value: this.params[whereParamIndex++] };
+      m = /^(\w+) = (\d+)$/.exec(clause);
+      if (m) return { column: m[1], op: '=num', value: Number(m[2]) };
+      m = /^(\w+) = '([^']*)'$/.exec(clause);
+      if (m) return { column: m[1], op: '=str', value: m[2] };
+      m = /^(\w+) != '([^']+)'$/.exec(clause);
+      if (m) return { column: m[1], op: '!=str', value: m[2] };
+      m = /^(\w+) (>=|<=|<|>) \?$/.exec(clause);
+      if (m) return { column: m[1], op: m[2], value: this.params[whereParamIndex++] };
+      m = /^(\w+) IS NOT NULL$/i.exec(clause);
+      if (m) return { column: m[1], op: 'notnull' };
+      throw new Error('Unsupported WHERE clause in test D1 mock: ' + clause);
+    }) : [];
+    let rows = this.db.table(tableName).filter(row => predicates.every(p => {
+      switch (p.op) {
+        case '=': return row[p.column] === p.value;
+        case '=num': return Number(row[p.column]) === p.value;
+        case '=str': return String(row[p.column]) === p.value;
+        case '!=str': return row[p.column] !== p.value;
+        case 'notnull': return row[p.column] != null;
+        case '>=': case '<=': case '<': case '>': return compareValues(row[p.column], p.op, p.value);
+        default: return false;
+      }
+    }));
     if (/ORDER BY created_at DESC/i.test(this.sql)) rows = rows.toSorted((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
     if (/ORDER BY priority ASC/i.test(this.sql)) rows = rows.toSorted((a, b) => Number(a.priority || 0) - Number(b.priority || 0));
+    if (/ORDER BY timestamp DESC/i.test(this.sql)) rows = rows.toSorted((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)));
+    if (/ORDER BY timestamp ASC/i.test(this.sql)) rows = rows.toSorted((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
     if (limitToken) {
       const limit = limitToken === '?' ? Number(this.params.at(-1)) : Number(limitToken);
       rows = rows.slice(0, limit);
@@ -193,6 +225,27 @@ class MemoryStatement {
           else row[setter.column] = setter.value;
         }
         changes++;
+      }
+      return { meta: { changes } };
+    }
+
+    match = /^DELETE FROM (\w+) WHERE (.+)$/i.exec(this.sql);
+    if (match) {
+      const [, tableName, whereText] = match;
+      let paramIndex = 0;
+      const predicates = whereText.split(/\s+AND\s+/i).map(clause => {
+        let m = /^(\w+) = \?$/.exec(clause);
+        if (m) return { column: m[1], op: '=', value: this.params[paramIndex++] };
+        m = /^(\w+) (>=|<=|<|>) \?$/.exec(clause);
+        if (m) return { column: m[1], op: m[2], value: this.params[paramIndex++] };
+        throw new Error('Unsupported DELETE predicate in test D1 mock: ' + clause);
+      });
+      const table = this.db.table(tableName);
+      let changes = 0;
+      for (let i = table.length - 1; i >= 0; i--) {
+        const row = table[i];
+        const keep = !predicates.every(p => p.op === '=' ? row[p.column] === p.value : compareValues(row[p.column], p.op, p.value));
+        if (!keep) { table.splice(i, 1); changes++; }
       }
       return { meta: { changes } };
     }
@@ -467,3 +520,205 @@ test('static bearer compatibility retains full tool access', async () => {
   assert.equal(result.response.status, 200);
   assert.equal(result.body.result.isError, false);
 });
+
+// ===================================================================
+// OAuth Flight Recorder (V1.4.6) tests
+// ===================================================================
+
+function traceEvents(env, filter) {
+  return env.DB.table('oauth_trace_events').filter(row => !filter || filter(row));
+}
+
+async function adminGrant(env, overrides = {}) {
+  // A full-access (mcp:admin) OAuth token, obtained the only sanctioned way:
+  // the consent-page checkbox. Used to reach the admin-gated trace tools.
+  const client = await registerClient(env, { client_name: overrides.client_name || 'Claude.ai' });
+  const grant = await issueAuthorizationCode(env, client, { grantAdmin: true, scope: overrides.scope || 'wallet:read offline_access' });
+  const issued = await exchangeCode(env, client, grant);
+  assert.equal(issued.response.status, 200, JSON.stringify(issued.body));
+  return { client, token: issued.body.access_token };
+}
+
+test('flight recorder writes a hashed, secret-free trail across a full successful flow', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env, { client_name: 'ChatGPT' });
+  const grant = await issueAuthorizationCode(env, client);
+  const issued = await exchangeCode(env, client, grant);
+  assert.equal(issued.response.status, 200);
+
+  const events = traceEvents(env);
+  assert.ok(events.length >= 3, 'expected discovery/authorize/token trace events');
+
+  // The full-flow markers must be present.
+  const types = new Set(events.map(e => e.event_type));
+  assert.ok(types.has('login_ok'));
+  assert.ok(types.has('token_issued'));
+
+  // SECURITY INVARIANT: no raw secret ever lands in the recorder. The raw
+  // code, verifier, and access/refresh tokens must not appear in any column.
+  const secrets = [grant.code, grant.verifier, issued.body.access_token, issued.body.refresh_token].filter(Boolean);
+  for (const row of events) {
+    const serialized = JSON.stringify(row);
+    for (const secret of secrets) {
+      assert.ok(!serialized.includes(secret), 'raw secret leaked into trace event: ' + row.event_type);
+    }
+  }
+  // The stored authorization_code_hash must be the DIGEST, not the raw code.
+  const codeIssued = events.find(e => e.event_type === 'login_ok');
+  assert.equal(codeIssued.authorization_code_hash, sha256Hex(grant.code));
+
+  // client_ip / user_agent hashing: when a UA is present it is stored hashed.
+  const withUa = events.find(e => e.user_agent_hash);
+  if (withUa) assert.match(withUa.user_agent_hash, /^[0-9a-f]{64}$/);
+});
+
+test('oauth_trace_get reconstructs one flow as an ordered timeline', async () => {
+  const env = makeEnv();
+  const { token } = await adminGrant(env);
+  // Drive one correlated flow through /mcp using an explicit trace id header.
+  const traceId = 'trace-e2e-1';
+  const headers = { 'content-type': 'application/json', authorization: 'Bearer ' + token, 'x-oauth-trace-id': traceId };
+  await request(env, '/mcp', { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) });
+  await request(env, '/mcp', { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) });
+  await request(env, '/mcp', { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'oauth_trace_get', arguments: { trace_id: traceId } } }) });
+
+  const listed = await mcp(env, token, 'tools/call', { name: 'oauth_trace_get', arguments: { trace_id: traceId } });
+  assert.equal(listed.response.status, 200);
+  const payload = JSON.parse(listed.body.result.content[0].text);
+  assert.equal(payload.found, true);
+  assert.equal(payload.trace_id, traceId);
+  const timelineTypes = payload.timeline.map(e => e.event);
+  assert.ok(timelineTypes.includes('initialize'));
+  assert.ok(timelineTypes.includes('tools_list'));
+  // Timeline must be non-decreasing in time.
+  const times = payload.timeline.map(e => e.at);
+  assert.deepEqual(times, [...times].sort());
+});
+
+test('flight recorder captures a replay attempt as a replay-outcome event', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env);
+  const grant = await issueAuthorizationCode(env, client);
+  await exchangeCode(env, client, grant);
+  await exchangeCode(env, client, grant); // replay
+  const replays = traceEvents(env, r => r.outcome === 'replay');
+  assert.ok(replays.length >= 1, 'expected a replay-outcome trace event');
+  assert.equal(replays[0].authorization_code_hash, sha256Hex(grant.code));
+  assert.equal(replays[0].error, 'invalid_grant');
+});
+
+test('flight recorder captures an expired authorization code', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env);
+  const grant = await issueAuthorizationCode(env, client);
+  env.DB.table('oauth_auth_codes')[0].expires_at = new Date(Date.now() - 1000).toISOString();
+  await exchangeCode(env, client, grant);
+  const expired = traceEvents(env, r => r.outcome === 'expired');
+  assert.ok(expired.length >= 1, 'expected an expired-outcome trace event');
+});
+
+test('flight recorder captures a PKCE failure distinctly', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env);
+  const grant = await issueAuthorizationCode(env, client);
+  await exchangeCode(env, client, grant, { verifier: 'wrong-verifier'.repeat(6) });
+  const pkce = traceEvents(env, r => r.event_type === 'pkce_failure');
+  assert.equal(pkce.length, 1);
+  assert.equal(pkce[0].outcome, 'pkce_failure');
+});
+
+test('flight recorder captures a resource mismatch at authorize', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env);
+  await authorize(env, client, { resource: 'https://foreign.example/mcp' });
+  const mismatch = traceEvents(env, r => r.outcome === 'resource_mismatch');
+  assert.ok(mismatch.length >= 1, 'expected a resource_mismatch trace event');
+  assert.equal(mismatch[0].error, 'invalid_target');
+});
+
+test('flight recorder captures an unauthorized MCP request', async () => {
+  const env = makeEnv();
+  const res = await mcp(env, 'not-a-real-token', 'initialize', {});
+  assert.equal(res.response.status, 401);
+  const unauth = traceEvents(env, r => r.event_type === 'unauthorized');
+  assert.ok(unauth.length >= 1);
+  assert.equal(unauth[0].outcome, 'unauthorized');
+  assert.equal(unauth[0].http_status, 401);
+});
+
+test('flight recorder distinguishes a wallet authorization failure', async () => {
+  const env = makeEnv();
+  // A read-only OAuth token (no admin, no transfer scope) calling a wallet tool.
+  const client = await registerClient(env, { client_name: 'ChatGPT' });
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
+  const issued = await exchangeCode(env, client, grant);
+  const denied = await mcp(env, issued.body.access_token, 'tools/call', { name: 'circle_transfer', arguments: { wallet_id: 'w', destination_address: '0x0', amount: '0.01' } });
+  assert.equal(denied.response.status, 403);
+  const walletFail = traceEvents(env, r => r.event_type === 'wallet_authz_fail');
+  assert.equal(walletFail.length, 1);
+  assert.equal(walletFail[0].outcome, 'denied');
+});
+
+test('oauth_trace_list filters by outcome and folds into traces', async () => {
+  const env = makeEnv();
+  const { token } = await adminGrant(env);
+  // Generate a replay so there is a known error outcome to filter on.
+  const client = await registerClient(env);
+  const grant = await issueAuthorizationCode(env, client);
+  await exchangeCode(env, client, grant);
+  await exchangeCode(env, client, grant);
+
+  const res = await mcp(env, token, 'tools/call', { name: 'oauth_trace_list', arguments: { outcome: 'replay' } });
+  const payload = JSON.parse(res.body.result.content[0].text);
+  assert.equal(payload.ok, true);
+  assert.ok(payload.events.every(e => e.outcome === 'replay'));
+  assert.ok(payload.traces.length >= 1);
+});
+
+test('oauth_trace_analyze surfaces a likely cause and suggested fix', async () => {
+  const env = makeEnv();
+  const { token } = await adminGrant(env);
+  // Create a PKCE failure under a known trace id via the /token path is not
+  // header-correlated (browser step), so drive a header-correlated unauthorized
+  // flow instead and analyze it.
+  const traceId = 'trace-analyze-1';
+  await request(env, '/mcp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer bad-token', 'x-oauth-trace-id': traceId },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'subagent_status', arguments: {} } })
+  });
+  const res = await mcp(env, token, 'tools/call', { name: 'oauth_trace_analyze', arguments: { trace_id: traceId } });
+  const payload = JSON.parse(res.body.result.content[0].text);
+  assert.equal(payload.found, true);
+  assert.ok(payload.likely_client_issue.length >= 1);
+  assert.ok(payload.suggested_fix.length >= 1);
+});
+
+test('oauth_trace_prune deletes only events older than the retention window', async () => {
+  const env = makeEnv();
+  const { token } = await adminGrant(env);
+  const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+  const recent = nowIsoTest();
+  env.DB.table('oauth_trace_events').push(
+    { id: 'old1', trace_id: 't-old', timestamp: old, event_type: 'discovery', created_at: old },
+    { id: 'new1', trace_id: 't-new', timestamp: recent, event_type: 'discovery', created_at: recent }
+  );
+  const res = await mcp(env, token, 'tools/call', { name: 'oauth_trace_prune', arguments: { retention_days: '30' } });
+  const payload = JSON.parse(res.body.result.content[0].text);
+  assert.equal(payload.ok, true);
+  assert.ok(payload.deleted >= 1);
+  const remaining = env.DB.table('oauth_trace_events').map(r => r.id);
+  assert.ok(!remaining.includes('old1'));
+  assert.ok(remaining.includes('new1'));
+});
+
+test('trace tools are unreachable for a non-admin OAuth token', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env, { client_name: 'ChatGPT' });
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
+  const issued = await exchangeCode(env, client, grant);
+  const denied = await mcp(env, issued.body.access_token, 'tools/call', { name: 'oauth_trace_list', arguments: {} });
+  assert.equal(denied.response.status, 403);
+});
+
+function nowIsoTest() { return new Date().toISOString(); }
