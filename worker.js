@@ -1697,6 +1697,7 @@ async function handleTokenEndpoint(req, env) {
       return j({ error: 'invalid_grant', error_description: 'code does not match client_id/redirect_uri' }, 400);
     }
     if (new Date(codeRow.expires_at).getTime() < Date.now()) {
+      await oauthAudit(env, 'authorization_code_expired', { client_id: clientId, detail: 'atomic claim rejected' });
       return j({ error: 'invalid_grant', error_description: 'authorization code expired' }, 400);
     }
     const computedChallenge = await sha256B64url(codeVerifier);
