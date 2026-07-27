@@ -1416,6 +1416,7 @@ function authServerMetadata(origin) {
     token_endpoint: origin + '/token',
     registration_endpoint: origin + '/register',
     revocation_endpoint: origin + '/revoke',
+    protected_resources: [origin, origin + '/mcp'],
     scopes_supported: OAUTH_SCOPES_SUPPORTED,
     response_types_supported: ['code'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
@@ -1682,6 +1683,13 @@ async function handleTokenEndpoint(req, env) {
     // Atomic one-time claim -- succeeds exactly once even under a concurrent replay.
     const claim = await dbRun(env, 'UPDATE oauth_auth_codes SET used = 1 WHERE code = ? AND used = 0', [codeHash]);
     if (!claim.meta || claim.meta.changes !== 1) {
+      try {
+        const failedCodeRow = await dbFirst(env, 'SELECT * FROM oauth_auth_codes WHERE code = ?', [codeHash]);
+        let event = 'authorization_code_redemption_failed';
+        if (failedCodeRow && Number(failedCodeRow.used) === 1) event = 'authorization_code_replay';
+        else if (failedCodeRow && new Date(failedCodeRow.expires_at).getTime() < Date.now()) event = 'authorization_code_expired';
+        await oauthAudit(env, event, { client_id: clientId, detail: failedCodeRow ? 'atomic claim rejected' : 'authorization code not found' });
+      } catch (e) { /* failure classification and auditing are best-effort */ }
       return j({ error: 'invalid_grant', error_description: 'authorization code is invalid, expired, or already used' }, 400);
     }
     const codeRow = await dbFirst(env, 'SELECT * FROM oauth_auth_codes WHERE code = ?', [codeHash]);
