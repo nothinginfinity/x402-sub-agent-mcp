@@ -16,7 +16,7 @@
 // on this for real mainnet money movement — the protocol is still young
 // and facilitator wire formats vary slightly between providers.
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 const WORKER = 'x402-sub-agent-mcp';
 const X402_VERSION = 1;
 const DEFAULT_FACILITATOR = 'https://x402.org/facilitator';
@@ -1206,7 +1206,18 @@ const toolSchemas = [
     inputSchema: obj({ wallet_id: str, destination_address: str, amount: str, blockchain: str, token_address: str, fee_level: str }, ['wallet_id', 'destination_address', 'amount']) },
   { name: 'circle_get_transaction', description: 'Look up a Circle transaction by id -- returns status and, once confirmed, the on-chain txHash you can check on a block explorer.', inputSchema: obj({ transaction_id: str }, ['transaction_id']) },
   { name: 'circle_gasless_transfer', description: "Gasless USDC transfer: a Circle wallet SIGNS an EIP-3009 TransferWithAuthorization (via Circle's sign/typedData) but never submits a transaction itself, so it never needs native gas -- an x402 facilitator (default: the same one evaluate_request/settle_payment use) submits it and pays gas. This is the correct way to move funds from an agent's Circle wallet; circle_transfer (direct on-chain send) requires the wallet to hold native gas and should be avoided for agent wallets. amount is a decimal USDC string (e.g. \"0.01\"). Optional valid_for_seconds (default 300, 30-3600) bounds how long the signed authorization remains valid before the facilitator must have submitted it.",
-    inputSchema: obj({ wallet_id: str, destination_address: str, amount: str, blockchain: str, token_address: str, facilitator_url: str, caller_id: str, resource: str, valid_for_seconds: num }, ['wallet_id', 'destination_address', 'amount']) }
+    inputSchema: obj({ wallet_id: str, destination_address: str, amount: str, blockchain: str, token_address: str, facilitator_url: str, caller_id: str, resource: str, valid_for_seconds: num }, ['wallet_id', 'destination_address', 'amount']) },
+
+  { name: 'oauth_trace_list', description: 'OAuth Flight Recorder: list recorded OAuth trace events, folded into distinct traces. Filter by trace_id, client_id, event_type, grant_type, outcome, resource, error, http_status, and a date_from/date_to (ISO) window. No secrets are ever returned -- only hashes and non-secret metadata.',
+    inputSchema: obj({ trace_id: str, client_id: str, event_type: str, grant_type: str, outcome: str, resource: str, error: str, http_status: str, date_from: str, date_to: str, limit: num }) },
+  { name: 'oauth_trace_get', description: 'OAuth Flight Recorder: reconstruct a single OAuth flow from one trace_id as an ordered, timing-aware timeline (authorize -> token -> initialize -> tools/list -> tool calls). Returns per-event status, latency, outcome, and non-secret metadata.',
+    inputSchema: obj({ trace_id: str }, ['trace_id']) },
+  { name: 'oauth_trace_analyze', description: 'OAuth Flight Recorder: analyze a trace (optionally comparing two, e.g. Claude vs ChatGPT) and produce a timeline, the OAuth differences, likely client-side vs server-side cause, and a suggested fix. Pure analysis over already-recorded, secret-free events.',
+    inputSchema: obj({ trace_id: str, compare_trace_id: str }, ['trace_id']) },
+  { name: 'oauth_trace_prune', description: 'OAuth Flight Recorder: delete trace events older than the configured (or supplied) retention window. Returns the cutoff and the number of rows deleted.',
+    inputSchema: obj({ retention_days: str }) },
+  { name: 'oauth_trace_set_retention', description: 'OAuth Flight Recorder: set the automatic retention window (in days) for trace events. Persisted in oauth_trace_config and used by oauth_trace_prune.',
+    inputSchema: obj({ retention_days: num }, ['retention_days']) }
 ];
 
 async function callTool(env, name, args) {
@@ -1246,6 +1257,11 @@ async function callTool(env, name, args) {
     case 'circle_transfer': return circleTransfer(env, a);
     case 'circle_get_transaction': return circleGetTransaction(env, a);
     case 'circle_gasless_transfer': return circleGaslessTransfer(env, a);
+    case 'oauth_trace_list': return oauthTraceList(env, a);
+    case 'oauth_trace_get': return oauthTraceGet(env, a);
+    case 'oauth_trace_analyze': return oauthTraceAnalyze(env, a);
+    case 'oauth_trace_prune': return oauthTracePrune(env, a);
+    case 'oauth_trace_set_retention': return oauthTraceSetRetention(env, a);
     default: throw new Error('Unknown tool: ' + name);
   }
 }
@@ -1443,6 +1459,301 @@ async function oauthAudit(env, event, opts) {
   } catch (e) { /* audit logging is best-effort */ }
 }
 
+// ==== OAuth Flight Recorder (V1.4.6) =================================
+// A fine-grained, correlated, timing-aware trace of an OAuth flow that makes
+// a whole session reproducible from ONE trace_id -- without ever persisting a
+// secret. It complements (does not replace) oauth_audit_log: the audit log is
+// the coarse human event stream, the flight recorder is the debuggable,
+// per-request, cross-client record.
+//
+// SECURITY INVARIANT: only hashes of credential-shaped values are ever
+// written. Raw bearer tokens, refresh tokens, authorization codes, client
+// secrets, and PKCE verifiers must never reach this table. traceHash() is the
+// single chokepoint for turning a sensitive value into a stored digest.
+
+const OAUTH_TRACE_DEFAULT_RETENTION_DAYS = 30;
+const OAUTH_TRACE_HEADER = 'x-oauth-trace-id';
+
+async function traceHash(value) {
+  if (value == null || value === '') return null;
+  return await sha256Hex(String(value));
+}
+
+function traceClientIp(req) {
+  // Cloudflare populates CF-Connecting-IP; fall back to X-Forwarded-For's
+  // first hop. Only ever hashed, never stored raw.
+  try {
+    return req.headers.get('cf-connecting-ip')
+      || (req.headers.get('x-forwarded-for') || '').split(',')[0].trim()
+      || null;
+  } catch (e) { return null; }
+}
+
+// One trace_id per OAuth flow. Reuse a client-supplied correlation id when
+// present (so authorize -> token -> initialize -> tools/list -> tool calls
+// share a trace even across separate HTTP requests), otherwise mint one.
+// Also returns any Mcp-Session-Id the client sent, for column-level joins.
+function traceContext(req) {
+  let traceId = null;
+  let sessionId = null;
+  try {
+    traceId = clean(req.headers.get(OAUTH_TRACE_HEADER)) || null;
+    sessionId = clean(req.headers.get('mcp-session-id')) || null;
+  } catch (e) { /* header access is best-effort */ }
+  if (!traceId) traceId = sessionId || uid('otrace');
+  return { traceId, sessionId };
+}
+
+// Best-effort insert. Like oauthAudit, this must NEVER throw into the request
+// it is recording -- a broken recorder can never break an OAuth flow.
+async function recordTraceEvent(env, fields) {
+  const f = fields || {};
+  try {
+    const ts = f.timestamp || nowIso();
+    let metadata = null;
+    if (f.metadata != null) {
+      try { metadata = typeof f.metadata === 'string' ? f.metadata : JSON.stringify(f.metadata); }
+      catch (e) { metadata = null; }
+    }
+    await dbRun(env, `INSERT INTO oauth_trace_events
+        (id, trace_id, timestamp, event_type, client_id, grant_type, resource, session_id, request_id,
+         http_status, latency_ms, client_ip_hash, user_agent_hash, authorization_code_hash, refresh_token_hash,
+         outcome, error, metadata_json, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [uid('otr'), f.trace_id || uid('otrace'), ts, f.event_type || 'unknown',
+        f.client_id || null, f.grant_type || null, f.resource || null, f.session_id || null, f.request_id || null,
+        (f.http_status == null ? null : Number(f.http_status)),
+        (f.latency_ms == null ? null : Number(f.latency_ms)),
+        f.client_ip_hash || null, f.user_agent_hash || null,
+        f.authorization_code_hash || null, f.refresh_token_hash || null,
+        f.outcome || null, f.error || null, metadata, ts]);
+  } catch (e) { /* flight recording is best-effort; never breaks the flow */ }
+}
+
+// Convenience wrapper: derive trace context + IP/UA hashes from the Request
+// and record in one call. Used by every request-scoped call site so no
+// endpoint has to re-derive the hashing.
+async function traceFromRequest(env, req, fields) {
+  const f = fields || {};
+  const ctx = f.__ctx || traceContext(req);
+  let ipHash = f.client_ip_hash;
+  let uaHash = f.user_agent_hash;
+  try {
+    if (ipHash === undefined) ipHash = await traceHash(traceClientIp(req));
+    if (uaHash === undefined) uaHash = await traceHash((req.headers.get('user-agent') || '') || null);
+  } catch (e) { /* best-effort */ }
+  await recordTraceEvent(env, {
+    ...f,
+    trace_id: f.trace_id || ctx.traceId,
+    session_id: f.session_id !== undefined ? f.session_id : ctx.sessionId,
+    client_ip_hash: ipHash,
+    user_agent_hash: uaHash
+  });
+}
+
+async function traceRetentionDays(env) {
+  try {
+    const row = await dbFirst(env, "SELECT value FROM oauth_trace_config WHERE name = 'retention_days'");
+    const n = row ? Number(row.value) : NaN;
+    if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  } catch (e) { /* fall through to default */ }
+  return OAUTH_TRACE_DEFAULT_RETENTION_DAYS;
+}
+
+// ---- Flight Recorder tools -----------------------------------------
+async function oauthTraceList(env, a) {
+  requireDb(env);
+  const limit = limitNum(a.limit, 50, 1, 500);
+  const clauses = [];
+  const params = [];
+  if (clean(a.trace_id)) { clauses.push('trace_id = ?'); params.push(clean(a.trace_id)); }
+  if (clean(a.client_id)) { clauses.push('client_id = ?'); params.push(clean(a.client_id)); }
+  if (clean(a.event_type)) { clauses.push('event_type = ?'); params.push(clean(a.event_type)); }
+  if (clean(a.grant_type)) { clauses.push('grant_type = ?'); params.push(clean(a.grant_type)); }
+  if (clean(a.outcome)) { clauses.push('outcome = ?'); params.push(clean(a.outcome)); }
+  if (clean(a.resource)) { clauses.push('resource = ?'); params.push(clean(a.resource)); }
+  if (clean(a.error)) { clauses.push('error = ?'); params.push(clean(a.error)); }
+  if (clean(a.http_status)) { clauses.push('http_status = ?'); params.push(Number(clean(a.http_status))); }
+  if (clean(a.date_from)) { clauses.push('timestamp >= ?'); params.push(clean(a.date_from)); }
+  if (clean(a.date_to)) { clauses.push('timestamp <= ?'); params.push(clean(a.date_to)); }
+  const where = clauses.length ? ' WHERE ' + clauses.join(' AND ') : '';
+  const rows = await dbAll(env, 'SELECT * FROM oauth_trace_events' + where + ' ORDER BY timestamp DESC LIMIT ?', [...params, limit]);
+  // Fold into distinct traces so a caller can pick one to expand, while still
+  // returning the raw matching events for direct inspection.
+  const traces = new Map();
+  for (const r of rows) {
+    let t = traces.get(r.trace_id);
+    if (!t) { t = { trace_id: r.trace_id, events: 0, first: r.timestamp, last: r.timestamp, clients: new Set(), event_types: new Set(), outcomes: new Set() }; traces.set(r.trace_id, t); }
+    t.events++;
+    if (r.timestamp < t.first) t.first = r.timestamp;
+    if (r.timestamp > t.last) t.last = r.timestamp;
+    if (r.client_id) t.clients.add(r.client_id);
+    if (r.event_type) t.event_types.add(r.event_type);
+    if (r.outcome) t.outcomes.add(r.outcome);
+  }
+  const traceSummaries = [...traces.values()].map(t => ({
+    trace_id: t.trace_id, events: t.events, first: t.first, last: t.last,
+    clients: [...t.clients], event_types: [...t.event_types], outcomes: [...t.outcomes]
+  }));
+  return { ok: true, count: rows.length, traces: traceSummaries, events: rows };
+}
+
+async function oauthTraceGet(env, a) {
+  requireDb(env);
+  const traceId = clean(a.trace_id);
+  if (!traceId) throw new Error('trace_id is required');
+  const rows = await dbAll(env, 'SELECT * FROM oauth_trace_events WHERE trace_id = ? ORDER BY timestamp ASC LIMIT ?', [traceId, 1000]);
+  if (!rows.length) return { ok: true, trace_id: traceId, found: false, events: [] };
+  const timeline = rows.map(r => ({
+    at: r.timestamp, event: r.event_type, client_id: r.client_id, grant_type: r.grant_type,
+    resource: r.resource, http_status: r.http_status, latency_ms: r.latency_ms,
+    outcome: r.outcome, error: r.error, request_id: r.request_id,
+    metadata: safeJson(r.metadata_json)
+  }));
+  const first = rows[0].timestamp;
+  const last = rows[rows.length - 1].timestamp;
+  const totalMs = new Date(last).getTime() - new Date(first).getTime();
+  const clients = [...new Set(rows.map(r => r.client_id).filter(Boolean))];
+  return {
+    ok: true, trace_id: traceId, found: true, events: rows.length,
+    started_at: first, ended_at: last, total_ms: Number.isFinite(totalMs) ? totalMs : null,
+    clients, timeline
+  };
+}
+
+function safeJson(s) {
+  if (s == null) return null;
+  try { return JSON.parse(s); } catch (e) { return s; }
+}
+
+// Cross-client comparison: given a trace (or two), reconstruct the flow,
+// contrast it against the canonical Claude/ChatGPT connector expectations,
+// and surface likely client-side vs server-side causes with a suggested fix.
+// Pure analysis over already-recorded, secret-free events -- no new I/O risk.
+async function oauthTraceAnalyze(env, a) {
+  requireDb(env);
+  const traceId = clean(a.trace_id);
+  if (!traceId) throw new Error('trace_id is required');
+  const self = await oauthTraceGet(env, { trace_id: traceId });
+  if (!self.found) return { ok: true, trace_id: traceId, found: false };
+
+  let compare = null;
+  if (clean(a.compare_trace_id)) {
+    const other = await oauthTraceGet(env, { trace_id: clean(a.compare_trace_id) });
+    if (other.found) compare = other;
+  }
+
+  const events = self.timeline;
+  const seen = new Set(events.map(e => e.event));
+  const has = t => seen.has(t);
+  const errored = events.filter(e => e.outcome && e.outcome !== 'ok');
+  const clientLabel = (self.clients || []).map(c => driverFromClientMeta(events, c)).join(', ') || 'unknown';
+
+  // Expected canonical order for an MCP OAuth connector.
+  const EXPECTED = ['discovery', 'authorize_view', 'login_ok', 'token_issued', 'initialize', 'tools_list', 'tool_call'];
+  const reached = EXPECTED.filter(has);
+  const missing = EXPECTED.filter(e => !has(e));
+
+  const oauthDifferences = [];
+  const likelyClientIssue = [];
+  const likelyServerIssue = [];
+  const suggestedFix = [];
+
+  for (const e of errored) {
+    switch (e.outcome) {
+      case 'resource_mismatch':
+      case 'mismatch':
+        oauthDifferences.push('Resource/audience mismatch at ' + e.event + ' (resource=' + (e.resource || 'n/a') + ')');
+        likelyClientIssue.push('Client sent a resource indicator that is not the canonical origin or origin+/mcp.');
+        suggestedFix.push('Have the client use exactly the resource advertised in /.well-known/oauth-protected-resource; the server canonicalizes trailing slashes but not foreign hosts.');
+        break;
+      case 'pkce_failure':
+        oauthDifferences.push('PKCE verification failed at ' + e.event);
+        likelyClientIssue.push('Client code_verifier did not match the S256 code_challenge, or a plain challenge was attempted.');
+        suggestedFix.push('Ensure the client generates a fresh S256 verifier/challenge pair per authorize call and reuses the same verifier at /token.');
+        break;
+      case 'replay':
+        oauthDifferences.push('Replay detected at ' + e.event);
+        likelyServerIssue.push('A code or refresh token was presented twice; the server correctly rejected the second use.');
+        suggestedFix.push('This is expected hardening, not a bug: the client must not retry an already-redeemed code or a rotated refresh token.');
+        break;
+      case 'expired':
+        oauthDifferences.push('Expired credential at ' + e.event);
+        likelyClientIssue.push('Client took too long between authorize and token (code TTL) or reused an expired token.');
+        suggestedFix.push('Reduce client latency between authorize and token exchange, or refresh before expiry.');
+        break;
+      case 'unauthorized':
+        oauthDifferences.push('Unauthorized request at ' + e.event + ' (status ' + (e.http_status || '401') + ')');
+        likelyClientIssue.push('Client called a gated MCP method without a valid bearer, so discovery should have been triggered by the 401 + WWW-Authenticate.');
+        suggestedFix.push('Confirm the client reads WWW-Authenticate on 401 and starts the authorization-server discovery flow.');
+        break;
+      case 'denied':
+        oauthDifferences.push('Scope denied at ' + e.event + ' for ' + ((e.metadata && e.metadata.tool_name) || 'a tool'));
+        likelyServerIssue.push('Token scope does not cover the requested tool; mcp:admin is grant-only via consent checkbox.');
+        suggestedFix.push('Request the correct scope at authorize time, or grant mcp:admin via the consent page for full access.');
+        break;
+      default:
+        oauthDifferences.push('Error outcome "' + e.outcome + '" at ' + e.event + (e.error ? ' (' + e.error + ')' : ''));
+    }
+  }
+
+  if (missing.length && !errored.length) {
+    const stalledAfter = reached[reached.length - 1] || '(nothing)';
+    likelyClientIssue.push('Flow stalled after ' + stalledAfter + '; the client never sent the next expected step (' + (missing[0] || 'n/a') + ').');
+    suggestedFix.push('Inspect the client between ' + stalledAfter + ' and ' + (missing[0] || 'the next step') + ' -- the server recorded no follow-up request.');
+  }
+
+  const result = {
+    ok: true, trace_id: traceId, found: true, client: clientLabel,
+    timeline: events,
+    reached_steps: reached,
+    missing_steps: missing,
+    oauth_differences: dedupe(oauthDifferences),
+    likely_client_issue: dedupe(likelyClientIssue),
+    likely_server_issue: dedupe(likelyServerIssue),
+    suggested_fix: dedupe(suggestedFix)
+  };
+  if (compare) {
+    result.comparison = {
+      compare_trace_id: compare.trace_id,
+      compare_client: (compare.clients || []).join(', ') || 'unknown',
+      compare_reached: EXPECTED.filter(step => compare.timeline.some(e => e.event === step)),
+      this_reached: reached,
+      divergence: EXPECTED.filter(step => has(step) !== compare.timeline.some(e => e.event === step))
+        .map(step => ({ step, this_trace: has(step), compare_trace: compare.timeline.some(e => e.event === step) }))
+    };
+  }
+  return result;
+}
+
+function driverFromClientMeta(events, clientId) {
+  for (const e of events) {
+    if (e.client_id === clientId && e.metadata && e.metadata.driver) return e.metadata.driver + ' (' + clientId + ')';
+  }
+  return clientId;
+}
+
+function dedupe(arr) { return [...new Set(arr)]; }
+
+async function oauthTracePrune(env, a) {
+  requireDb(env);
+  const days = clean(a.retention_days) ? Math.max(1, Math.floor(Number(clean(a.retention_days)))) : await traceRetentionDays(env);
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const res = await dbRun(env, 'DELETE FROM oauth_trace_events WHERE timestamp < ?', [cutoff]);
+  return { ok: true, retention_days: days, cutoff, deleted: (res.meta && res.meta.changes) || 0 };
+}
+
+async function oauthTraceSetRetention(env, a) {
+  requireDb(env);
+  const days = Math.max(1, Math.floor(Number(clean(a.retention_days))));
+  if (!Number.isFinite(days)) throw new Error('retention_days must be a positive number');
+  const existing = await dbFirst(env, "SELECT name FROM oauth_trace_config WHERE name = 'retention_days'");
+  if (existing) await dbRun(env, "UPDATE oauth_trace_config SET value = ?, updated_at = ? WHERE name = 'retention_days'", [String(days), nowIso()]);
+  else await dbRun(env, 'INSERT INTO oauth_trace_config (name, value, updated_at) VALUES (?,?,?)', ['retention_days', String(days), nowIso()]);
+  return { ok: true, retention_days: days };
+}
+// ==== end OAuth Flight Recorder =====================================
+
 // ---- dynamic client registration (RFC 7591) ----
 async function registerOauthClient(env, body) {
   const b = body || {};
@@ -1588,14 +1899,19 @@ async function handleAuthorizePost(req, env, origin) {
   };
   const password = String(form.get('password') || '');
   const v = await validateAuthorizeRequest(env, params, origin);
-  if (!v.ok) return oauthAuthorizeErrorResponse(v, params);
+  if (!v.ok) {
+    await traceFromRequest(env, req, { event_type: 'authorize_view', client_id: params.client_id || null, resource: params.resource || null, http_status: v.safe_redirect ? 302 : 400, latency_ms: 0, outcome: v.error === 'invalid_target' ? 'resource_mismatch' : 'error', error: v.error });
+    return oauthAuthorizeErrorResponse(v, params);
+  }
 
   if (!env.OAUTH_LOGIN_PASSWORD) {
     return htmlResponse('<h1>Authorization not configured</h1><p>OAUTH_LOGIN_PASSWORD is not set on this Worker.</p>', 503);
   }
   const subjectRow = await getOrCreateSubject(env);
   const nowMs = Date.now();
+  const azT0 = Date.now();
   if (subjectRow.locked_until && new Date(subjectRow.locked_until).getTime() > nowMs) {
+    await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 429, latency_ms: Date.now() - azT0, outcome: 'denied', error: 'locked', metadata: { reason: 'lockout' } });
     return htmlResponse(renderLoginForm(params, v.client, 'Too many failed attempts. Try again later.'), 429);
   }
   if (!timingSafeEqual(password, env.OAUTH_LOGIN_PASSWORD)) {
@@ -1603,6 +1919,7 @@ async function handleAuthorizePost(req, env, origin) {
     const lockedUntil = attempts >= OAUTH_LOGIN_LOCKOUT_THRESHOLD ? new Date(nowMs + OAUTH_LOGIN_LOCKOUT_SECONDS * 1000).toISOString() : null;
     await dbRun(env, 'UPDATE oauth_subjects SET failed_attempts = ?, locked_until = ? WHERE subject = ?', [attempts, lockedUntil, subjectRow.subject]);
     await oauthAudit(env, 'login_fail', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'attempt ' + attempts });
+    await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 401, latency_ms: Date.now() - azT0, outcome: 'error', error: 'invalid_credentials', metadata: { attempt: attempts, locked: !!lockedUntil } });
     return htmlResponse(renderLoginForm(params, v.client, 'Incorrect password.'), 401);
   }
   await dbRun(env, 'UPDATE oauth_subjects SET failed_attempts = 0, locked_until = NULL WHERE subject = ?', [subjectRow.subject]);
@@ -1621,6 +1938,7 @@ async function handleAuthorizePost(req, env, origin) {
     [codeHash, v.client.client_id, subjectRow.subject, params.redirect_uri, grantedScopes.join(' '), v.resource,
       params.code_challenge, params.code_challenge_method, expiresAt, nowIso()]);
   await oauthAudit(env, 'login_ok', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'code_issued scope=' + grantedScopes.join(' ') });
+  await traceFromRequest(env, req, { event_type: 'login_ok', client_id: v.client.client_id, resource: v.resource || null, http_status: 302, latency_ms: Date.now() - azT0, authorization_code_hash: codeHash, outcome: 'ok', metadata: { scope: grantedScopes.join(' '), admin_granted: grantAdmin } });
 
   const redirectUrl = new URL(params.redirect_uri);
   redirectUrl.searchParams.set('code', code);
@@ -1660,12 +1978,17 @@ async function handleTokenEndpoint(req, env) {
     get = k => clean(fd.get(k));
   }
 
+  const tkT0 = Date.now();
   const clientId = get('client_id');
   const clientSecret = get('client_secret');
   const client = await dbFirst(env, 'SELECT * FROM oauth_clients WHERE client_id = ? AND enabled = 1', [clientId]);
-  if (!client) return j({ error: 'invalid_client', error_description: 'unknown client_id' }, 401);
+  if (!client) {
+    await traceFromRequest(env, req, { event_type: 'token', client_id: clientId || null, http_status: 401, latency_ms: Date.now() - tkT0, outcome: 'error', error: 'invalid_client' });
+    return j({ error: 'invalid_client', error_description: 'unknown client_id' }, 401);
+  }
   if (client.token_endpoint_auth_method === 'client_secret_post') {
     if (!clientSecret || (await sha256Hex(clientSecret)) !== client.client_secret_hash) {
+      await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, http_status: 401, latency_ms: Date.now() - tkT0, outcome: 'error', error: 'invalid_client' });
       return j({ error: 'invalid_client', error_description: 'invalid client_secret' }, 401);
     }
   }
@@ -1677,48 +2000,67 @@ async function handleTokenEndpoint(req, env) {
     const redirectUri = get('redirect_uri');
     const codeVerifier = get('code_verifier');
     if (!code || !redirectUri || !codeVerifier) {
+      await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'authorization_code', http_status: 400, latency_ms: Date.now() - tkT0, outcome: 'error', error: 'invalid_request' });
       return j({ error: 'invalid_request', error_description: 'code, redirect_uri, and code_verifier are required' }, 400);
     }
     const codeHash = await sha256Hex(code);
     // Atomic one-time claim -- succeeds exactly once even under a concurrent replay.
     const claim = await dbRun(env, 'UPDATE oauth_auth_codes SET used = 1 WHERE code = ? AND used = 0', [codeHash]);
     if (!claim.meta || claim.meta.changes !== 1) {
+      let traceOutcome = 'error';
       try {
         const failedCodeRow = await dbFirst(env, 'SELECT * FROM oauth_auth_codes WHERE code = ?', [codeHash]);
         let event = 'authorization_code_redemption_failed';
-        if (failedCodeRow && Number(failedCodeRow.used) === 1) event = 'authorization_code_replay';
-        else if (failedCodeRow && new Date(failedCodeRow.expires_at).getTime() < Date.now()) event = 'authorization_code_expired';
+        if (failedCodeRow && Number(failedCodeRow.used) === 1) { event = 'authorization_code_replay'; traceOutcome = 'replay'; }
+        else if (failedCodeRow && new Date(failedCodeRow.expires_at).getTime() < Date.now()) { event = 'authorization_code_expired'; traceOutcome = 'expired'; }
         await oauthAudit(env, event, { client_id: clientId, detail: failedCodeRow ? 'atomic claim rejected' : 'authorization code not found' });
       } catch (e) { /* failure classification and auditing are best-effort */ }
+      await traceFromRequest(env, req, { event_type: traceOutcome === 'replay' ? 'replay' : (traceOutcome === 'expired' ? 'expired' : 'token'), client_id: clientId, grant_type: 'authorization_code', http_status: 400, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: traceOutcome, error: 'invalid_grant' });
       return j({ error: 'invalid_grant', error_description: 'authorization code is invalid, expired, or already used' }, 400);
     }
     const codeRow = await dbFirst(env, 'SELECT * FROM oauth_auth_codes WHERE code = ?', [codeHash]);
     if (!codeRow || codeRow.client_id !== clientId || codeRow.redirect_uri !== redirectUri) {
+      await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'authorization_code', http_status: 400, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'mismatch', error: 'invalid_grant', metadata: { reason: 'client_id/redirect_uri mismatch' } });
       return j({ error: 'invalid_grant', error_description: 'code does not match client_id/redirect_uri' }, 400);
     }
     if (new Date(codeRow.expires_at).getTime() < Date.now()) {
       await oauthAudit(env, 'authorization_code_expired', { client_id: clientId, detail: 'atomic claim rejected' });
+      await traceFromRequest(env, req, { event_type: 'expired', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 400, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'expired', error: 'invalid_grant' });
       return j({ error: 'invalid_grant', error_description: 'authorization code expired' }, 400);
     }
     const computedChallenge = await sha256B64url(codeVerifier);
     if (computedChallenge !== codeRow.code_challenge) {
+      await traceFromRequest(env, req, { event_type: 'pkce_failure', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 400, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'pkce_failure', error: 'invalid_grant' });
       return j({ error: 'invalid_grant', error_description: 'code_verifier does not match code_challenge' }, 400);
     }
     const scopes = codeRow.scope.split(/\s+/).filter(Boolean);
     const wantsRefresh = scopes.includes('offline_access');
     const tokens = await issueTokenPair(env, { clientId, subject: codeRow.subject, scope: codeRow.scope, resource: codeRow.resource, includeRefresh: wantsRefresh, familyId: null });
     await oauthAudit(env, 'token_issued', { subject: codeRow.subject, client_id: clientId, detail: 'grant=authorization_code scope=' + codeRow.scope });
+    await traceFromRequest(env, req, { event_type: 'token_issued', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 200, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'ok', metadata: { scope: codeRow.scope, refresh: wantsRefresh } });
     return j(tokens);
   }
 
   if (grantType === 'refresh_token') {
     const refreshToken = get('refresh_token');
-    if (!refreshToken) return j({ error: 'invalid_request', error_description: 'refresh_token is required' }, 400);
+    if (!refreshToken) {
+      await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'refresh_token', http_status: 400, latency_ms: Date.now() - tkT0, outcome: 'error', error: 'invalid_request' });
+      return j({ error: 'invalid_request', error_description: 'refresh_token is required' }, 400);
+    }
     const tokenHash = await sha256Hex(refreshToken);
     const row = await dbFirst(env, 'SELECT * FROM oauth_refresh_tokens WHERE token_hash = ?', [tokenHash]);
-    if (!row || row.client_id !== clientId) return j({ error: 'invalid_grant', error_description: 'unknown refresh token' }, 400);
-    if (row.revoked) return j({ error: 'invalid_grant', error_description: 'refresh token revoked' }, 400);
-    if (new Date(row.expires_at).getTime() < Date.now()) return j({ error: 'invalid_grant', error_description: 'refresh token expired' }, 400);
+    if (!row || row.client_id !== clientId) {
+      await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'refresh_token', http_status: 400, latency_ms: Date.now() - tkT0, refresh_token_hash: tokenHash, outcome: 'error', error: 'invalid_grant', metadata: { reason: 'unknown refresh token' } });
+      return j({ error: 'invalid_grant', error_description: 'unknown refresh token' }, 400);
+    }
+    if (row.revoked) {
+      await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'refresh_token', resource: row.resource || null, http_status: 400, latency_ms: Date.now() - tkT0, refresh_token_hash: tokenHash, outcome: 'error', error: 'invalid_grant', metadata: { reason: 'revoked', family: row.family_id } });
+      return j({ error: 'invalid_grant', error_description: 'refresh token revoked' }, 400);
+    }
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      await traceFromRequest(env, req, { event_type: 'expired', client_id: clientId, grant_type: 'refresh_token', resource: row.resource || null, http_status: 400, latency_ms: Date.now() - tkT0, refresh_token_hash: tokenHash, outcome: 'expired', error: 'invalid_grant' });
+      return j({ error: 'invalid_grant', error_description: 'refresh token expired' }, 400);
+    }
     if (row.rotated_at) {
       // REPLAY: an already-rotated (previously exchanged) refresh token was
       // presented again -- revoke the whole family, the standard response to
@@ -1726,14 +2068,17 @@ async function handleTokenEndpoint(req, env) {
       await dbRun(env, 'UPDATE oauth_refresh_tokens SET revoked = 1 WHERE family_id = ?', [row.family_id]);
       await dbRun(env, 'UPDATE oauth_access_tokens SET revoked = 1 WHERE client_id = ? AND subject = ?', [row.client_id, row.subject]);
       await oauthAudit(env, 'refresh_replay_detected', { subject: row.subject, client_id: clientId, detail: 'family=' + row.family_id });
+      await traceFromRequest(env, req, { event_type: 'replay', client_id: clientId, grant_type: 'refresh_token', resource: row.resource || null, http_status: 400, latency_ms: Date.now() - tkT0, refresh_token_hash: tokenHash, outcome: 'replay', error: 'invalid_grant', metadata: { family: row.family_id, action: 'family_revoked' } });
       return j({ error: 'invalid_grant', error_description: 'refresh token reuse detected; token family revoked' }, 400);
     }
     await dbRun(env, 'UPDATE oauth_refresh_tokens SET rotated_at = ? WHERE token_hash = ?', [nowIso(), tokenHash]);
     const tokens = await issueTokenPair(env, { clientId, subject: row.subject, scope: row.scope, resource: row.resource, includeRefresh: true, familyId: row.family_id });
     await oauthAudit(env, 'refresh_rotated', { subject: row.subject, client_id: clientId, detail: 'family=' + row.family_id });
+    await traceFromRequest(env, req, { event_type: 'token_issued', client_id: clientId, grant_type: 'refresh_token', resource: row.resource || null, http_status: 200, latency_ms: Date.now() - tkT0, refresh_token_hash: tokenHash, outcome: 'ok', metadata: { scope: row.scope, family: row.family_id, rotated: true } });
     return j(tokens);
   }
 
+  await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: grantType || null, http_status: 400, latency_ms: Date.now() - tkT0, outcome: 'error', error: 'unsupported_grant_type' });
   return j({ error: 'unsupported_grant_type', error_description: 'only authorization_code and refresh_token are supported' }, 400);
 }
 
@@ -1814,21 +2159,38 @@ async function handleMcp(req, env) {
     // 200 here made the handshake look complete, so discovery never ran and
     // the client registered a server whose every tool call then 401'd.
     if (rpc.method === 'initialize') {
+      const mT0 = Date.now();
       const auth = await authenticate(req, env);
-      if (!auth.ok) return mcpUnauthorized(req, id, origin);
+      if (!auth.ok) {
+        await traceFromRequest(env, req, { event_type: 'unauthorized', request_id: id == null ? null : String(id), http_status: 401, latency_ms: Date.now() - mT0, outcome: 'unauthorized', error: 'missing_or_invalid_bearer', metadata: { method: 'initialize' } });
+        return mcpUnauthorized(req, id, origin);
+      }
+      await traceFromRequest(env, req, { event_type: 'initialize', client_id: auth.client_id || null, request_id: id == null ? null : String(id), http_status: 200, latency_ms: Date.now() - mT0, outcome: 'ok', metadata: { mode: auth.mode, driver: auth.driver || null } });
       return mcpResponse(req, { jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: WORKER, version: VERSION } } });
     }
     if (rpc.method === 'tools/list') {
+      const mT0 = Date.now();
       const auth = await authenticate(req, env);
-      if (!auth.ok) return mcpUnauthorized(req, id, origin);
+      if (!auth.ok) {
+        await traceFromRequest(env, req, { event_type: 'unauthorized', request_id: id == null ? null : String(id), http_status: 401, latency_ms: Date.now() - mT0, outcome: 'unauthorized', error: 'missing_or_invalid_bearer', metadata: { method: 'tools/list' } });
+        return mcpUnauthorized(req, id, origin);
+      }
+      await traceFromRequest(env, req, { event_type: 'tools_list', client_id: auth.client_id || null, request_id: id == null ? null : String(id), http_status: 200, latency_ms: Date.now() - mT0, outcome: 'ok', metadata: { mode: auth.mode, driver: auth.driver || null } });
       return mcpResponse(req, { jsonrpc: '2.0', id, result: { tools: toolSchemas } });
     }
     if (rpc.method === 'tools/call') {
+      const mT0 = Date.now();
+      const reqId = id == null ? null : String(id);
       const auth = await authenticate(req, env);
-      if (!auth.ok) return mcpUnauthorized(req, id, origin);
+      if (!auth.ok) {
+        await traceFromRequest(env, req, { event_type: 'unauthorized', request_id: reqId, http_status: 401, latency_ms: Date.now() - mT0, outcome: 'unauthorized', error: 'missing_or_invalid_bearer', metadata: { method: 'tools/call', tool_name: (rpc.params && rpc.params.name) || null } });
+        return mcpUnauthorized(req, id, origin);
+      }
       const toolName = rpc.params && rpc.params.name;
       if (auth.mode === 'oauth' && !oauthToolAllowedForScopes(toolName, auth.scope)) {
         await oauthAudit(env, 'scope_denied', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'scope=' + auth.scope.join(' ') });
+        const isWalletTool = String(toolName || '').startsWith('circle_') || String(toolName || '').includes('transfer');
+        await traceFromRequest(env, req, { event_type: isWalletTool ? 'wallet_authz_fail' : 'scope_denied', client_id: auth.client_id, request_id: reqId, http_status: 403, latency_ms: Date.now() - mT0, outcome: 'denied', error: 'insufficient_scope', metadata: { tool_name: toolName, scope: auth.scope.join(' '), driver: auth.driver } });
         return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32002, message: 'insufficient_scope: this OAuth token cannot call ' + toolName } }), {
           status: 403,
           headers: { ...CORS, 'content-type': 'application/json;charset=utf-8', 'cache-control': 'no-store', 'www-authenticate': wwwAuthenticateHeader(origin, 'insufficient_scope', 'token lacks scope for ' + toolName) }
@@ -1838,9 +2200,11 @@ async function handleMcp(req, env) {
       try {
         result = await callTool(env, toolName, (rpc.params && rpc.params.arguments) || {});
         if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=' + auth.driver + ':' + auth.subject + ' outcome=ok' });
+        await traceFromRequest(env, req, { event_type: 'tool_call', client_id: auth.client_id || null, request_id: reqId, http_status: 200, latency_ms: Date.now() - mT0, outcome: result && result.ok === false ? 'error' : 'ok', metadata: { tool_name: toolName, mode: auth.mode, driver: auth.driver || null } });
       } catch (e) {
         result = { ok: false, error: String(e.message || e) };
         if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=' + auth.driver + ':' + auth.subject + ' outcome=error: ' + result.error });
+        await traceFromRequest(env, req, { event_type: 'tool_call', client_id: auth.client_id || null, request_id: reqId, http_status: 200, latency_ms: Date.now() - mT0, outcome: 'error', error: 'tool_error', metadata: { tool_name: toolName, mode: auth.mode, driver: auth.driver || null } });
       }
       return mcpResponse(req, { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result && result.ok === false } });
     }
@@ -1853,6 +2217,7 @@ async function handleMcp(req, env) {
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
+    const t0 = Date.now();
     if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
     try {
       if (url.pathname === '/' || url.pathname === '/status' || url.pathname === '/health') return j(status(env));
@@ -1872,19 +2237,33 @@ export default {
         // RFC 9728 path-aware metadata: the /mcp variant describes the /mcp
         // resource, matching what MCP clients will send as their resource
         // indicator. The bare variant keeps describing the bare origin.
-        return j(protectedResourceMetadata(url.origin, url.pathname.endsWith('/mcp') ? url.origin + '/mcp' : url.origin));
+        const resource = url.pathname.endsWith('/mcp') ? url.origin + '/mcp' : url.origin;
+        await traceFromRequest(env, req, { event_type: 'discovery', resource, http_status: 200, latency_ms: Date.now() - t0, outcome: 'ok', metadata: { doc: 'oauth-protected-resource' } });
+        return j(protectedResourceMetadata(url.origin, resource));
       }
       if (url.pathname === '/.well-known/oauth-authorization-server' || url.pathname === '/.well-known/oauth-authorization-server/mcp') {
+        await traceFromRequest(env, req, { event_type: 'discovery', http_status: 200, latency_ms: Date.now() - t0, outcome: 'ok', metadata: { doc: 'oauth-authorization-server' } });
         return j(authServerMetadata(url.origin));
       }
       if (url.pathname === '/register' && req.method === 'POST') {
-        try { return j(await registerOauthClient(env, await readJson(req)), 201); }
-        catch (e) { return j({ error: 'invalid_client_metadata', error_description: String(e.message || e) }, 400); }
+        try {
+          const reg = await registerOauthClient(env, await readJson(req));
+          await traceFromRequest(env, req, { event_type: 'client_registered', client_id: reg.client_id, http_status: 201, latency_ms: Date.now() - t0, outcome: 'ok' });
+          return j(reg, 201);
+        }
+        catch (e) {
+          await traceFromRequest(env, req, { event_type: 'client_registered', http_status: 400, latency_ms: Date.now() - t0, outcome: 'error', error: 'invalid_client_metadata' });
+          return j({ error: 'invalid_client_metadata', error_description: String(e.message || e) }, 400);
+        }
       }
       if (url.pathname === '/authorize' && req.method === 'GET') {
         const params = loadOauthRequestParams(url);
         const v = await validateAuthorizeRequest(env, params, url.origin);
-        if (!v.ok) return oauthAuthorizeErrorResponse(v, params);
+        if (!v.ok) {
+          await traceFromRequest(env, req, { event_type: 'authorize_view', client_id: params.client_id || null, resource: params.resource || null, http_status: 302, latency_ms: Date.now() - t0, outcome: v.error === 'invalid_target' ? 'resource_mismatch' : 'error', error: v.error, metadata: { safe_redirect: v.safe_redirect } });
+          return oauthAuthorizeErrorResponse(v, params);
+        }
+        await traceFromRequest(env, req, { event_type: 'authorize_view', client_id: v.client.client_id, resource: v.resource || null, http_status: 200, latency_ms: Date.now() - t0, outcome: 'ok', metadata: { scope: (v.scopes || []).join(' ') } });
         return htmlResponse(renderLoginForm(params, v.client, null));
       }
       if (url.pathname === '/authorize' && req.method === 'POST') {
