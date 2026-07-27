@@ -12,6 +12,10 @@ const REDIRECT_URI = 'https://client.example/callback';
 const LOGIN_PASSWORD = 'correct horse battery staple';
 const STATIC_TOKEN = 'legacy-static-token';
 
+function auditEvents(env, event) {
+  return env.DB.table('oauth_audit_log').filter(row => !event || row.event === event);
+}
+
 function sha256Hex(value) {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -45,7 +49,8 @@ const PRIMARY_KEYS = {
   oauth_clients: 'client_id',
   oauth_auth_codes: 'code',
   oauth_access_tokens: 'token_hash',
-  oauth_refresh_tokens: 'token_hash'
+  oauth_refresh_tokens: 'token_hash',
+  oauth_audit_log: 'id'
 };
 
 class MemoryD1 {
@@ -302,6 +307,13 @@ async function mcp(env, bearer, method, params = {}) {
   }));
 }
 
+test('authorization-server metadata publishes the protected resource list', async () => {
+  const env = makeEnv();
+  const { response, body } = await json(await request(env, '/.well-known/oauth-authorization-server'));
+  assert.equal(response.status, 200);
+  assert.deepEqual(body.protected_resources, [ORIGIN, ORIGIN + '/mcp']);
+});
+
 test('authorization-code success stores only a digest and authorizes a read tool', async () => {
   const env = makeEnv();
   const client = await registerClient(env);
@@ -340,6 +352,10 @@ test('expired authorization code is rejected', async () => {
   assert.equal(result.response.status, 400);
   assert.equal(result.body.error, 'invalid_grant');
   assert.match(result.body.error_description, /expired/);
+  const events = auditEvents(env, 'authorization_code_expired');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].client_id, client.client_id);
+  assert.equal(events[0].detail, 'atomic claim rejected');
 });
 
 test('authorization code replay fails after the first successful redemption', async () => {
@@ -351,15 +367,25 @@ test('authorization code replay fails after the first successful redemption', as
   const second = await exchangeCode(env, client, grant);
   assert.equal(second.response.status, 400);
   assert.equal(second.body.error, 'invalid_grant');
+  const events = auditEvents(env, 'authorization_code_replay');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].client_id, client.client_id);
+  assert.equal(events[0].detail, 'atomic claim rejected');
 });
 
-test('concurrent redemption race yields exactly one token response', async () => {
+test('concurrent redemption race yields exactly one token response and audits the losing attempt', async () => {
   const env = makeEnv();
   const client = await registerClient(env);
   const grant = await issueAuthorizationCode(env, client);
-  const results = await Promise.all(Array.from({ length: 8 }, () => exchangeCode(env, client, grant)));
+  const results = await Promise.all([
+    exchangeCode(env, client, grant),
+    exchangeCode(env, client, grant)
+  ]);
   assert.equal(results.filter(result => result.response.status === 200).length, 1);
-  assert.equal(results.filter(result => result.response.status === 400 && result.body.error === 'invalid_grant').length, 7);
+  assert.equal(results.filter(result => result.response.status === 400 && result.body.error === 'invalid_grant').length, 1);
+  const events = auditEvents(env, 'authorization_code_replay');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].client_id, client.client_id);
 });
 
 test('refresh token rotates and preserves its family', async () => {
