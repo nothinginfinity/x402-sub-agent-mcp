@@ -820,7 +820,7 @@ test('missing capability, explicit deny, and permission maximum return permissio
   env.DB.table('agent_permissions').push({ id: 'deny', agent_id: 'agent-1', capability: 'resolve_agent_context', effect: 'deny', network: null, asset: null });
   result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
   assert.equal(toolPayload(result).error_code, 'permission_denied');
-  env.DB.table('agent_permissions')[:] = [];
+  env.DB.table('agent_permissions').length = 0;
 });
 
 test('permission-specific maximum amount is enforced', async () => {
