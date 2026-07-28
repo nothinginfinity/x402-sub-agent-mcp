@@ -1043,12 +1043,21 @@ async function circleSignTypedData(env, walletId, typedData) {
   return signature;
 }
 
-async function circleGaslessTransfer(env, a) {
-  const walletId = clean(a.wallet_id);
-  if (!walletId) throw new Error('wallet_id (payer) is required');
-  const destinationAddress = assertValidAddress(a.destination_address, 'destination_address');
+async function circleGaslessTransfer(env, a, authContext) {
+  const requestedWallet = clean(a.wallet_id);
   const amount = clean(a.amount);
   if (!amount || !Number.isFinite(Number(amount)) || Number(amount) <= 0) throw new Error('amount is required and must be a positive decimal USD string, e.g. "0.01"');
+  const context = await resolveAgentContext(env, authContext, {
+    capability: 'circle_gasless_transfer',
+    wallet_address: requestedWallet,
+    network: clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN,
+    asset: 'USDC',
+    amount_atomic: toAtomic(amount, 6)
+  });
+  if (!context.ok) return context;
+  const walletId = context.wallet.wallet_address;
+  if (!walletId) throw new Error('wallet_id (payer) is required');
+  const destinationAddress = assertValidAddress(a.destination_address, 'destination_address');
   const blockchain = clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN;
   const network = blockchain.toLowerCase(); // matches x402/KNOWN_ASSETS network naming
   const tokenAddress = assetAddress(network, 'USDC', clean(a.token_address) || null);
@@ -1121,14 +1130,27 @@ async function circleGaslessTransfer(env, a) {
   });
   const success = !!(settle.data && settle.data.success);
   await logUsage(env, {
-    route: paymentRequirements.resource, method: 'CIRCLE_GASLESS', caller_id: clean(a.caller_id) || null,
+    route: paymentRequirements.resource, method: 'CIRCLE_GASLESS', caller_id: context.caller_id,
     outcome: success ? 'paid' : 'denied', price_atomic: atomicValue, asset: 'USDC', network,
     payment_id: (settle.data && settle.data.txHash) || null,
     facilitator_http_status: settle.httpStatus, facilitator_url: settle.facilitator
   });
+  if (success) await consumeAgentBudget(env, context, atomicValue);
+  const receipt = {
+    agent_id: context.agent.agent_id,
+    caller_id: context.caller_id,
+    credential_type: context.credential.type,
+    wallet_address: context.wallet.wallet_address,
+    network,
+    asset: 'USDC',
+    amount_atomic: atomicValue,
+    transaction_id: (settle.data && (settle.data.txHash || settle.data.transactionId)) || null
+  };
+  await writeAgentContextAudit(env, context, success ? 'allowed' : 'denied', success ? null : 'settlement_failed', receipt);
   return {
-    ok: success, payer_address: payerAddress, destination_address: destinationAddress,
-    amount_atomic: atomicValue, verify: verify.data, settle: settle.data
+    ok: success, agent_id: context.agent.agent_id, caller_id: context.caller_id,
+    payer_address: payerAddress, destination_address: destinationAddress,
+    amount_atomic: atomicValue, receipt, verify: verify.data, settle: settle.data
   };
 }
 
