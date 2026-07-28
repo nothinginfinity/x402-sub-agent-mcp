@@ -66,7 +66,13 @@ const PRIMARY_KEYS = {
   oauth_refresh_tokens: 'token_hash',
   oauth_audit_log: 'id',
   oauth_trace_events: 'id',
-  oauth_trace_config: 'name'
+  oauth_trace_config: 'name',
+  agents: 'agent_id',
+  agent_credentials: 'id',
+  agent_wallets: 'id',
+  agent_permissions: 'id',
+  agent_budgets: 'id',
+  agent_context_audit: 'id'
 };
 
 class MemoryD1 {
@@ -190,6 +196,10 @@ class MemoryStatement {
       if (key && Object.hasOwn(row, key) && table.some(existing => existing[key] === row[key])) {
         throw new Error('UNIQUE constraint failed: ' + tableName + '.' + key);
       }
+      if (tableName === 'agent_credentials' && table.some(existing =>
+        existing.credential_type === row.credential_type && existing.credential_key === row.credential_key)) {
+        throw new Error('UNIQUE constraint failed: agent_credentials.credential_type, agent_credentials.credential_key');
+      }
       table.push(row);
       return { meta: { changes: 1 } };
     }
@@ -212,9 +222,11 @@ class MemoryStatement {
       });
       const whereClauses = whereText.split(/\s+AND\s+/i).map(clause => {
         let m = /^(\w+) = \?$/.exec(clause);
-        if (m) return { column: m[1], value: this.params[paramIndex++] };
+        if (m) return { column: m[1], op: '=', value: this.params[paramIndex++] };
         m = /^(\w+) = (\d+)$/.exec(clause);
-        if (m) return { column: m[1], value: Number(m[2]) };
+        if (m) return { column: m[1], op: '=', value: Number(m[2]) };
+        m = /^(\w+) = '([^']*)'$/.exec(clause);
+        if (m) return { column: m[1], op: '=', value: m[2] };
         throw new Error('Unsupported UPDATE predicate in test D1 mock: ' + clause);
       });
       let changes = 0;
@@ -719,6 +731,125 @@ test('trace tools are unreachable for a non-admin OAuth token', async () => {
   const issued = await exchangeCode(env, client, grant);
   const denied = await mcp(env, issued.body.access_token, 'tools/call', { name: 'oauth_trace_list', arguments: {} });
   assert.equal(denied.response.status, 403);
+});
+
+function seedAgentContext(env, overrides = {}) {
+  const agentId = overrides.agent_id || 'agent-1';
+  const subject = overrides.subject || 'subject-1';
+  const walletId = overrides.wallet_id || 'wallet-1';
+  const credentialType = overrides.credential_type || 'oauth_subject';
+  const credentialKey = overrides.credential_key || subject;
+  const ts = nowIsoTest();
+  env.DB.table('agents').push({ agent_id: agentId, display_name: 'Agent One', status: overrides.agent_status || 'active', created_at: ts, updated_at: ts });
+  env.DB.table('agent_credentials').push({ id: 'cred-1', agent_id: agentId, credential_type: credentialType, credential_key: credentialKey, status: 'active', created_at: ts, updated_at: ts });
+  if (overrides.wallet !== false) env.DB.table('agent_wallets').push({ id: 'aw-1', agent_id: agentId, wallet_address: walletId, network: overrides.network || 'base-sepolia', asset: overrides.asset || 'USDC', status: 'active', created_at: ts, updated_at: ts });
+  if (overrides.permission !== false) env.DB.table('agent_permissions').push({ id: 'perm-1', agent_id: agentId, capability: overrides.capability || 'resolve_agent_context', effect: overrides.effect || 'allow', network: overrides.permission_network ?? null, asset: overrides.permission_asset ?? null, max_amount_atomic: overrides.max_amount_atomic ?? null, created_at: ts, updated_at: ts });
+  if (overrides.budget !== false) env.DB.table('agent_budgets').push({ id: 'budget-1', agent_id: agentId, network: overrides.network || 'base-sepolia', asset: overrides.asset || 'USDC', period: 'lifetime', limit_atomic: overrides.limit_atomic || '1000000', spent_atomic: overrides.spent_atomic || '0', status: 'active', created_at: ts, updated_at: ts });
+  return { agentId, subject, walletId };
+}
+
+function toolPayload(result) {
+  return JSON.parse(result.body.result.content[0].text);
+}
+
+test('resolve_agent_context appears in tools/list', async () => {
+  const env = makeEnv();
+  const result = await mcp(env, STATIC_TOKEN, 'tools/list');
+  assert.ok(result.body.result.tools.some(tool => tool.name === 'resolve_agent_context'));
+});
+
+test('OAuth subject resolves to an agent through MCP', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env, { client_name: 'ChatGPT' });
+  const grant = await issueAuthorizationCode(env, client, { grantAdmin: true });
+  const issued = await exchangeCode(env, client, grant);
+  const subject = env.DB.table('oauth_access_tokens')[0].subject;
+  seedAgentContext(env, { subject });
+  const result = await mcp(env, issued.body.access_token, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  assert.equal(toolPayload(result).agent_id, 'agent-1');
+});
+
+test('static bearer resolves using the SHA-256 digest, not the raw token', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN) });
+  const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  const payload = toolPayload(result);
+  assert.equal(payload.agent_id, 'agent-1');
+  assert.equal(env.DB.table('agent_credentials')[0].credential_key, sha256Hex(STATIC_TOKEN));
+  assert.notEqual(env.DB.table('agent_credentials')[0].credential_key, STATIC_TOKEN);
+});
+
+test('unknown credential fails closed', async () => {
+  const env = makeEnv();
+  const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  assert.equal(toolPayload(result).error_code, 'unknown_agent');
+});
+
+test('corrupt duplicate credential rows injected outside schema validation produce ambiguous_identity', async () => {
+  const env = makeEnv();
+  const digest = sha256Hex(STATIC_TOKEN);
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: digest });
+  env.DB.table('agents').push({ agent_id: 'agent-2', display_name: 'Agent Two', status: 'active', created_at: nowIsoTest(), updated_at: nowIsoTest() });
+  env.DB.table('agent_credentials').push({ id: 'corrupt-duplicate', agent_id: 'agent-2', credential_type: 'bearer_token', credential_key: digest, status: 'active', created_at: nowIsoTest(), updated_at: nowIsoTest() });
+  const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  assert.equal(toolPayload(result).error_code, 'ambiguous_identity');
+});
+
+test('disabled agent fails closed', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), agent_status: 'disabled' });
+  const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  assert.equal(toolPayload(result).error_code, 'disabled_agent');
+});
+
+test('missing or mismatched wallet fails closed', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), wallet: false });
+  let result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  assert.equal(toolPayload(result).error_code, 'wallet_not_assigned');
+  env.DB.table('agent_wallets').push({ id: 'aw-2', agent_id: 'agent-1', wallet_address: 'wallet-x', network: 'base', asset: 'USDC', status: 'active' });
+  result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: { network: 'base-sepolia', asset: 'USDC' } });
+  assert.equal(toolPayload(result).error_code, 'wallet_not_assigned');
+});
+
+test('missing capability, explicit deny, and permission maximum return permission_denied', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), permission: false });
+  let result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  assert.equal(toolPayload(result).error_code, 'permission_denied');
+  env.DB.table('agent_permissions').push({ id: 'deny', agent_id: 'agent-1', capability: 'resolve_agent_context', effect: 'deny', network: null, asset: null });
+  result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  assert.equal(toolPayload(result).error_code, 'permission_denied');
+  env.DB.table('agent_permissions')[:] = [];
+});
+
+test('permission-specific maximum amount is enforced', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), max_amount_atomic: '9' });
+  const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: { amount_atomic: '10' } });
+  assert.equal(toolPayload(result).error_code, 'permission_denied');
+});
+
+test('exhausted budget returns budget_exhausted and valid context succeeds', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), limit_atomic: '10', spent_atomic: '10' });
+  let result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: { amount_atomic: '1' } });
+  assert.equal(toolPayload(result).error_code, 'budget_exhausted');
+  env.DB.table('agent_budgets')[0].spent_atomic = '0';
+  result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: { amount_atomic: '1' } });
+  assert.equal(toolPayload(result).ok, true);
+});
+
+test('successful and denied Agent Context decisions write secret-free audit rows', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN) });
+  await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  env.DB.table('agent_permissions')[0].effect = 'deny';
+  await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  const rows = env.DB.table('agent_context_audit');
+  assert.ok(rows.some(row => row.outcome === 'allowed'));
+  assert.ok(rows.some(row => row.outcome === 'denied'));
+  assert.ok(rows.every(row => !JSON.stringify(row).includes(STATIC_TOKEN)));
 });
 
 function nowIsoTest() { return new Date().toISOString(); }
