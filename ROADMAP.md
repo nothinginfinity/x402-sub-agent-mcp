@@ -826,6 +826,78 @@ Live: https://agent-wallets-console.jaredtechfit.workers.dev/ . Phone-first cons
 
 - [ ] The console is read-only today. Set pricing, assign tasks, and (Jared's vision) a per-agent chat inside the wallet -- the wallet as the agent's home/identity, not just its balance. This WRITES, so it needs real auth (OAuth/gateway, not a localStorage token). Build against real usage, not synthetic data.
 
+### V1.X — Agent Context Resolution
+
+Before introducing `paid_messages`, add one foundational milestone that makes agent identity deterministic.
+
+#### Goal
+
+Every paid operation should execute against a resolved execution context rather than trusting caller-supplied fields.
+
+Flow:
+
+```text
+resolve_agent()
+        ↓
+identity
+        ↓
+wallet(s)
+        ↓
+budget
+        ↓
+policy
+        ↓
+permissions
+        ↓
+execution context
+```
+
+#### Deliverables
+
+- [ ] Resolve authenticated identity into a stable `agent_id`.
+- [ ] Map each agent to one or more wallets through an `agent_wallet` relationship.
+- [ ] Produce one normalized execution-context object used by every payment-capable tool.
+- [ ] Treat caller-supplied identities only as consistency checks, never the source of truth.
+- [ ] Return structured errors for:
+  - `unknown agent`
+  - `disabled agent`
+  - `ambiguous identity`
+  - `wallet not assigned`
+  - `policy violation`
+- [ ] Include `agent_id` in settlement receipts.
+- [ ] Record `agent_id` in audit logs.
+- [ ] Add tests covering:
+  - ChatGPT OAuth
+  - Claude bearer authentication
+  - credential rotation
+  - identity mismatch
+  - disabled agent
+  - spending-cap enforcement
+
+#### Why this comes before `paid_messages`
+
+`paid_messages` should exchange value between stable agents—not arbitrary strings.
+
+The protocol should eventually become:
+
+```text
+resolve_agent
+      ↓
+create execution context
+      ↓
+authorize payment
+      ↓
+execute work
+      ↓
+settle
+      ↓
+receipt
+      ↓
+paid_messages
+```
+
+Without deterministic identity, receipts, budgets, permissions, and provenance become significantly harder to reason about.
+
 ### UI lessons already learned (stone d246bbb96b7e)
 
 - A browser UI that calls an external endpoint CANNOT live in a Claude artifact sandbox (its fetch is blocked, which masquerades as a token failure). It needs a real origin -- hence the dedicated worker.
