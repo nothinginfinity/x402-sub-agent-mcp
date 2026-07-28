@@ -259,12 +259,12 @@ async function resolveAgentContext(env, authContext, request) {
   const denied = matchingPermissions.find(row => row.effect === 'deny');
   const allowed = matchingPermissions.find(row => row.effect === 'allow');
   if (denied || !allowed) {
-    const failure = agentContextError('policy_violation', denied ? 'an explicit deny permission matched' : 'no allow permission matched', { agent_id: agent.agent_id });
+    const failure = agentContextError('permission_denied', denied ? 'an explicit deny permission matched' : 'no allow permission matched', { agent_id: agent.agent_id });
     await writeAgentContextAudit(env, { ...baseContext, wallet }, 'denied', failure.error_code, { detail: failure.detail });
     return failure;
   }
   if (allowed.max_amount_atomic != null && BigInt(amountAtomic) > BigInt(allowed.max_amount_atomic)) {
-    const failure = agentContextError('policy_violation', 'requested amount exceeds the permission maximum', { agent_id: agent.agent_id });
+    const failure = agentContextError('permission_denied', 'requested amount exceeds the permission maximum', { agent_id: agent.agent_id });
     await writeAgentContextAudit(env, { ...baseContext, wallet }, 'denied', failure.error_code, { detail: failure.detail });
     return failure;
   }
@@ -273,7 +273,7 @@ async function resolveAgentContext(env, authContext, request) {
     WHERE agent_id = ? AND network = ? AND asset = ? AND status = 'active'`, [agent.agent_id, network, asset]);
   for (const budget of budgets) {
     if (BigInt(budget.spent_atomic || '0') + BigInt(amountAtomic) > BigInt(budget.limit_atomic)) {
-      const failure = agentContextError('policy_violation', 'agent budget would be exceeded', { agent_id: agent.agent_id, budget_id: budget.id });
+      const failure = agentContextError('budget_exhausted', 'agent budget would be exceeded', { agent_id: agent.agent_id, budget_id: budget.id });
       await writeAgentContextAudit(env, { ...baseContext, wallet }, 'denied', failure.error_code, { detail: failure.detail });
       return failure;
     }
@@ -284,11 +284,36 @@ async function resolveAgentContext(env, authContext, request) {
   return context;
 }
 
-async function consumeAgentBudget(env, context, amountAtomic) {
+async function reserveAgentBudget(env, context, amountAtomic) {
+  const amount = BigInt(amountAtomic || '0');
+  const reserved = [];
   for (const budget of context.budgets || []) {
-    await dbRun(env, 'UPDATE agent_budgets SET spent_atomic = ?, updated_at = ? WHERE id = ?', [
-      (BigInt(budget.spent_atomic || '0') + BigInt(amountAtomic)).toString(), nowIso(), budget.id
-    ]);
+    const before = BigInt(budget.spent_atomic || '0');
+    const after = before + amount;
+    if (after > BigInt(budget.limit_atomic)) {
+      await releaseAgentBudget(env, reserved, amountAtomic);
+      return agentContextError('budget_exhausted', 'agent budget would be exceeded', { agent_id: context.agent.agent_id, budget_id: budget.id });
+    }
+    const result = await dbRun(env, `UPDATE agent_budgets
+      SET spent_atomic = ?, updated_at = ?
+      WHERE id = ? AND status = 'active' AND spent_atomic = ?`, [after.toString(), nowIso(), budget.id, before.toString()]);
+    if (!result.meta || result.meta.changes !== 1) {
+      await releaseAgentBudget(env, reserved, amountAtomic);
+      return agentContextError('budget_exhausted', 'agent budget changed concurrently; reservation denied', { agent_id: context.agent.agent_id, budget_id: budget.id });
+    }
+    reserved.push({ id: budget.id, before: before.toString(), after: after.toString() });
+  }
+  return { ok: true, reserved };
+}
+
+async function releaseAgentBudget(env, reserved, amountAtomic) {
+  const amount = BigInt(amountAtomic || '0');
+  for (const item of [...(reserved || [])].reverse()) {
+    const current = BigInt(item.after);
+    const restored = current - amount;
+    await dbRun(env, `UPDATE agent_budgets
+      SET spent_atomic = ?, updated_at = ?
+      WHERE id = ? AND status = 'active' AND spent_atomic = ?`, [restored.toString(), nowIso(), item.id, current.toString()]);
   }
 }
 
@@ -1220,14 +1245,20 @@ async function circleGaslessTransfer(env, a, authContext) {
   const requestedWallet = clean(a.wallet_id);
   const amount = clean(a.amount);
   if (!amount || !Number.isFinite(Number(amount)) || Number(amount) <= 0) throw new Error('amount is required and must be a positive decimal USD string, e.g. "0.01"');
+  const atomicValue = toAtomic(amount, 6);
   const context = await resolveAgentContext(env, authContext, {
     capability: 'circle_gasless_transfer',
     wallet_address: requestedWallet,
     network: clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN,
     asset: 'USDC',
-    amount_atomic: toAtomic(amount, 6)
+    amount_atomic: atomicValue
   });
   if (!context.ok) return context;
+  const reservation = await reserveAgentBudget(env, context, atomicValue);
+  if (!reservation.ok) {
+    await writeAgentContextAudit(env, context, 'denied', reservation.error_code, { detail: reservation.detail });
+    return reservation;
+  }
   const walletId = context.wallet.wallet_address;
   if (!walletId) throw new Error('wallet_id (payer) is required');
   const destinationAddress = assertValidAddress(a.destination_address, 'destination_address');
@@ -1241,7 +1272,6 @@ async function circleGaslessTransfer(env, a, authContext) {
   const payerWallet = await circleGetWallet(env, walletId);
   const payerAddress = payerWallet.address;
 
-  const atomicValue = toAtomic(amount, 6);
   const validAfter = 0;
   const validBeforeSeconds = limitNum(a.valid_for_seconds, 300, 30, 3600);
   const validBefore = Math.floor(Date.now() / 1000) + validBeforeSeconds;
@@ -1273,7 +1303,13 @@ async function circleGaslessTransfer(env, a, authContext) {
     message: { from: payerAddress, to: destinationAddress, value: atomicValue, validAfter: String(validAfter), validBefore: String(validBefore), nonce }
   };
 
-  const signature = await circleSignTypedData(env, walletId, typedData);
+  let signature;
+  try {
+    signature = await circleSignTypedData(env, walletId, typedData);
+  } catch (e) {
+    await releaseAgentBudget(env, reservation.reserved, atomicValue);
+    throw e;
+  }
 
   const paymentPayload = {
     x402Version: X402_VERSION,
@@ -1296,6 +1332,8 @@ async function circleGaslessTransfer(env, a, authContext) {
     x402Version: X402_VERSION, paymentPayload, paymentRequirements
   });
   if (!(verify.data && verify.data.isValid !== false && verify.httpOk)) {
+    await releaseAgentBudget(env, reservation.reserved, atomicValue);
+    await writeAgentContextAudit(env, context, 'denied', 'payment_verification_failed', { detail: 'payment verification failed' });
     return { ok: false, error: 'payment verification failed', verify: verify.data, payer_address: payerAddress };
   }
   const settle = await facilitatorCall(env, a.facilitator_url, '/settle', {
@@ -1308,7 +1346,7 @@ async function circleGaslessTransfer(env, a, authContext) {
     payment_id: (settle.data && settle.data.txHash) || null,
     facilitator_http_status: settle.httpStatus, facilitator_url: settle.facilitator
   });
-  if (success) await consumeAgentBudget(env, context, atomicValue);
+  if (!success) await releaseAgentBudget(env, reservation.reserved, atomicValue);
   const receipt = {
     agent_id: context.agent.agent_id,
     caller_id: context.caller_id,
