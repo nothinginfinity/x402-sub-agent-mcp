@@ -299,14 +299,44 @@ class MemoryStatement {
 }
 
 function makeEnv() {
+function makeEnv() {
   return {
     DB: new MemoryD1(),
     OAUTH_LOGIN_PASSWORD: LOGIN_PASSWORD,
     MCP_AUTH_TOKEN: STATIC_TOKEN,
-    WORKER_NAME: 'x402-test'
+    WORKER_NAME: 'x402-test',
+    CIRCLE_API_KEY: 'test-circle-key',
+    CIRCLE_WALLET_SET_ID: 'test-wallet-set'
   };
 }
 
+function stubCircleWallet(walletId, address = '0x1111111111111111111111111111111111111111', blockchain = 'BASE-SEPOLIA') {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.includes('/developer/wallets/' + walletId)) {
+      return new Response(JSON.stringify({ data: { wallet: { id: walletId, address, blockchain } } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+    return originalFetch(input);
+  };
+  return () => { globalThis.fetch = originalFetch; };
+}
+
+async function adminOAuthToken(env, clientName = 'ChatGPT provisioning test') {
+  const client = await registerClient(env, { client_name: clientName });
+  const grant = await issueAuthorizationCode(env, client, {
+    scope: 'wallet:read wallet:transfer:testnet offline_access',
+    grantAdmin: true
+  });
+  const issued = await exchangeCode(env, client, grant);
+  assert.equal(issued.response.status, 200, JSON.stringify(issued.body));
+  return issued.body.access_token;
+}
+
+async function request(env, path, init = {}) {
 async function request(env, path, init = {}) {
   return worker.fetch(new Request(ORIGIN + path, init), env);
 }
