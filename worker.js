@@ -185,7 +185,7 @@ async function authCredentialEvidence(authContext) {
   return null;
 }
 
-async function provisionAgentContextSelf(env, a, authContext) {async function provisionAgentContextSelf(env, a, authContext) {
+async function provisionAgentContextSelf(env, a, authContext) {
   if (!authContext || !authContext.ok || authContext.mode !== 'oauth' || !(authContext.scope || []).includes(OAUTH_ADMIN_SCOPE)) {
     return agentContextError('permission_denied', 'OAuth mcp:admin authentication is required');
   }
