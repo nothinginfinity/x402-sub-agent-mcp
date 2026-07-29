@@ -1,0 +1,42 @@
+{
+  "worker": "afo-gitzip",
+  "version": "0.2.2-unified",
+  "action": "apply_repo_text_patch",
+  "target": {
+    "owner": "nothinginfinity",
+    "repo": "x402-sub-agent-mcp",
+    "branch": "agent-context-phase2-hardening",
+    "path": "worker.js"
+  },
+  "source_sha": "86f3219d7a820adb1485f10eb3abcf3bc1f29e44",
+  "result_sha": "87081c121c51bc3fdd7f307d16d3860681da3a9b",
+  "commit_sha": "c0573788e2a143ec446bf5bf818a7e4c6a41ecf7",
+  "diff": {
+    "before_length": 158447,
+    "after_length": 158384,
+    "delta": -63,
+    "common_prefix": 8140,
+    "common_suffix": 150244,
+    "before_fingerprint": "12aa6bcb",
+    "after_fingerprint": "377103b5"
+  },
+  "applied": [
+    {
+      "label": "op_0",
+      "type": "replace_between",
+      "changed": true
+    }
+  ],
+  "verification": {
+    "ok": true,
+    "results": [
+      {
+        "label": "contains",
+        "ok": true,
+        "detail": "contains"
+      }
+    ],
+    "failed": []
+  },
+  "timestamp": "2026-07-29T12:41:44.882Z"
+}

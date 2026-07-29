@@ -191,7 +191,7 @@ async function provisionAgentContextSelf(env, a, authContext) {
   }
   const evidence = await authCredentialEvidence(authContext);
   if (!evidence || evidence.type !== 'oauth_subject_sha256') return agentContextError('unknown_agent', 'OAuth subject evidence is unavailable');
-  const agentId = clean(a.agent_id) || 'chatgpt-primary';
+  const agentId = 'oauth-' + evidence.key.slice(0, 24);
   const displayName = clean(a.display_name) || 'ChatGPT';
   const walletId = clean(a.wallet_id);
   const network = (clean(a.network) || DEFAULT_CIRCLE_BLOCKCHAIN).toLowerCase();
@@ -201,23 +201,42 @@ async function provisionAgentContextSelf(env, a, authContext) {
   if (!walletId) throw new Error('wallet_id is required');
   if (!/^\d+$/.test(budgetAtomic) || BigInt(budgetAtomic) <= 0n) throw new Error('budget_atomic must be a positive atomic-unit integer string');
   if (!/^\d+$/.test(transferMaxAtomic) || BigInt(transferMaxAtomic) <= 0n || BigInt(transferMaxAtomic) > BigInt(budgetAtomic)) throw new Error('transfer_max_atomic must be positive and no greater than budget_atomic');
-  const existingCredential = await dbFirst(env, 'SELECT agent_id FROM agent_credentials WHERE credential_type = ? AND credential_key = ?', [evidence.type, evidence.key]);
-  if (existingCredential && existingCredential.agent_id !== agentId) return agentContextError('ambiguous_identity', 'authenticated OAuth identity is already assigned to another agent');
-  const ts = nowIso();
   const walletRecord = await circleGetWallet(env, walletId);
+  const walletAddress = assertValidAddress(walletRecord.address, 'wallet address');
   if (clean(walletRecord.blockchain).toLowerCase() !== network) throw new Error('wallet network does not match requested network');
+  const existingCredential = await dbFirst(env, `SELECT agent_id FROM agent_credentials WHERE credential_type = ? AND credential_key = ?`, [evidence.type, evidence.key]);
+  if (existingCredential && existingCredential.agent_id !== agentId) {
+    const failure = agentContextError('ambiguous_identity', 'authenticated OAuth identity is already assigned to another agent');
+    await writeAgentContextAudit(env, { credential: evidence, capability: 'provision_agent_context_self', network, asset }, 'denied', failure.error_code, { wallet_address: walletAddress, detail: failure.detail });
+    return failure;
+  }
+  const walletConflict = await dbFirst(env, `SELECT agent_id FROM agent_wallets WHERE status = 'active' AND network = ? AND asset = ? AND (wallet_id = ? OR lower(wallet_address) = lower(?))`, [network, asset, walletId, walletAddress]);
+  if (walletConflict && walletConflict.agent_id !== agentId) {
+    const failure = agentContextError('wallet_conflict', 'wallet is already assigned to another active agent');
+    await writeAgentContextAudit(env, { credential: evidence, capability: 'provision_agent_context_self', network, asset }, 'denied', failure.error_code, { wallet_address: walletAddress, detail: failure.detail });
+    return failure;
+  }
+  const ts = nowIso();
   const db = requireDb(env);
   await db.batch([
-    db.prepare(`INSERT INTO agents (agent_id, display_name, status, created_at, updated_at) VALUES (?,?, 'active', ?, ?)
+    db.prepare(`INSERT INTO agents (agent_id, display_name, status, created_at, updated_at) VALUES (?, ?, 'active', ?, ?)
       ON CONFLICT(agent_id) DO UPDATE SET display_name = excluded.display_name, status = 'active', updated_at = excluded.updated_at`).bind(agentId, displayName, ts, ts),
-    db.prepare(`INSERT INTO agent_credentials (id, agent_id, credential_type, credential_key, status, metadata_json, created_at, updated_at) VALUES (?,?,?,?, 'active', ?, ?, ?)
-      ON CONFLICT(credential_type, credential_key) DO UPDATE SET agent_id = excluded.agent_id, status = 'active', metadata_json = excluded.metadata_json, updated_at = excluded.updated_at`).bind(uid('acred'), agentId, evidence.type, evidence.key, JSON.stringify({ driver: authContext.driver || 'chatgpt', subject_digest: 'sha256' }), ts, ts),
-    db.prepare(`INSERT INTO agent_wallets (id, agent_id, wallet_address, network, asset, status, created_at, updated_at) VALUES (?,?,?,?,?, 'active', ?, ?)`).bind(uid('awlt'), agentId, walletId, network, asset, ts, ts),
-    db.prepare(`INSERT INTO agent_permissions (id, agent_id, capability, effect, network, asset, max_amount_atomic, created_at, updated_at) VALUES (?,?, 'resolve_agent_context', 'allow', ?, ?, '0', ?, ?)`).bind(uid('aperm'), agentId, network, asset, ts, ts),
-    db.prepare(`INSERT INTO agent_permissions (id, agent_id, capability, effect, network, asset, max_amount_atomic, created_at, updated_at) VALUES (?,?, 'circle_gasless_transfer', 'allow', ?, ?, ?, ?, ?)`).bind(uid('aperm'), agentId, network, asset, transferMaxAtomic, ts, ts),
-    db.prepare(`INSERT INTO agent_budgets (id, agent_id, network, asset, period, limit_atomic, spent_atomic, status, created_at, updated_at) VALUES (?,?,?,?, 'lifetime', ?, '0', 'active', ?, ?)`).bind(uid('abud'), agentId, network, asset, budgetAtomic, ts, ts)
+    db.prepare(`INSERT INTO agent_credentials (id, agent_id, credential_type, credential_key, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+      ON CONFLICT(credential_type, credential_key) DO UPDATE SET status = 'active', metadata_json = excluded.metadata_json, updated_at = excluded.updated_at
+      WHERE agent_credentials.agent_id = excluded.agent_id`).bind(uid('acred'), agentId, evidence.type, evidence.key, JSON.stringify({ driver: authContext.driver || 'chatgpt', subject_digest: 'sha256' }), ts, ts),
+    db.prepare(`INSERT INTO agent_wallets (id, agent_id, wallet_id, wallet_address, network, asset, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+      ON CONFLICT(wallet_id, network, asset) WHERE status = 'active' DO UPDATE SET wallet_address = excluded.wallet_address, updated_at = excluded.updated_at
+      WHERE agent_wallets.agent_id = excluded.agent_id`).bind(uid('awlt'), agentId, walletId, walletAddress, network, asset, ts, ts),
+    db.prepare(`INSERT INTO agent_permissions (id, agent_id, capability, effect, network, asset, max_amount_atomic, created_at, updated_at) VALUES (?, ?, 'resolve_agent_context', 'allow', ?, ?, '0', ?, ?)
+      ON CONFLICT(agent_id, capability, effect, COALESCE(network, ''), COALESCE(asset, '')) DO UPDATE SET max_amount_atomic = excluded.max_amount_atomic, updated_at = excluded.updated_at`).bind(uid('aperm'), agentId, network, asset, ts, ts),
+    db.prepare(`INSERT INTO agent_permissions (id, agent_id, capability, effect, network, asset, max_amount_atomic, created_at, updated_at) VALUES (?, ?, 'circle_gasless_transfer', 'allow', ?, ?, ?, ?, ?)
+      ON CONFLICT(agent_id, capability, effect, COALESCE(network, ''), COALESCE(asset, '')) DO UPDATE SET max_amount_atomic = excluded.max_amount_atomic, updated_at = excluded.updated_at`).bind(uid('aperm'), agentId, network, asset, transferMaxAtomic, ts, ts),
+    db.prepare(`INSERT INTO agent_budgets (id, agent_id, network, asset, period, limit_atomic, spent_atomic, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'lifetime', ?, '0', 'active', ?, ?)
+      ON CONFLICT(agent_id, network, asset, period) WHERE status = 'active' DO UPDATE SET limit_atomic = excluded.limit_atomic, updated_at = excluded.updated_at`).bind(uid('abud'), agentId, network, asset, budgetAtomic, ts, ts)
   ]);
-  return { ok: true, agent_id: agentId, credential_type: evidence.type, credential_fingerprint: evidence.key.slice(0, 16), wallet_id: walletId, wallet_address: walletRecord.address, network, asset, budget_atomic: budgetAtomic, transfer_max_atomic: transferMaxAtomic };
+  const result = { ok: true, agent_id: agentId, credential_type: evidence.type, credential_fingerprint: evidence.key.slice(0, 16), wallet_id: walletId, wallet_address: walletAddress, network, asset, budget_atomic: budgetAtomic, transfer_max_atomic: transferMaxAtomic };
+  await writeAgentContextAudit(env, { credential: evidence, agent: { agent_id: agentId }, wallet: { wallet_address: walletAddress }, capability: 'provision_agent_context_self', network, asset }, 'allowed', null, { detail: 'agent context provisioned idempotently' });
+  return result;
 }
 
 function permissionMatches(row, capability, network, asset) {

@@ -177,7 +177,37 @@ class MemoryStatement {
   }
 
   async #mutate() {
-    let match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\)$/i.exec(this.sql);
+    let match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT \((.+?)\) DO UPDATE SET (.+)$/i.exec(this.sql);
+    if (match) {
+      const [, tableName, columnsText, valuesText, conflictText, updateText] = match;
+      const columns = splitCsv(columnsText);
+      const values = splitCsv(valuesText);
+      let paramIndex = 0;
+      const row = {};
+      columns.forEach((column, index) => {
+        const token = values[index];
+        if (token === '?') row[column] = this.params[paramIndex++];
+        else if (/^NULL$/i.test(token)) row[column] = null;
+        else if (/^'([^']*)'$/.test(token)) row[column] = token.slice(1, -1);
+        else if (/^\d+$/.test(token)) row[column] = Number(token);
+        else throw new Error('Unsupported UPSERT value in test D1 mock: ' + token);
+      });
+      const conflictColumns = splitCsv(conflictText);
+      const table = this.db.table(tableName);
+      const existing = table.find(candidate => conflictColumns.every(column => candidate[column] === row[column]));
+      if (!existing) {
+        table.push(row);
+        return { meta: { changes: 1 } };
+      }
+      for (const clause of splitCsv(updateText)) {
+        const updateMatch = /^(\w+) = excluded\.(\w+)$/i.exec(clause);
+        if (!updateMatch) throw new Error('Unsupported UPSERT setter in test D1 mock: ' + clause);
+        existing[updateMatch[1]] = row[updateMatch[2]];
+      }
+      return { meta: { changes: 1 } };
+    }
+
+    match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\)$/i.exec(this.sql);
     if (match) {
       const [, tableName, columnsText, valuesText] = match;
       const columns = splitCsv(columnsText);
@@ -204,6 +234,7 @@ class MemoryStatement {
       return { meta: { changes: 1 } };
     }
 
+    match = /^UPDATE (\w+) SET (.+?) WHERE (.+)$/i.exec(this.sql);
     match = /^UPDATE (\w+) SET (.+?) WHERE (.+)$/i.exec(this.sql);
     if (match) {
       const [, tableName, setText, whereText] = match;
@@ -271,8 +302,36 @@ function makeEnv() {
     DB: new MemoryD1(),
     OAUTH_LOGIN_PASSWORD: LOGIN_PASSWORD,
     MCP_AUTH_TOKEN: STATIC_TOKEN,
-    WORKER_NAME: 'x402-test'
+    WORKER_NAME: 'x402-test',
+    CIRCLE_API_KEY: 'test-circle-key',
+    CIRCLE_WALLET_SET_ID: 'test-wallet-set'
   };
+}
+
+function stubCircleWallet(walletId, address = '0x1111111111111111111111111111111111111111', blockchain = 'BASE-SEPOLIA') {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async input => {
+    const url = String(input);
+    if (url.includes('/developer/wallets/' + walletId)) {
+      return new Response(JSON.stringify({ data: { wallet: { id: walletId, address, blockchain } } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+    return originalFetch(input);
+  };
+  return () => { globalThis.fetch = originalFetch; };
+}
+
+async function adminOAuthToken(env, clientName = 'ChatGPT provisioning test') {
+  const client = await registerClient(env, { client_name: clientName });
+  const grant = await issueAuthorizationCode(env, client, {
+    scope: 'wallet:read wallet:transfer:testnet offline_access',
+    grantAdmin: true
+  });
+  const issued = await exchangeCode(env, client, grant);
+  assert.equal(issued.response.status, 200, JSON.stringify(issued.body));
+  return issued.body.access_token;
 }
 
 async function request(env, path, init = {}) {
@@ -737,8 +796,8 @@ function seedAgentContext(env, overrides = {}) {
   const agentId = overrides.agent_id || 'agent-1';
   const subject = overrides.subject || 'subject-1';
   const walletId = overrides.wallet_id || 'wallet-1';
-  const credentialType = overrides.credential_type || 'oauth_subject';
-  const credentialKey = overrides.credential_key || subject;
+  const credentialType = overrides.credential_type || 'oauth_subject_sha256';
+  const credentialKey = overrides.credential_key || sha256Hex(subject);
   const ts = nowIsoTest();
   env.DB.table('agents').push({ agent_id: agentId, display_name: 'Agent One', status: overrides.agent_status || 'active', created_at: ts, updated_at: ts });
   env.DB.table('agent_credentials').push({ id: 'cred-1', agent_id: agentId, credential_type: credentialType, credential_key: credentialKey, status: 'active', created_at: ts, updated_at: ts });

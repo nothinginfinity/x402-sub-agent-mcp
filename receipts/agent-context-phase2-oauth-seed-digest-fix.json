@@ -1,0 +1,54 @@
+{
+  "worker": "afo-gitzip",
+  "version": "0.2.2-unified",
+  "action": "apply_repo_text_patch",
+  "target": {
+    "owner": "nothinginfinity",
+    "repo": "x402-sub-agent-mcp",
+    "branch": "agent-context-phase2-hardening",
+    "path": "tests/oauth-hardening.test.js"
+  },
+  "source_sha": "15dfdc53b2e0795ee210ecab023acbb5d602d1ff",
+  "result_sha": "d366fc7290bff08ef10424b3c018714b5dc96536",
+  "commit_sha": "1eee731ac61795c2a2d8b353711ddf8bb263e6f3",
+  "diff": {
+    "before_length": 43141,
+    "after_length": 43159,
+    "delta": 18,
+    "common_prefix": 35172,
+    "common_suffix": 7907,
+    "before_fingerprint": "9f265d84",
+    "after_fingerprint": "2cc398df"
+  },
+  "applied": [
+    {
+      "label": "op_0",
+      "type": "replace_exact",
+      "changed": true,
+      "replaced": 1
+    },
+    {
+      "label": "op_1",
+      "type": "replace_exact",
+      "changed": true,
+      "replaced": 1
+    }
+  ],
+  "verification": {
+    "ok": true,
+    "results": [
+      {
+        "label": "contains",
+        "ok": true,
+        "detail": "contains"
+      },
+      {
+        "label": "contains",
+        "ok": true,
+        "detail": "contains"
+      }
+    ],
+    "failed": []
+  },
+  "timestamp": "2026-07-29T12:56:11.800Z"
+}
