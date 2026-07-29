@@ -1,0 +1,62 @@
+{
+  "worker": "afo-gitzip",
+  "version": "0.2.2-unified",
+  "action": "apply_repo_text_patch",
+  "target": {
+    "owner": "nothinginfinity",
+    "repo": "x402-sub-agent-mcp",
+    "branch": "agent-context-phase2-hardening",
+    "path": "worker.js"
+  },
+  "source_sha": "c4048b5f105e0dc10d2264761a2c7cbfb000fe5a",
+  "result_sha": "86f3219d7a820adb1485f10eb3abcf3bc1f29e44",
+  "commit_sha": "5b19fbb103c17b80a237259ee76724c20e821697",
+  "diff": {
+    "before_length": 156296,
+    "after_length": 158447,
+    "delta": 2151,
+    "common_prefix": 8140,
+    "common_suffix": 144157,
+    "before_fingerprint": "b844640f",
+    "after_fingerprint": "12aa6bcb"
+  },
+  "applied": [
+    {
+      "label": "op_0",
+      "type": "replace_between",
+      "changed": true
+    }
+  ],
+  "verification": {
+    "ok": true,
+    "results": [
+      {
+        "label": "contains",
+        "ok": true,
+        "detail": "contains"
+      },
+      {
+        "label": "contains",
+        "ok": true,
+        "detail": "contains"
+      },
+      {
+        "label": "contains",
+        "ok": true,
+        "detail": "contains"
+      },
+      {
+        "label": "contains",
+        "ok": true,
+        "detail": "contains"
+      },
+      {
+        "label": "not_contains",
+        "ok": true,
+        "detail": "absent"
+      }
+    ],
+    "failed": []
+  },
+  "timestamp": "2026-07-29T07:14:17.458Z"
+}
