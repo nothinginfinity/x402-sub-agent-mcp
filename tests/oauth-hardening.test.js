@@ -796,8 +796,8 @@ function seedAgentContext(env, overrides = {}) {
   const agentId = overrides.agent_id || 'agent-1';
   const subject = overrides.subject || 'subject-1';
   const walletId = overrides.wallet_id || 'wallet-1';
-  const credentialType = overrides.credential_type || 'oauth_subject';
-  const credentialKey = overrides.credential_key || subject;
+  const credentialType = overrides.credential_type || 'oauth_subject_sha256';
+  const credentialKey = overrides.credential_key || sha256Hex(subject);
   const ts = nowIsoTest();
   env.DB.table('agents').push({ agent_id: agentId, display_name: 'Agent One', status: overrides.agent_status || 'active', created_at: ts, updated_at: ts });
   env.DB.table('agent_credentials').push({ id: 'cred-1', agent_id: agentId, credential_type: credentialType, credential_key: credentialKey, status: 'active', created_at: ts, updated_at: ts });
