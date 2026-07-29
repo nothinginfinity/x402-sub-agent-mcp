@@ -177,7 +177,6 @@ class MemoryStatement {
   }
 
   async #mutate() {
-  async #mutate() {
     let match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT \((.+?)\) DO UPDATE SET (.+)$/i.exec(this.sql);
     if (match) {
       const [, tableName, columnsText, valuesText, conflictText, updateText] = match;
@@ -299,7 +298,6 @@ class MemoryStatement {
 }
 
 function makeEnv() {
-function makeEnv() {
   return {
     DB: new MemoryD1(),
     OAUTH_LOGIN_PASSWORD: LOGIN_PASSWORD,
@@ -336,7 +334,6 @@ async function adminOAuthToken(env, clientName = 'ChatGPT provisioning test') {
   return issued.body.access_token;
 }
 
-async function request(env, path, init = {}) {
 async function request(env, path, init = {}) {
   return worker.fetch(new Request(ORIGIN + path, init), env);
 }
