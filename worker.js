@@ -1297,24 +1297,32 @@ async function circleSignTypedData(env, walletId, typedData) {
 }
 
 async function circleGaslessTransfer(env, a, authContext) {
-  const requestedWallet = clean(a.wallet_id);
+  const requestedWalletId = clean(a.wallet_id);
   const amount = clean(a.amount);
   if (!amount || !Number.isFinite(Number(amount)) || Number(amount) <= 0) throw new Error('amount is required and must be a positive decimal USD string, e.g. "0.01"');
   const atomicValue = toAtomic(amount, 6);
+  // Resolve the agent's assigned wallet from its OAuth identity. We do NOT pass
+  // wallet_id into the wallet_address slot -- that field matches the on-chain
+  // address column, and a Circle UUID would never match it. When the agent has a
+  // single assigned wallet, resolveAgentContext auto-selects it. The optional
+  // wallet_id input is treated as a confirming check against the resolved wallet.
   const context = await resolveAgentContext(env, authContext, {
     capability: 'circle_gasless_transfer',
-    wallet_address: requestedWallet,
     network: clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN,
     asset: 'USDC',
     amount_atomic: atomicValue
   });
   if (!context.ok) return context;
+  if (requestedWalletId && clean(context.wallet.wallet_id) && clean(context.wallet.wallet_id) !== requestedWalletId) {
+    await writeAgentContextAudit(env, context, 'denied', 'wallet_mismatch', { detail: 'requested wallet_id does not match the assigned wallet' });
+    return agentContextError('wallet_mismatch', 'requested wallet_id does not match the assigned wallet', { agent_id: context.agent.agent_id });
+  }
   const reservation = await reserveAgentBudget(env, context, atomicValue);
   if (!reservation.ok) {
     await writeAgentContextAudit(env, context, 'denied', reservation.error_code, { detail: reservation.detail });
     return reservation;
   }
-  const walletId = context.wallet.wallet_address;
+  const walletId = context.wallet.wallet_id;
   if (!walletId) throw new Error('wallet_id (payer) is required');
   const destinationAddress = assertValidAddress(a.destination_address, 'destination_address');
   const blockchain = clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN;
