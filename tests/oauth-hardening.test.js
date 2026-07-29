@@ -177,7 +177,38 @@ class MemoryStatement {
   }
 
   async #mutate() {
-    let match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\)$/i.exec(this.sql);
+  async #mutate() {
+    let match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT \((.+?)\) DO UPDATE SET (.+)$/i.exec(this.sql);
+    if (match) {
+      const [, tableName, columnsText, valuesText, conflictText, updateText] = match;
+      const columns = splitCsv(columnsText);
+      const values = splitCsv(valuesText);
+      let paramIndex = 0;
+      const row = {};
+      columns.forEach((column, index) => {
+        const token = values[index];
+        if (token === '?') row[column] = this.params[paramIndex++];
+        else if (/^NULL$/i.test(token)) row[column] = null;
+        else if (/^'([^']*)'$/.test(token)) row[column] = token.slice(1, -1);
+        else if (/^\d+$/.test(token)) row[column] = Number(token);
+        else throw new Error('Unsupported UPSERT value in test D1 mock: ' + token);
+      });
+      const conflictColumns = splitCsv(conflictText);
+      const table = this.db.table(tableName);
+      const existing = table.find(candidate => conflictColumns.every(column => candidate[column] === row[column]));
+      if (!existing) {
+        table.push(row);
+        return { meta: { changes: 1 } };
+      }
+      for (const clause of splitCsv(updateText)) {
+        const updateMatch = /^(\w+) = excluded\.(\w+)$/i.exec(clause);
+        if (!updateMatch) throw new Error('Unsupported UPSERT setter in test D1 mock: ' + clause);
+        existing[updateMatch[1]] = row[updateMatch[2]];
+      }
+      return { meta: { changes: 1 } };
+    }
+
+    match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\)$/i.exec(this.sql);
     if (match) {
       const [, tableName, columnsText, valuesText] = match;
       const columns = splitCsv(columnsText);
@@ -204,6 +235,7 @@ class MemoryStatement {
       return { meta: { changes: 1 } };
     }
 
+    match = /^UPDATE (\w+) SET (.+?) WHERE (.+)$/i.exec(this.sql);
     match = /^UPDATE (\w+) SET (.+?) WHERE (.+)$/i.exec(this.sql);
     if (match) {
       const [, tableName, setText, whereText] = match;
