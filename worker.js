@@ -175,13 +175,49 @@ async function writeAgentContextAudit(env, context, outcome, errorCode, fields) 
 async function authCredentialEvidence(authContext) {
   if (!authContext || !authContext.ok) return null;
   if (authContext.mode === 'oauth' && authContext.subject) {
-    return { type: 'oauth_subject', key: clean(authContext.subject), caller_id: (authContext.driver || 'oauth') + ':' + clean(authContext.subject) };
+    const digest = await sha256Hex(clean(authContext.subject));
+    return { type: 'oauth_subject_sha256', key: digest, caller_id: (authContext.driver || 'oauth') + ':' + digest.slice(0, 16) };
   }
   if (authContext.mode === 'static' && authContext.raw_token) {
     const digest = await sha256Hex(authContext.raw_token);
     return { type: 'bearer_token', key: digest, caller_id: 'claude:' + digest.slice(0, 16) };
   }
   return null;
+}
+
+async function provisionAgentContextSelf(env, a, authContext) {
+  if (!authContext || !authContext.ok || authContext.mode !== 'oauth' || !(authContext.scope || []).includes(OAUTH_ADMIN_SCOPE)) {
+    return agentContextError('permission_denied', 'OAuth mcp:admin authentication is required');
+  }
+  const evidence = await authCredentialEvidence(authContext);
+  if (!evidence || evidence.type !== 'oauth_subject_sha256') return agentContextError('unknown_agent', 'OAuth subject evidence is unavailable');
+  const agentId = clean(a.agent_id) || 'chatgpt-primary';
+  const displayName = clean(a.display_name) || 'ChatGPT';
+  const walletId = clean(a.wallet_id);
+  const network = (clean(a.network) || DEFAULT_CIRCLE_BLOCKCHAIN).toLowerCase();
+  const asset = (clean(a.asset) || 'USDC').toUpperCase();
+  const budgetAtomic = clean(a.budget_atomic);
+  const transferMaxAtomic = clean(a.transfer_max_atomic) || budgetAtomic;
+  if (!walletId) throw new Error('wallet_id is required');
+  if (!/^\d+$/.test(budgetAtomic) || BigInt(budgetAtomic) <= 0n) throw new Error('budget_atomic must be a positive atomic-unit integer string');
+  if (!/^\d+$/.test(transferMaxAtomic) || BigInt(transferMaxAtomic) <= 0n || BigInt(transferMaxAtomic) > BigInt(budgetAtomic)) throw new Error('transfer_max_atomic must be positive and no greater than budget_atomic');
+  const existingCredential = await dbFirst(env, 'SELECT agent_id FROM agent_credentials WHERE credential_type = ? AND credential_key = ?', [evidence.type, evidence.key]);
+  if (existingCredential && existingCredential.agent_id !== agentId) return agentContextError('ambiguous_identity', 'authenticated OAuth identity is already assigned to another agent');
+  const ts = nowIso();
+  const walletRecord = await circleGetWallet(env, walletId);
+  if (clean(walletRecord.blockchain).toLowerCase() !== network) throw new Error('wallet network does not match requested network');
+  const db = requireDb(env);
+  await db.batch([
+    db.prepare(`INSERT INTO agents (agent_id, display_name, status, created_at, updated_at) VALUES (?,?, 'active', ?, ?)
+      ON CONFLICT(agent_id) DO UPDATE SET display_name = excluded.display_name, status = 'active', updated_at = excluded.updated_at`).bind(agentId, displayName, ts, ts),
+    db.prepare(`INSERT INTO agent_credentials (id, agent_id, credential_type, credential_key, status, metadata_json, created_at, updated_at) VALUES (?,?,?,?, 'active', ?, ?, ?)
+      ON CONFLICT(credential_type, credential_key) DO UPDATE SET agent_id = excluded.agent_id, status = 'active', metadata_json = excluded.metadata_json, updated_at = excluded.updated_at`).bind(uid('acred'), agentId, evidence.type, evidence.key, JSON.stringify({ driver: authContext.driver || 'chatgpt', subject_digest: 'sha256' }), ts, ts),
+    db.prepare(`INSERT INTO agent_wallets (id, agent_id, wallet_address, network, asset, status, created_at, updated_at) VALUES (?,?,?,?,?, 'active', ?, ?)`).bind(uid('awlt'), agentId, walletId, network, asset, ts, ts),
+    db.prepare(`INSERT INTO agent_permissions (id, agent_id, capability, effect, network, asset, max_amount_atomic, created_at, updated_at) VALUES (?,?, 'resolve_agent_context', 'allow', ?, ?, '0', ?, ?)`).bind(uid('aperm'), agentId, network, asset, ts, ts),
+    db.prepare(`INSERT INTO agent_permissions (id, agent_id, capability, effect, network, asset, max_amount_atomic, created_at, updated_at) VALUES (?,?, 'circle_gasless_transfer', 'allow', ?, ?, ?, ?, ?)`).bind(uid('aperm'), agentId, network, asset, transferMaxAtomic, ts, ts),
+    db.prepare(`INSERT INTO agent_budgets (id, agent_id, network, asset, period, limit_atomic, spent_atomic, status, created_at, updated_at) VALUES (?,?,?,?, 'lifetime', ?, '0', 'active', ?, ?)`).bind(uid('abud'), agentId, network, asset, budgetAtomic, ts, ts)
+  ]);
+  return { ok: true, agent_id: agentId, credential_type: evidence.type, credential_fingerprint: evidence.key.slice(0, 16), wallet_id: walletId, wallet_address: walletRecord.address, network, asset, budget_atomic: budgetAtomic, transfer_max_atomic: transferMaxAtomic };
 }
 
 function permissionMatches(row, capability, network, asset) {
@@ -1443,6 +1479,8 @@ const toolSchemas = [
   { name: 'circle_gasless_transfer', description: "Gasless USDC transfer: a Circle wallet SIGNS an EIP-3009 TransferWithAuthorization (via Circle's sign/typedData) but never submits a transaction itself, so it never needs native gas -- an x402 facilitator (default: the same one evaluate_request/settle_payment use) submits it and pays gas. This is the correct way to move funds from an agent's Circle wallet; circle_transfer (direct on-chain send) requires the wallet to hold native gas and should be avoided for agent wallets. amount is a decimal USDC string (e.g. \"0.01\"). Optional valid_for_seconds (default 300, 30-3600) bounds how long the signed authorization remains valid before the facilitator must have submitted it.",
     inputSchema: obj({ wallet_id: str, destination_address: str, amount: str, blockchain: str, token_address: str, facilitator_url: str, caller_id: str, resource: str, valid_for_seconds: num }, ['wallet_id', 'destination_address', 'amount']) },
 
+  { name: 'provision_agent_context_self', description: 'Admin-only: provision the currently authenticated OAuth identity into one Agent Context using only a SHA-256 subject digest. Never returns or stores the raw OAuth subject or bearer token.', inputSchema: obj({ agent_id: str, display_name: str, wallet_id: str, network: str, asset: str, budget_atomic: str, transfer_max_atomic: str }, ['wallet_id', 'budget_atomic']) },
+
   { name: 'oauth_trace_list', description: 'OAuth Flight Recorder: list recorded OAuth trace events, folded into distinct traces. Filter by trace_id, client_id, event_type, grant_type, outcome, resource, error, http_status, and a date_from/date_to (ISO) window. No secrets are ever returned -- only hashes and non-secret metadata.',
     inputSchema: obj({ trace_id: str, client_id: str, event_type: str, grant_type: str, outcome: str, resource: str, error: str, http_status: str, date_from: str, date_to: str, limit: num }) },
   { name: 'oauth_trace_get', description: 'OAuth Flight Recorder: reconstruct a single OAuth flow from one trace_id as an ordered, timing-aware timeline (authorize -> token -> initialize -> tools/list -> tool calls). Returns per-event status, latency, outcome, and non-secret metadata.',
@@ -1460,6 +1498,7 @@ async function callTool(env, name, args, authContext) {
   switch (name) {
     case 'subagent_status': return status(env);
     case 'resolve_agent_context': return resolveAgentContextTool(env, a, authContext);
+    case 'provision_agent_context_self': return provisionAgentContextSelf(env, a, authContext);
     case 'create_payment_rule': return createPaymentRule(env, a);
     case 'list_payment_rules': return listPaymentRules(env, a);
     case 'update_payment_rule': return updatePaymentRule(env, a);
