@@ -142,6 +142,204 @@ async function dbRun(env, sql, params = []) {
 }
 
 // =======================================================================
+// Agent Context Phase 1
+// =======================================================================
+function agentContextError(code, detail, extra) {
+  return { ok: false, error: code, error_code: code, detail: detail || code, ...(extra || {}) };
+}
+
+async function writeAgentContextAudit(env, context, outcome, errorCode, fields) {
+  const f = fields || {};
+  const credential = context && context.credential;
+  const agent = context && context.agent;
+  const wallet = context && context.wallet;
+  try {
+    await dbRun(env, `INSERT INTO agent_context_audit
+      (id, agent_id, credential_type, credential_key, capability, outcome, error_code,
+       wallet_address, network, asset, amount_atomic, detail, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, [
+      uid('acx'), agent && agent.agent_id || null,
+      credential && credential.type || f.credential_type || null,
+      credential && credential.key || f.credential_key || null,
+      context && context.capability || f.capability || null,
+      outcome, errorCode || null,
+      wallet && wallet.wallet_address || f.wallet_address || null,
+      context && context.network || f.network || null,
+      context && context.asset || f.asset || null,
+      context && context.amount_atomic || f.amount_atomic || null,
+      f.detail || null, nowIso()
+    ]);
+  } catch (e) { /* audit must not replace the primary result */ }
+}
+
+async function authCredentialEvidence(authContext) {
+  if (!authContext || !authContext.ok) return null;
+  if (authContext.mode === 'oauth' && authContext.subject) {
+    return { type: 'oauth_subject', key: clean(authContext.subject), caller_id: (authContext.driver || 'oauth') + ':' + clean(authContext.subject) };
+  }
+  if (authContext.mode === 'static' && authContext.raw_token) {
+    const digest = await sha256Hex(authContext.raw_token);
+    return { type: 'bearer_token', key: digest, caller_id: 'claude:' + digest.slice(0, 16) };
+  }
+  return null;
+}
+
+function permissionMatches(row, capability, network, asset) {
+  if (row.capability !== capability && row.capability !== '*') return false;
+  if (row.network && clean(row.network).toLowerCase() !== clean(network).toLowerCase()) return false;
+  if (row.asset && clean(row.asset).toUpperCase() !== clean(asset).toUpperCase()) return false;
+  return true;
+}
+
+async function resolveAgentContext(env, authContext, request) {
+  const r = request || {};
+  const capability = clean(r.capability) || 'resolve_agent_context';
+  const network = (clean(r.network) || DEFAULT_CIRCLE_BLOCKCHAIN).toLowerCase();
+  const asset = (clean(r.asset) || 'USDC').toUpperCase();
+  const amountAtomic = clean(r.amount_atomic) || '0';
+  const evidence = await authCredentialEvidence(authContext);
+  if (!evidence) {
+    const failure = agentContextError('unknown_agent', 'authenticated credential evidence is unavailable');
+    await writeAgentContextAudit(env, { capability, network, asset, amount_atomic: amountAtomic }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+
+  const credentials = await dbAll(env, `SELECT * FROM agent_credentials
+    WHERE credential_type = ? AND credential_key = ? AND status = 'active'`, [evidence.type, evidence.key]);
+  if (!credentials.length) {
+    const failure = agentContextError('unknown_agent', 'no active agent credential matches the authenticated identity');
+    await writeAgentContextAudit(env, { credential: evidence, capability, network, asset, amount_atomic: amountAtomic }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  const agentIds = [...new Set(credentials.map(row => row.agent_id))];
+  if (agentIds.length !== 1) {
+    const failure = agentContextError('ambiguous_identity', 'authenticated credential resolves to more than one agent');
+    await writeAgentContextAudit(env, { credential: evidence, capability, network, asset, amount_atomic: amountAtomic }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+
+  const agent = await dbFirst(env, 'SELECT * FROM agents WHERE agent_id = ?', [agentIds[0]]);
+  const baseContext = { credential: evidence, agent, capability, network, asset, amount_atomic: amountAtomic, caller_id: evidence.caller_id };
+  if (!agent) {
+    const failure = agentContextError('unknown_agent', 'credential points to an agent record that does not exist');
+    await writeAgentContextAudit(env, baseContext, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  if (agent.status !== 'active') {
+    const failure = agentContextError('disabled_agent', 'resolved agent is not active', { agent_id: agent.agent_id });
+    await writeAgentContextAudit(env, baseContext, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  if (clean(r.agent_id) && clean(r.agent_id) !== agent.agent_id) {
+    const failure = agentContextError('identity_mismatch', 'request agent_id does not match the authenticated agent', { agent_id: agent.agent_id });
+    await writeAgentContextAudit(env, baseContext, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+
+  const wallets = await dbAll(env, `SELECT * FROM agent_wallets
+    WHERE agent_id = ? AND network = ? AND asset = ? AND status = 'active'`, [agent.agent_id, network, asset]);
+  let wallet = null;
+  const requestedWallet = clean(r.wallet_address);
+  if (requestedWallet) wallet = wallets.find(row => clean(row.wallet_address).toLowerCase() === requestedWallet.toLowerCase()) || null;
+  else if (wallets.length === 1) wallet = wallets[0];
+  else if (wallets.length > 1) {
+    const failure = agentContextError('ambiguous_identity', 'multiple wallets are assigned; a confirming wallet is required', { agent_id: agent.agent_id });
+    await writeAgentContextAudit(env, baseContext, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  if (!wallet) {
+    const code = requestedWallet && wallets.length ? 'wallet_mismatch' : 'wallet_not_assigned';
+    const failure = agentContextError(code, requestedWallet ? 'request wallet does not match an assigned wallet' : 'no active wallet is assigned', { agent_id: agent.agent_id });
+    await writeAgentContextAudit(env, baseContext, 'denied', failure.error_code, { wallet_address: requestedWallet || null, detail: failure.detail });
+    return failure;
+  }
+
+  const permissions = await dbAll(env, 'SELECT * FROM agent_permissions WHERE agent_id = ?', [agent.agent_id]);
+  const matchingPermissions = permissions.filter(row => permissionMatches(row, capability, network, asset));
+  const denied = matchingPermissions.find(row => row.effect === 'deny');
+  const allowed = matchingPermissions.find(row => row.effect === 'allow');
+  if (denied || !allowed) {
+    const failure = agentContextError('permission_denied', denied ? 'an explicit deny permission matched' : 'no allow permission matched', { agent_id: agent.agent_id });
+    await writeAgentContextAudit(env, { ...baseContext, wallet }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  if (allowed.max_amount_atomic != null && BigInt(amountAtomic) > BigInt(allowed.max_amount_atomic)) {
+    const failure = agentContextError('permission_denied', 'requested amount exceeds the permission maximum', { agent_id: agent.agent_id });
+    await writeAgentContextAudit(env, { ...baseContext, wallet }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+
+  const budgets = await dbAll(env, `SELECT * FROM agent_budgets
+    WHERE agent_id = ? AND network = ? AND asset = ? AND status = 'active'`, [agent.agent_id, network, asset]);
+  for (const budget of budgets) {
+    if (BigInt(budget.spent_atomic || '0') + BigInt(amountAtomic) > BigInt(budget.limit_atomic)) {
+      const failure = agentContextError('budget_exhausted', 'agent budget would be exceeded', { agent_id: agent.agent_id, budget_id: budget.id });
+      await writeAgentContextAudit(env, { ...baseContext, wallet }, 'denied', failure.error_code, { detail: failure.detail });
+      return failure;
+    }
+  }
+
+  const context = { ok: true, ...baseContext, wallet, permission: allowed, budgets };
+  await writeAgentContextAudit(env, context, 'allowed', null, { detail: 'agent context resolved' });
+  return context;
+}
+
+async function reserveAgentBudget(env, context, amountAtomic) {
+  const amount = BigInt(amountAtomic || '0');
+  const reserved = [];
+  for (const budget of context.budgets || []) {
+    const before = BigInt(budget.spent_atomic || '0');
+    const after = before + amount;
+    if (after > BigInt(budget.limit_atomic)) {
+      await releaseAgentBudget(env, reserved, amountAtomic);
+      return agentContextError('budget_exhausted', 'agent budget would be exceeded', { agent_id: context.agent.agent_id, budget_id: budget.id });
+    }
+    const result = await dbRun(env, `UPDATE agent_budgets
+      SET spent_atomic = ?, updated_at = ?
+      WHERE id = ? AND status = 'active' AND spent_atomic = ?`, [after.toString(), nowIso(), budget.id, before.toString()]);
+    if (!result.meta || result.meta.changes !== 1) {
+      await releaseAgentBudget(env, reserved, amountAtomic);
+      return agentContextError('budget_exhausted', 'agent budget changed concurrently; reservation denied', { agent_id: context.agent.agent_id, budget_id: budget.id });
+    }
+    reserved.push({ id: budget.id, before: before.toString(), after: after.toString() });
+  }
+  return { ok: true, reserved };
+}
+
+async function releaseAgentBudget(env, reserved, amountAtomic) {
+  const amount = BigInt(amountAtomic || '0');
+  for (const item of [...(reserved || [])].reverse()) {
+    const current = BigInt(item.after);
+    const restored = current - amount;
+    await dbRun(env, `UPDATE agent_budgets
+      SET spent_atomic = ?, updated_at = ?
+      WHERE id = ? AND status = 'active' AND spent_atomic = ?`, [restored.toString(), nowIso(), item.id, current.toString()]);
+  }
+}
+
+async function resolveAgentContextTool(env, a, authContext) {
+  const context = await resolveAgentContext(env, authContext, {
+    capability: clean(a.capability) || 'resolve_agent_context',
+    agent_id: a.agent_id,
+    wallet_address: a.wallet_address,
+    network: a.network,
+    asset: a.asset,
+    amount_atomic: a.amount_atomic
+  });
+  if (!context.ok) return context;
+  return {
+    ok: true,
+    agent_id: context.agent.agent_id,
+    display_name: context.agent.display_name || null,
+    caller_id: context.caller_id,
+    credential_type: context.credential.type,
+    wallet: context.wallet,
+    permission: context.permission,
+    budgets: context.budgets
+  };
+}
+
+// =======================================================================
 // Payment rules
 // =======================================================================
 async function createPaymentRule(env, a) {
@@ -1043,12 +1241,27 @@ async function circleSignTypedData(env, walletId, typedData) {
   return signature;
 }
 
-async function circleGaslessTransfer(env, a) {
-  const walletId = clean(a.wallet_id);
-  if (!walletId) throw new Error('wallet_id (payer) is required');
-  const destinationAddress = assertValidAddress(a.destination_address, 'destination_address');
+async function circleGaslessTransfer(env, a, authContext) {
+  const requestedWallet = clean(a.wallet_id);
   const amount = clean(a.amount);
   if (!amount || !Number.isFinite(Number(amount)) || Number(amount) <= 0) throw new Error('amount is required and must be a positive decimal USD string, e.g. "0.01"');
+  const atomicValue = toAtomic(amount, 6);
+  const context = await resolveAgentContext(env, authContext, {
+    capability: 'circle_gasless_transfer',
+    wallet_address: requestedWallet,
+    network: clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN,
+    asset: 'USDC',
+    amount_atomic: atomicValue
+  });
+  if (!context.ok) return context;
+  const reservation = await reserveAgentBudget(env, context, atomicValue);
+  if (!reservation.ok) {
+    await writeAgentContextAudit(env, context, 'denied', reservation.error_code, { detail: reservation.detail });
+    return reservation;
+  }
+  const walletId = context.wallet.wallet_address;
+  if (!walletId) throw new Error('wallet_id (payer) is required');
+  const destinationAddress = assertValidAddress(a.destination_address, 'destination_address');
   const blockchain = clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN;
   const network = blockchain.toLowerCase(); // matches x402/KNOWN_ASSETS network naming
   const tokenAddress = assetAddress(network, 'USDC', clean(a.token_address) || null);
@@ -1059,7 +1272,6 @@ async function circleGaslessTransfer(env, a) {
   const payerWallet = await circleGetWallet(env, walletId);
   const payerAddress = payerWallet.address;
 
-  const atomicValue = toAtomic(amount, 6);
   const validAfter = 0;
   const validBeforeSeconds = limitNum(a.valid_for_seconds, 300, 30, 3600);
   const validBefore = Math.floor(Date.now() / 1000) + validBeforeSeconds;
@@ -1091,7 +1303,13 @@ async function circleGaslessTransfer(env, a) {
     message: { from: payerAddress, to: destinationAddress, value: atomicValue, validAfter: String(validAfter), validBefore: String(validBefore), nonce }
   };
 
-  const signature = await circleSignTypedData(env, walletId, typedData);
+  let signature;
+  try {
+    signature = await circleSignTypedData(env, walletId, typedData);
+  } catch (e) {
+    await releaseAgentBudget(env, reservation.reserved, atomicValue);
+    throw e;
+  }
 
   const paymentPayload = {
     x402Version: X402_VERSION,
@@ -1114,6 +1332,8 @@ async function circleGaslessTransfer(env, a) {
     x402Version: X402_VERSION, paymentPayload, paymentRequirements
   });
   if (!(verify.data && verify.data.isValid !== false && verify.httpOk)) {
+    await releaseAgentBudget(env, reservation.reserved, atomicValue);
+    await writeAgentContextAudit(env, context, 'denied', 'payment_verification_failed', { detail: 'payment verification failed' });
     return { ok: false, error: 'payment verification failed', verify: verify.data, payer_address: payerAddress };
   }
   const settle = await facilitatorCall(env, a.facilitator_url, '/settle', {
@@ -1121,14 +1341,27 @@ async function circleGaslessTransfer(env, a) {
   });
   const success = !!(settle.data && settle.data.success);
   await logUsage(env, {
-    route: paymentRequirements.resource, method: 'CIRCLE_GASLESS', caller_id: clean(a.caller_id) || null,
+    route: paymentRequirements.resource, method: 'CIRCLE_GASLESS', caller_id: context.caller_id,
     outcome: success ? 'paid' : 'denied', price_atomic: atomicValue, asset: 'USDC', network,
     payment_id: (settle.data && settle.data.txHash) || null,
     facilitator_http_status: settle.httpStatus, facilitator_url: settle.facilitator
   });
+  if (!success) await releaseAgentBudget(env, reservation.reserved, atomicValue);
+  const receipt = {
+    agent_id: context.agent.agent_id,
+    caller_id: context.caller_id,
+    credential_type: context.credential.type,
+    wallet_address: context.wallet.wallet_address,
+    network,
+    asset: 'USDC',
+    amount_atomic: atomicValue,
+    transaction_id: (settle.data && (settle.data.txHash || settle.data.transactionId)) || null
+  };
+  await writeAgentContextAudit(env, context, success ? 'allowed' : 'denied', success ? null : 'settlement_failed', receipt);
   return {
-    ok: success, payer_address: payerAddress, destination_address: destinationAddress,
-    amount_atomic: atomicValue, verify: verify.data, settle: settle.data
+    ok: success, agent_id: context.agent.agent_id, caller_id: context.caller_id,
+    payer_address: payerAddress, destination_address: destinationAddress,
+    amount_atomic: atomicValue, receipt, verify: verify.data, settle: settle.data
   };
 }
 
@@ -1157,6 +1390,8 @@ const boolT = { type: 'boolean' };
 
 const toolSchemas = [
   { name: 'subagent_status', description: 'Health check: bindings, facilitator default, and tool list.', inputSchema: obj({}) },
+  { name: 'resolve_agent_context', description: 'Resolve the authenticated OAuth subject or static bearer credential into one canonical agent, assigned wallet, permission, and budget context. Request identity fields are consistency checks only.',
+    inputSchema: obj({ capability: str, agent_id: str, wallet_address: str, network: str, asset: str, amount_atomic: str }) },
 
   { name: 'create_payment_rule', description: 'Protect a route pattern (e.g. /api/premium/*) with an x402 price. Provide price_usd (converted to atomic units) or price_atomic directly.',
     inputSchema: obj({ pattern: str, method: str, mode: str, price_usd: num, price_atomic: str, decimals: num, asset: str, asset_address: str, network: str, pay_to: str, auth_required: boolT, bot_auth_required: boolT, description: str, priority: num }, ['pattern', 'pay_to']) },
@@ -1220,10 +1455,11 @@ const toolSchemas = [
     inputSchema: obj({ retention_days: num }, ['retention_days']) }
 ];
 
-async function callTool(env, name, args) {
+async function callTool(env, name, args, authContext) {
   const a = args || {};
   switch (name) {
     case 'subagent_status': return status(env);
+    case 'resolve_agent_context': return resolveAgentContextTool(env, a, authContext);
     case 'create_payment_rule': return createPaymentRule(env, a);
     case 'list_payment_rules': return listPaymentRules(env, a);
     case 'update_payment_rule': return updatePaymentRule(env, a);
@@ -1256,7 +1492,7 @@ async function callTool(env, name, args) {
     case 'circle_fund_wallet': return circleFundWallet(env, a);
     case 'circle_transfer': return circleTransfer(env, a);
     case 'circle_get_transaction': return circleGetTransaction(env, a);
-    case 'circle_gasless_transfer': return circleGaslessTransfer(env, a);
+    case 'circle_gasless_transfer': return circleGaslessTransfer(env, a, authContext);
     case 'oauth_trace_list': return oauthTraceList(env, a);
     case 'oauth_trace_get': return oauthTraceGet(env, a);
     case 'oauth_trace_analyze': return oauthTraceAnalyze(env, a);
@@ -2109,7 +2345,7 @@ async function verifyOauthAccessToken(env, rawToken) {
 async function authenticate(req, env) {
   const token = extractBearer(req);
   if (!token) return { ok: false };
-  if (env.MCP_AUTH_TOKEN && timingSafeEqual(token, env.MCP_AUTH_TOKEN)) return { ok: true, mode: 'static' };
+  if (env.MCP_AUTH_TOKEN && timingSafeEqual(token, env.MCP_AUTH_TOKEN)) return { ok: true, mode: 'static', raw_token: token };
   const row = await verifyOauthAccessToken(env, token);
   if (!row) return { ok: false };
   const origin = new URL(req.url).origin;
@@ -2198,7 +2434,7 @@ async function handleMcp(req, env) {
       }
       let result;
       try {
-        result = await callTool(env, toolName, (rpc.params && rpc.params.arguments) || {});
+        result = await callTool(env, toolName, (rpc.params && rpc.params.arguments) || {}, auth);
         if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=' + auth.driver + ':' + auth.subject + ' outcome=ok' });
         await traceFromRequest(env, req, { event_type: 'tool_call', client_id: auth.client_id || null, request_id: reqId, http_status: 200, latency_ms: Date.now() - mT0, outcome: result && result.ok === false ? 'error' : 'ok', metadata: { tool_name: toolName, mode: auth.mode, driver: auth.driver || null } });
       } catch (e) {
@@ -2291,7 +2527,7 @@ export default {
           return j({ ok: false, error: 'insufficient_scope: this OAuth token cannot call ' + body.name }, 403);
         }
         try {
-          const result = await callTool(env, body.name, body.arguments || {});
+          const result = await callTool(env, body.name, body.arguments || {}, auth);
           if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: body.name, detail: 'caller_id=' + auth.driver + ':' + auth.subject + ' outcome=ok' });
           return j(result);
         } catch (e) { return j({ ok: false, error: String(e.message || e) }, 200); }
