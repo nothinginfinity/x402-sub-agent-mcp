@@ -178,9 +178,10 @@ async function authCredentialEvidence(authContext) {
     const digest = await sha256Hex(clean(authContext.subject));
     return { type: 'oauth_subject_sha256', key: digest, caller_id: (authContext.driver || 'oauth') + ':' + digest.slice(0, 16) };
   }
-  if (authContext.mode === 'static' && authContext.raw_token) {
+  if ((authContext.mode === 'static' || authContext.mode === 'agent') && authContext.raw_token) {
     const digest = await sha256Hex(authContext.raw_token);
-    return { type: 'bearer_token', key: digest, caller_id: 'claude:' + digest.slice(0, 16) };
+    const driver = authContext.driver || (authContext.mode === 'agent' ? 'agent' : 'claude');
+    return { type: 'bearer_token', key: digest, caller_id: driver + ':' + digest.slice(0, 16) };
   }
   return null;
 }
@@ -1781,6 +1782,24 @@ function oauthToolAllowedForScopes(toolName, grantedScopes) {
   return false;
 }
 
+// A1 least-privilege allow-list for per-agent bearer tokens (mode:'agent').
+// Agent tokens are NOT static-token equivalent: they may call only these
+// tools. Spend tools (circle_gasless_transfer) are additionally constrained
+// by agent_permissions/agent_budgets in resolveAgentContext. Admin/onboarding
+// tools require mode:'oauth'+mcp:admin and are unreachable here regardless.
+const AGENT_ALLOWED_TOOLS = new Set([
+  'subagent_status',
+  'resolve_agent_context',
+  'circle_gasless_transfer',
+  'circle_get_wallet_balance',
+  'circle_get_transaction',
+  'circle_list_wallets',
+  'circle_list_wallet_sets'
+]);
+function agentToolAllowed(toolName) {
+  return AGENT_ALLOWED_TOOLS.has(toolName);
+}
+
 // ---- crypto / encoding helpers ----
 function b64urlFromBytes(bytes) {
   let bin = '';
@@ -2516,7 +2535,19 @@ async function authenticate(req, env) {
   if (!token) return { ok: false };
   if (env.MCP_AUTH_TOKEN && timingSafeEqual(token, env.MCP_AUTH_TOKEN)) return { ok: true, mode: 'static', raw_token: token };
   const row = await verifyOauthAccessToken(env, token);
-  if (!row) return { ok: false };
+  if (!row) {
+    // Per-agent bearer token (A1): only reached when the token is NEITHER the
+    // static admin secret NOR a valid OAuth access token -- i.e. the exact
+    // branch that returned {ok:false} before. OAuth callers (ChatGPT) match
+    // above and never arrive here, so this cannot change how OAuth connects.
+    // Tool reach is limited by agentToolAllowed() at the tool-call gates;
+    // spend is further governed by agent_permissions/agent_budgets in
+    // resolveAgentContext. No OAuth-style scope layer is applied.
+    const agentFp = await sha256Hex(token);
+    const cred = await dbFirst(env, `SELECT ac.agent_id FROM agent_credentials ac JOIN agents ag ON ag.agent_id = ac.agent_id WHERE ac.credential_type = 'bearer_token' AND ac.credential_key = ? AND ac.status = 'active' AND ag.status = 'active'`, [agentFp]);
+    if (cred) return { ok: true, mode: 'agent', raw_token: token, agent_id: cred.agent_id, driver: 'agent' };
+    return { ok: false };
+  }
   const origin = new URL(req.url).origin;
   // Audience: accept both canonical resource forms (bare origin and the
   // /mcp endpoint URL MCP clients bind to per RFC 8707) -- must mirror the
@@ -2592,6 +2623,13 @@ async function handleMcp(req, env) {
         return mcpUnauthorized(req, id, origin);
       }
       const toolName = rpc.params && rpc.params.name;
+      if (auth.mode === 'agent' && !agentToolAllowed(toolName)) {
+        await traceFromRequest(env, req, { event_type: 'scope_denied', client_id: null, request_id: reqId, http_status: 403, latency_ms: Date.now() - mT0, outcome: 'denied', error: 'agent_tool_not_allowed', metadata: { tool_name: toolName, mode: 'agent', agent_id: auth.agent_id || null } });
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32002, message: 'agent_tool_not_allowed: this agent bearer token cannot call ' + toolName } }), {
+          status: 403,
+          headers: { ...CORS, 'content-type': 'application/json;charset=utf-8', 'cache-control': 'no-store' }
+        });
+      }
       if (auth.mode === 'oauth' && !oauthToolAllowedForScopes(toolName, auth.scope)) {
         await oauthAudit(env, 'scope_denied', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'scope=' + auth.scope.join(' ') });
         const isWalletTool = String(toolName || '').startsWith('circle_') || String(toolName || '').includes('transfer');
@@ -2691,6 +2729,9 @@ export default {
           });
         }
         const body = await readJson(req);
+        if (auth.mode === 'agent' && !agentToolAllowed(body.name)) {
+          return j({ ok: false, error: 'agent_tool_not_allowed: this agent bearer token cannot call ' + body.name }, 403);
+        }
         if (auth.mode === 'oauth' && !oauthToolAllowedForScopes(body.name, auth.scope)) {
           await oauthAudit(env, 'scope_denied', { subject: auth.subject, client_id: auth.client_id, tool_name: body.name, detail: 'scope=' + auth.scope.join(' ') });
           return j({ ok: false, error: 'insufficient_scope: this OAuth token cannot call ' + body.name }, 403);
