@@ -185,6 +185,96 @@ async function authCredentialEvidence(authContext) {
   return null;
 }
 
+function randomBearerToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  const encoded = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  return 'afo_x402_' + encoded;
+}
+
+async function upsertAgentWallet(env, input) {
+  const a = input || {};
+  const agentId = clean(a.agent_id);
+  const displayName = clean(a.display_name) || agentId;
+  const walletId = clean(a.wallet_id);
+  const network = (clean(a.network) || DEFAULT_CIRCLE_BLOCKCHAIN).toLowerCase();
+  const asset = (clean(a.asset) || 'USDC').toUpperCase();
+  const budgetAtomic = clean(a.budget_atomic);
+  const transferMaxAtomic = clean(a.transfer_max_atomic) || budgetAtomic;
+  if (!agentId) throw new Error('agent_id is required');
+  if (!walletId) throw new Error('wallet_id is required');
+  if (!/^[0-9a-fA-F-]{36}$/.test(walletId)) throw new Error('wallet_id must be a Circle UUID');
+  if (!/^\d+$/.test(budgetAtomic) || BigInt(budgetAtomic) <= 0n) throw new Error('budget_atomic must be a positive atomic-unit integer string');
+  if (!/^\d+$/.test(transferMaxAtomic) || BigInt(transferMaxAtomic) <= 0n || BigInt(transferMaxAtomic) > BigInt(budgetAtomic)) throw new Error('transfer_max_atomic must be positive and no greater than budget_atomic');
+  const walletRecord = await circleGetWallet(env, walletId);
+  const walletAddress = assertValidAddress(walletRecord.address, 'wallet address');
+  if (clean(walletRecord.blockchain).toLowerCase() !== network) throw new Error('wallet network does not match requested network');
+  const walletConflict = await dbFirst(env, `SELECT agent_id FROM agent_wallets WHERE status = 'active' AND network = ? AND asset = ? AND (wallet_id = ? OR lower(wallet_address) = lower(?))`, [network, asset, walletId, walletAddress]);
+  if (walletConflict && walletConflict.agent_id !== agentId) {
+    const failure = agentContextError('wallet_conflict', 'wallet is already assigned to another active agent', { agent_id: walletConflict.agent_id });
+    await writeAgentContextAudit(env, { agent: { agent_id: agentId }, wallet: { wallet_address: walletAddress }, capability: 'admin_assign_agent_wallet', network, asset }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  const ts = nowIso();
+  const db = requireDb(env);
+  await db.batch([
+    db.prepare(`INSERT INTO agents (agent_id, display_name, status, created_at, updated_at) VALUES (?, ?, 'active', ?, ?)
+      ON CONFLICT(agent_id) DO UPDATE SET display_name = excluded.display_name, status = 'active', updated_at = excluded.updated_at`).bind(agentId, displayName, ts, ts),
+    db.prepare(`INSERT INTO agent_wallets (id, agent_id, wallet_id, wallet_address, network, asset, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+      ON CONFLICT(wallet_id, network, asset) WHERE status = 'active' DO UPDATE SET wallet_address = excluded.wallet_address, updated_at = excluded.updated_at
+      WHERE agent_wallets.agent_id = excluded.agent_id`).bind(uid('awlt'), agentId, walletId, walletAddress, network, asset, ts, ts),
+    db.prepare(`INSERT INTO agent_permissions (id, agent_id, capability, effect, network, asset, max_amount_atomic, created_at, updated_at) VALUES (?, ?, 'resolve_agent_context', 'allow', ?, ?, '0', ?, ?)
+      ON CONFLICT(agent_id, capability, effect, COALESCE(network, ''), COALESCE(asset, '')) DO UPDATE SET max_amount_atomic = excluded.max_amount_atomic, updated_at = excluded.updated_at`).bind(uid('aperm'), agentId, network, asset, ts, ts),
+    db.prepare(`INSERT INTO agent_permissions (id, agent_id, capability, effect, network, asset, max_amount_atomic, created_at, updated_at) VALUES (?, ?, 'circle_gasless_transfer', 'allow', ?, ?, ?, ?, ?)
+      ON CONFLICT(agent_id, capability, effect, COALESCE(network, ''), COALESCE(asset, '')) DO UPDATE SET max_amount_atomic = excluded.max_amount_atomic, updated_at = excluded.updated_at`).bind(uid('aperm'), agentId, network, asset, transferMaxAtomic, ts, ts),
+    db.prepare(`INSERT INTO agent_budgets (id, agent_id, network, asset, period, limit_atomic, spent_atomic, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'lifetime', ?, '0', 'active', ?, ?)
+      ON CONFLICT(agent_id, network, asset, period) WHERE status = 'active' DO UPDATE SET limit_atomic = excluded.limit_atomic, updated_at = excluded.updated_at`).bind(uid('abud'), agentId, network, asset, budgetAtomic, ts, ts)
+  ]);
+  const result = { ok: true, agent_id: agentId, wallet_id: walletId, wallet_address: walletAddress, network, asset, budget_atomic: budgetAtomic, transfer_max_atomic: transferMaxAtomic };
+  await writeAgentContextAudit(env, { agent: { agent_id: agentId }, wallet: { wallet_address: walletAddress }, capability: 'admin_assign_agent_wallet', network, asset }, 'allowed', null, { detail: 'agent wallet assigned idempotently' });
+  return result;
+}
+
+async function attachAgentCredential(env, input) {
+  const a = input || {};
+  const agentId = clean(a.agent_id);
+  const credentialType = clean(a.credential_type) || 'bearer_token';
+  const credentialKey = clean(a.credential_key);
+  if (!agentId) throw new Error('agent_id is required');
+  if (!credentialKey) throw new Error('credential_key is required');
+  const agent = await dbFirst(env, `SELECT * FROM agents WHERE agent_id = ? AND status = 'active'`, [agentId]);
+  if (!agent) {
+    const failure = agentContextError('unknown_agent', 'active agent does not exist', { agent_id: agentId });
+    await writeAgentContextAudit(env, { agent: { agent_id: agentId }, credential: { type: credentialType, key: credentialKey }, capability: 'attach_agent_credential' }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  const existing = await dbFirst(env, `SELECT * FROM agent_credentials WHERE credential_type = ? AND credential_key = ?`, [credentialType, credentialKey]);
+  if (existing && existing.agent_id !== agentId) {
+    const failure = agentContextError('ambiguous_identity', 'credential is already attached to another agent', { agent_id: existing.agent_id });
+    await writeAgentContextAudit(env, { agent, credential: { type: credentialType, key: credentialKey }, capability: 'attach_agent_credential' }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  const ts = nowIso();
+  await dbRun(env, `INSERT INTO agent_credentials (id, agent_id, credential_type, credential_key, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+    ON CONFLICT(credential_type, credential_key) DO UPDATE SET status = 'active', metadata_json = excluded.metadata_json, updated_at = excluded.updated_at
+    WHERE agent_credentials.agent_id = excluded.agent_id`, [uid('acred'), agentId, credentialType, credentialKey, JSON.stringify(a.metadata || { source: 'admin_assign_agent_wallet', fingerprint: 'sha256' }), ts, ts]);
+  await writeAgentContextAudit(env, { agent, credential: { type: credentialType, key: credentialKey }, capability: 'attach_agent_credential' }, 'allowed', null, { detail: 'agent credential attached idempotently' });
+  return { ok: true, agent_id: agentId, credential_type: credentialType, credential_fingerprint: credentialKey };
+}
+
+async function adminAssignAgentWallet(env, a, authContext) {
+  if (!authContext || !authContext.ok || authContext.mode !== 'oauth' || !(authContext.scope || []).includes(OAUTH_ADMIN_SCOPE)) {
+    return agentContextError('permission_denied', 'OAuth mcp:admin authentication is required');
+  }
+  const assigned = await upsertAgentWallet(env, a);
+  if (!assigned.ok) return assigned;
+  const rawToken = randomBearerToken();
+  const fingerprint = await sha256Hex(rawToken);
+  const attached = await attachAgentCredential(env, { agent_id: assigned.agent_id, credential_type: 'bearer_token', credential_key: fingerprint, metadata: { source: 'admin_assign_agent_wallet', fingerprint: 'sha256' } });
+  if (!attached.ok) return attached;
+  return { ...assigned, credential_type: attached.credential_type, credential_fingerprint: fingerprint, token: rawToken, one_time_reveal: true };
+}
+
 async function provisionAgentContextSelf(env, a, authContext) {
   if (!authContext || !authContext.ok || authContext.mode !== 'oauth' || !(authContext.scope || []).includes(OAUTH_ADMIN_SCOPE)) {
     return agentContextError('permission_denied', 'OAuth mcp:admin authentication is required');
@@ -1507,6 +1597,7 @@ const toolSchemas = [
     inputSchema: obj({ wallet_id: str, destination_address: str, amount: str, blockchain: str, token_address: str, facilitator_url: str, caller_id: str, resource: str, valid_for_seconds: num }, ['wallet_id', 'destination_address', 'amount']) },
 
   { name: 'provision_agent_context_self', description: 'Admin-only: provision the currently authenticated OAuth identity into one Agent Context using only a SHA-256 subject digest. Never returns or stores the raw OAuth subject or bearer token.', inputSchema: obj({ agent_id: str, display_name: str, wallet_id: str, network: str, asset: str, budget_atomic: str, transfer_max_atomic: str }, ['wallet_id', 'budget_atomic']) },
+  { name: 'admin_assign_agent_wallet', description: 'Admin-only: assign a Circle wallet, budget, permissions, and a server-generated one-time bearer credential to an explicit agent_id.', inputSchema: obj({ agent_id: str, display_name: str, wallet_id: str, network: str, asset: str, budget_atomic: str, transfer_max_atomic: str }, ['agent_id', 'wallet_id', 'budget_atomic']) },
 
   { name: 'oauth_trace_list', description: 'OAuth Flight Recorder: list recorded OAuth trace events, folded into distinct traces. Filter by trace_id, client_id, event_type, grant_type, outcome, resource, error, http_status, and a date_from/date_to (ISO) window. No secrets are ever returned -- only hashes and non-secret metadata.',
     inputSchema: obj({ trace_id: str, client_id: str, event_type: str, grant_type: str, outcome: str, resource: str, error: str, http_status: str, date_from: str, date_to: str, limit: num }) },
@@ -1526,6 +1617,7 @@ async function callTool(env, name, args, authContext) {
     case 'subagent_status': return status(env);
     case 'resolve_agent_context': return resolveAgentContextTool(env, a, authContext);
     case 'provision_agent_context_self': return provisionAgentContextSelf(env, a, authContext);
+    case 'admin_assign_agent_wallet': return adminAssignAgentWallet(env, a, authContext);
     case 'create_payment_rule': return createPaymentRule(env, a);
     case 'list_payment_rules': return listPaymentRules(env, a);
     case 'update_payment_rule': return updatePaymentRule(env, a);
