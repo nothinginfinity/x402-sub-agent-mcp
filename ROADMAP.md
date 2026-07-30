@@ -928,3 +928,207 @@ Without deterministic identity, receipts, budgets, permissions, and provenance b
 - **Narrowing is the value.** "Endless possibilities" is the trap. What makes this valuable is being the thing that meters *agent tool calls*, specifically, better than anyone. The generality is already in the architecture and does not need chasing.
 - **Every item above V1.5 rests on interception existing.** Confirmed absent 2026-07-24. Do not design further billing mechanics on an unverified foundation.
 - **Testnet / BASE-SEPOLIA only.** Verify stepwise; stop at first failure and capture the exact error before fixing. A settle success is not proof without independent confirmation — and mind the balance lag (stone 465902b511d5) when choosing that confirmation.
+
+---
+
+## V1.4.6 — OAuth-time wallet assignment (design-first, not yet built)
+
+**Status: DESIGN ONLY.** This section is the complete roadmap for the
+feature. No code is written until Jared says go. It extends
+[V1.4.5](#v145----multi-driver-llm-oauth-access-chatgpt-alongside-claude)
+(the OAuth 2.1 layer that already works for both Claude and ChatGPT) and
+supersedes, as the *default onboarding path*, the admin-assignment design
+doc near the top of this file (`admin_assign_agent_wallet`, 2026-07-29).
+That admin tool is not removed — it remains the break-glass / scripted
+path. What changes is that ordinary ChatGPT onboarding no longer requires
+any MCP tool call at all.
+
+### The problem this closes
+
+Today, binding a ChatGPT OAuth identity to a wallet is a two-phase dance:
+authorize first, then run `admin_assign_agent_wallet` (through a manual
+admin OAuth flow) to attach agent + wallet + budget + credential after
+the fact. It works and is proven on-chain (chatgpt-pilot transacted
+independently, tx `0xc8fb64d8…`), but it is operator-hostile: the wallet
+choice happens in a separate, privileged, tool-driven step that a normal
+onboarding should never need. The desired experience moves the wallet
+choice *into* the authorization page itself.
+
+```text
+Today:   OAuth → provision tools → assign wallet → configure budgets → ready
+Target:  OAuth (sign in → choose wallet → choose limits → authorize) → ready
+```
+
+After authorization completes, every future MCP call resolves to the
+chosen wallet automatically. ChatGPT never passes a wallet ID again.
+
+### Design goals
+
+**Human experience.** The single authorization page carries the whole
+onboarding: login, wallet selection, budget selection, confirmation, and
+OAuth approval. No MCP tool is required for an ordinary onboard.
+
+**Wallet selection — two methods.**
+
+- *Standard:* a dropdown of wallets owned by the authenticated operator,
+  showing human-friendly names ("ChatGPT Development Wallet",
+  "Production Wallet", "Testing Wallet") while internally carrying the
+  Circle wallet ID. Names are display; the ID is the stored key.
+- *Advanced:* manual wallet-ID entry. This MUST verify operator
+  ownership server-side before authorization can proceed. Knowing a
+  wallet ID alone must never grant access — a wallet ID is an
+  identifier, not a secret.
+
+**Budget configuration at authorization time.** The operator may set:
+lifetime budget, per-transfer maximum, allowed asset, allowed network,
+and an optional expiration date. These become the initial Agent Context
+budget. An existing budget must never be silently increased by a
+re-authorization (see reassignment, below).
+
+### OAuth flow (target sequence)
+
+1. User authenticates (existing single-user login/consent page).
+2. OAuth session begins.
+3. Server loads the wallets owned by the authenticated operator.
+4. User selects one wallet (standard dropdown or advanced manual entry).
+5. Server validates ownership of the selected wallet.
+6. The wallet assignment is stored against the *authorization session*,
+   not trusted from any client-supplied parameter.
+7. Authorization code is issued (one-time, short TTL, as today).
+8. Token exchange completes.
+9. Agent Context (agent + wallet + budget + permission + credential
+   mapping + audit) is created or updated **atomically** — no
+   partially-created state.
+10. Future MCP requests resolve to the assigned wallet automatically via
+    the existing `resolve_agent_context` path.
+
+### Architecture — the authorization session
+
+Wallet choice must be carried in temporary, server-owned session state
+keyed to the in-flight authorization, never re-derived from an unsigned
+client parameter at the token step. Proposed `authorization_session`
+fields:
+
+- `authorization_session_id`
+- `oauth_client_id`
+- `oauth_subject`
+- `user_id`
+- `selected_wallet_id`
+- `budget_atomic`
+- `transfer_max_atomic`
+- `allowed_asset`, `allowed_network`, `expires_at` (budget policy)
+- `scopes`
+- `state`
+- `pkce` (challenge/method)
+- `expires_at` (the session's own short TTL)
+
+This lives in **D1, not KV** — same reasoning as V1.4.5's one-time codes
+and refresh families: security-critical one-time state needs real
+transactional guarantees. The session is consumed at token exchange and
+expires on its own if abandoned.
+
+### Agent Context write — atomic or nothing
+
+At authorization completion the server creates-or-updates, in one
+transaction: the agent, the wallet assignment, the budget, the
+permissions, the OAuth-credential→agent mapping, and an
+`agent_context_audit` row. This reuses the existing idempotent,
+non-destructive primitives from the admin-assignment work
+(`upsertAgentWallet`, `attachAgentCredential`) — the OAuth-time path is
+another caller of the same substrate, which keeps the admin tool and this
+path mutually consistent by construction. If any step fails, nothing is
+committed.
+
+### Security requirements (state these explicitly in the build)
+
+- OAuth authenticates the **human**; wallet selection authorizes **which
+  wallet ChatGPT may use**. Two distinct decisions.
+- Wallet IDs are identifiers, not secrets. Ownership is validated
+  server-side on every selection, including advanced manual entry.
+- Authorization sessions expire.
+- PKCE (S256) and `state` remain required, exactly as V1.4.5.
+- Every assignment writes an audit row.
+- An existing budget cannot be silently increased by re-authorization;
+  a raise is an explicit, audited reassignment.
+- No credential, wallet secret, `MCP_AUTH_TOKEN`, or signing material is
+  ever logged or returned (V1.4.5 rule, unchanged).
+
+### Wallet changes / reassignment
+
+If ChatGPT is already assigned a wallet and a new authorization selects a
+different one:
+
+- show the existing assignment on the consent page,
+- require explicit confirmation before replacing it,
+- archive the previous assignment (do not delete),
+- preserve full audit history.
+
+Re-authorizing with the *same* wallet is idempotent and must not disturb
+existing rows.
+
+### Future admin features (later roadmap, not this milestone)
+
+Multiple wallet profiles per operator; delegated wallets;
+organization-owned wallets; rotating budgets and scheduled budget resets;
+emergency wallet disable; wallet revocation; wallet migration; and
+managing multiple AI agents from one operator account. These are
+enumerated here so the session/schema design does not paint them out, but
+none are built in this milestone.
+
+### Testing phase (all live-verified, stepwise, stop at first failure)
+
+- [ ] Successful authorization with a standard dropdown selection.
+- [ ] Wallet-ownership validation passes for an owned wallet.
+- [ ] Invalid wallet ID rejected.
+- [ ] Unauthorized wallet selection (valid ID, not owned) rejected.
+- [ ] Budget persistence: chosen limits land in the Agent Context.
+- [ ] Reconnecting ChatGPT preserves the assignment.
+- [ ] Replacing an assignment updates it and archives the prior one.
+- [ ] Expired authorization session is rejected at token exchange.
+- [ ] Concurrent approvals resolve to one consistent assignment.
+- [ ] PKCE validation enforced.
+- [ ] `state` validation enforced.
+- [ ] Idempotent retries do not double-write or double-charge.
+
+### Live verification (real ChatGPT OAuth connection)
+
+After implementation, verify against an actual ChatGPT OAuth connection —
+not a synthetic client — that: authorization succeeds; the selected
+wallet persists; `resolve_agent_context` returns the selected wallet;
+budgets match what was chosen at authorization; a `circle_gasless_transfer`
+uses the assigned wallet; reconnecting preserves the assignment; and
+changing the wallet updates the assignment correctly, archiving the prior
+binding. Testnet / BASE-SEPOLIA only, per the standing rule.
+
+### Implementation phases (to be built only after a "go")
+
+These are the phases that would follow, each live-verified before the
+next — same discipline as V1.4.5's staged rollout:
+
+- [ ] **Phase 0 — schema + design freeze.** `authorization_session`
+      table migration written (D1), threat-model notes, and the exact
+      curl/flow tests for each check above written down and shown to
+      Jared. No worker code yet.
+- [ ] **Phase 1 — session plumbing (no UI money decisions live).**
+      Create/consume the authorization session across authorize→token;
+      carry `selected_wallet_id` server-side; verify it survives the
+      round-trip and expires correctly. Wallet still assigned via the
+      existing admin path in this phase.
+- [ ] **Phase 2 — consent-page wallet selection (standard).** Load
+      operator-owned wallets, render the dropdown with friendly names,
+      store the choice on the session, validate ownership server-side.
+- [ ] **Phase 3 — budget configuration on the page.** Lifetime,
+      per-transfer max, asset, network, optional expiry → initial
+      Agent Context budget, atomically written at token exchange.
+- [ ] **Phase 4 — advanced manual wallet-ID entry** with server-side
+      ownership verification (identifier-not-secret enforced).
+- [ ] **Phase 5 — reassignment UX:** show existing assignment, confirm
+      replacement, archive prior, preserve audit; no silent budget raise.
+- [ ] **Phase 6 — full live verification** against a real ChatGPT OAuth
+      connection (the checklist above), then make this the default
+      onboarding path in docs.
+
+**Long-term framing.** This is the intended default onboarding for
+ChatGPT and every future AI client connecting to the x402 ecosystem: the
+operator chooses the wallet and limits once, during authorization, and
+the assignment is automatic and invisible afterward.
