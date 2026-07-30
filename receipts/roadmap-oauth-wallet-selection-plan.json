@@ -1,0 +1,36 @@
+{
+  "worker": "afo-gitzip",
+  "version": "0.2.2-unified",
+  "action": "apply_repo_text_patch",
+  "target": {
+    "owner": "nothinginfinity",
+    "repo": "x402-sub-agent-mcp",
+    "branch": "main",
+    "path": "ROADMAP.md"
+  },
+  "source_sha": "b5dea43caf0857095f59f5183c47d789f9fca468",
+  "result_sha": "b5dea43caf0857095f59f5183c47d789f9fca468",
+  "commit_sha": "0062a9ae0694a05c7d6e6f5b997a4bed0a01f3ed",
+  "diff": {
+    "before_length": 79448,
+    "after_length": 79448,
+    "delta": 0,
+    "common_prefix": 79448,
+    "common_suffix": 0,
+    "before_fingerprint": "8cce4aaf",
+    "after_fingerprint": "8cce4aaf"
+  },
+  "applied": [
+    {
+      "label": "op_0",
+      "type": "insert_before",
+      "changed": true
+    }
+  ],
+  "verification": {
+    "ok": true,
+    "results": [],
+    "failed": []
+  },
+  "timestamp": "2026-07-30T13:01:41.402Z"
+}
