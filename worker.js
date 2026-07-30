@@ -1755,6 +1755,7 @@ function authErrorPayload(env) {
 const OAUTH_ACCESS_TOKEN_TTL_S = 900;                  // 15 minutes
 const OAUTH_REFRESH_TOKEN_TTL_S = 60 * 60 * 24 * 30;   // 30 days
 const OAUTH_AUTH_CODE_TTL_S = 120;                     // 2 minutes
+const OAUTH_AUTHZ_SESSION_TTL_S = 600;                 // 10 minutes; the wallet-choice session's own TTL (V1.4.6). Outlives the 120s code so token exchange can always resolve it.
 const OAUTH_LOGIN_LOCKOUT_THRESHOLD = 5;
 const OAUTH_LOGIN_LOCKOUT_SECONDS = 15 * 60;
 
@@ -2361,6 +2362,23 @@ async function handleAuthorizePost(req, env, origin) {
      VALUES (?,?,?,?,?,?,?,?,0,?,?)`,
     [codeHash, v.client.client_id, subjectRow.subject, params.redirect_uri, grantedScopes.join(' '), v.resource,
       params.code_challenge, params.code_challenge_method, expiresAt, nowIso()]);
+  // V1.4.6 Phase 1: server-owned authorization session, keyed to this auth code.
+  // Carries the operator's (future) wallet + budget choice across authorize->token so
+  // it is never re-derived from a client parameter at the token step. Phase 1 stores
+  // no wallet yet (selected_wallet_id stays NULL; wallet is still assigned via the
+  // admin path); this phase only proves the row is created, threaded, atomically
+  // consumed once, and expires. Best-effort: a failure here must not break the code
+  // issuance that already succeeded above.
+  try {
+    const sessionTs = nowIso();
+    const sessionExpiresAt = new Date(nowMs + OAUTH_AUTHZ_SESSION_TTL_S * 1000).toISOString();
+    await dbRun(env, `INSERT INTO oauth_authorization_sessions
+        (authorization_session_id, oauth_client_id, oauth_subject, scopes, state, code_challenge, code_challenge_method, redirect_uri, resource, auth_code, status, expires_at, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,'authorized',?,?,?)`,
+      [uid('azs'), v.client.client_id, subjectRow.subject, JSON.stringify(grantedScopes), params.state || null,
+        params.code_challenge, params.code_challenge_method, params.redirect_uri, v.resource || null, codeHash,
+        sessionExpiresAt, sessionTs, sessionTs]);
+  } catch (e) { /* authorization-session write is additive; never blocks the OAuth code */ }
   await oauthAudit(env, 'login_ok', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'code_issued scope=' + grantedScopes.join(' ') });
   await traceFromRequest(env, req, { event_type: 'login_ok', client_id: v.client.client_id, resource: v.resource || null, http_status: 302, latency_ms: Date.now() - azT0, authorization_code_hash: codeHash, outcome: 'ok', metadata: { scope: grantedScopes.join(' '), admin_granted: grantAdmin } });
 
@@ -2457,6 +2475,15 @@ async function handleTokenEndpoint(req, env) {
       await traceFromRequest(env, req, { event_type: 'pkce_failure', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 400, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'pkce_failure', error: 'invalid_grant' });
       return j({ error: 'invalid_grant', error_description: 'code_verifier does not match code_challenge' }, 400);
     }
+    // V1.4.6 Phase 1: atomically consume the authorization session tied to this code,
+    // exactly once, mirroring the auth-code one-time claim above. Additive and
+    // backward-compatible: codes minted before this feature have no session row, so a
+    // 0-row result is normal and must NOT block token issuance. When a wallet is later
+    // carried (Phase 2+), the atomic UPDATE ... WHERE consumed = 0 is what guarantees a
+    // replayed token exchange cannot drive a second Agent Context write.
+    try {
+      await dbRun(env, `UPDATE oauth_authorization_sessions SET consumed = 1, consumed_at = ?, status = 'consumed', updated_at = ? WHERE auth_code = ? AND consumed = 0`, [nowIso(), nowIso(), codeHash]);
+    } catch (e) { /* session consume is best-effort in Phase 1; no wallet state depends on it yet */ }
     const scopes = codeRow.scope.split(/\s+/).filter(Boolean);
     const wantsRefresh = scopes.includes('offline_access');
     const tokens = await issueTokenPair(env, { clientId, subject: codeRow.subject, scope: codeRow.scope, resource: codeRow.resource, includeRefresh: wantsRefresh, familyId: null });
