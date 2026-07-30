@@ -275,7 +275,18 @@ async function adminAssignAgentWallet(env, a, authContext) {
   return { ...assigned, credential_type: attached.credential_type, credential_fingerprint: fingerprint, token: rawToken, one_time_reveal: true };
 }
 
+// DEPRECATED 2026-07-29 (Option A: unregister + stub). This tool derived agent identity
+// from the CALLER's OAuth subject digest, so with Claude+ChatGPT sharing one OAuth subject it
+// could not create distinct agents and twice hijacked an existing wallet. Onboarding now goes
+// through admin_assign_agent_wallet (explicit agent_id). Unregistered from tools/list and the
+// dispatch case returns a 'deprecated' error; this body is retained ONLY as a blueprint for a
+// future per-OAuth-subject self-provision (when distinct subjects exist, this becomes
+// admin_assign_agent_wallet's logic + one line deriving agent_id from the caller's subject).
 async function provisionAgentContextSelf(env, a, authContext) {
+  return agentContextError('deprecated', 'provision_agent_context_self is deprecated; use admin_assign_agent_wallet for onboarding');
+}
+/* DEPRECATED-BLUEPRINT (original body, unreachable):
+async function provisionAgentContextSelf_ORIGINAL(env, a, authContext) {
   if (!authContext || !authContext.ok || authContext.mode !== 'oauth' || !(authContext.scope || []).includes(OAUTH_ADMIN_SCOPE)) {
     return agentContextError('permission_denied', 'OAuth mcp:admin authentication is required');
   }
@@ -328,6 +339,7 @@ async function provisionAgentContextSelf(env, a, authContext) {
   await writeAgentContextAudit(env, { credential: evidence, agent: { agent_id: agentId }, wallet: { wallet_address: walletAddress }, capability: 'provision_agent_context_self', network, asset }, 'allowed', null, { detail: 'agent context provisioned idempotently' });
   return result;
 }
+*/
 
 function permissionMatches(row, capability, network, asset) {
   if (row.capability !== capability && row.capability !== '*') return false;
@@ -1596,7 +1608,6 @@ const toolSchemas = [
   { name: 'circle_gasless_transfer', description: "Gasless USDC transfer: a Circle wallet SIGNS an EIP-3009 TransferWithAuthorization (via Circle's sign/typedData) but never submits a transaction itself, so it never needs native gas -- an x402 facilitator (default: the same one evaluate_request/settle_payment use) submits it and pays gas. This is the correct way to move funds from an agent's Circle wallet; circle_transfer (direct on-chain send) requires the wallet to hold native gas and should be avoided for agent wallets. amount is a decimal USDC string (e.g. \"0.01\"). Optional valid_for_seconds (default 300, 30-3600) bounds how long the signed authorization remains valid before the facilitator must have submitted it.",
     inputSchema: obj({ wallet_id: str, destination_address: str, amount: str, blockchain: str, token_address: str, facilitator_url: str, caller_id: str, resource: str, valid_for_seconds: num }, ['wallet_id', 'destination_address', 'amount']) },
 
-  { name: 'provision_agent_context_self', description: 'Admin-only: provision the currently authenticated OAuth identity into one Agent Context using only a SHA-256 subject digest. Never returns or stores the raw OAuth subject or bearer token.', inputSchema: obj({ agent_id: str, display_name: str, wallet_id: str, network: str, asset: str, budget_atomic: str, transfer_max_atomic: str }, ['wallet_id', 'budget_atomic']) },
   { name: 'admin_assign_agent_wallet', description: 'Admin-only: assign a Circle wallet, budget, permissions, and a server-generated one-time bearer credential to an explicit agent_id.', inputSchema: obj({ agent_id: str, display_name: str, wallet_id: str, network: str, asset: str, budget_atomic: str, transfer_max_atomic: str }, ['agent_id', 'wallet_id', 'budget_atomic']) },
 
   { name: 'oauth_trace_list', description: 'OAuth Flight Recorder: list recorded OAuth trace events, folded into distinct traces. Filter by trace_id, client_id, event_type, grant_type, outcome, resource, error, http_status, and a date_from/date_to (ISO) window. No secrets are ever returned -- only hashes and non-secret metadata.',
@@ -1616,7 +1627,7 @@ async function callTool(env, name, args, authContext) {
   switch (name) {
     case 'subagent_status': return status(env);
     case 'resolve_agent_context': return resolveAgentContextTool(env, a, authContext);
-    case 'provision_agent_context_self': return provisionAgentContextSelf(env, a, authContext);
+    case 'provision_agent_context_self': return agentContextError('deprecated', 'provision_agent_context_self is deprecated; use admin_assign_agent_wallet for onboarding');
     case 'admin_assign_agent_wallet': return adminAssignAgentWallet(env, a, authContext);
     case 'create_payment_rule': return createPaymentRule(env, a);
     case 'list_payment_rules': return listPaymentRules(env, a);
