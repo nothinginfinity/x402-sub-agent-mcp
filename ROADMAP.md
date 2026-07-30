@@ -1105,15 +1105,26 @@ binding. Testnet / BASE-SEPOLIA only, per the standing rule.
 These are the phases that would follow, each live-verified before the
 next — same discipline as V1.4.5's staged rollout:
 
-- [ ] **Phase 0 — schema + design freeze.** `authorization_session`
-      table migration written (D1), threat-model notes, and the exact
-      curl/flow tests for each check above written down and shown to
-      Jared. No worker code yet.
-- [ ] **Phase 1 — session plumbing (no UI money decisions live).**
-      Create/consume the authorization session across authorize→token;
-      carry `selected_wallet_id` server-side; verify it survives the
-      round-trip and expires correctly. Wallet still assigned via the
-      existing admin path in this phase.
+- [x] **Phase 0 — schema + design freeze.** ✅ 2026-07-30. `oauth_authorization_sessions`
+      migration `0011` applied to live D1 (`9db1fe16…`) and independently
+      verified (24 cols, both one-time gates default 0, 3 indexes); committed
+      as `migrations/0011_oauth_wallet_authorization_session.sql`. Threat-model
+      notes + full test checklist frozen in the Phase 0 test plan. No worker
+      code in this phase.
+- [x] **Phase 1 — session plumbing (no UI money decisions live).** ✅ 2026-07-30,
+      live-verified (worker.js `e3caa276`, deployed). Session row created at
+      `/authorize` (keyed by `auth_code`, `selected_wallet_id` NULL), and
+      atomically consumed at `/token` via `UPDATE … WHERE consumed = 0`.
+      Real ChatGPT-style PKCE round-trip against live D1: (1) row created
+      `consumed=0`; (2) flipped to `consumed=1`/`status=consumed` on token
+      exchange; (3) replayed exchange → `invalid_grant` with ZERO further
+      writes (`consumed_at` byte-identical). Additive + backward-compatible:
+      pre-feature codes have no session row, so a 0-row consume never blocks
+      token issuance; existing Claude/ChatGPT OAuth behaves identically.
+      Wallet still assigned via the admin path this phase. NOTE: session
+      `expires_at` is populated + indexed but NOT yet enforced at consume —
+      the auth code's own 120s TTL guards staleness today; session-expiry
+      enforcement moves to Phase 2 when the row carries wallet state worth gating.
 - [ ] **Phase 2 — consent-page wallet selection (standard).** Load
       operator-owned wallets, render the dropdown with friendly names,
       store the choice on the session, validate ownership server-side.
