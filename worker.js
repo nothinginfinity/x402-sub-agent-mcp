@@ -2214,6 +2214,59 @@ async function registerOauthClient(env, body) {
   return out;
 }
 
+// ---- V1.4.6 Phase 2: workspace wallet inventory + ownership check ----
+// Loads the authenticated operator's WORKSPACE INVENTORY for the consent-page
+// dropdown. D1 is authoritative for allocation. We surface only wallets in an
+// active workspace owned by this subject that are assignable (available, or
+// already assigned). display_name is the label; circle_wallet_id is the value
+// stored on the session. Returns { workspace_id, wallets } or nulls when the
+// operator owns no active workspace (dropdown then renders empty and POST fails
+// the ownership check cleanly).
+async function loadWorkspaceInventory(env, subject) {
+  const ws = await dbFirst(env, `SELECT workspace_id, environment FROM workspaces WHERE owner_subject = ? AND status = 'active' ORDER BY created_at ASC`, [subject]);
+  if (!ws) return { workspace_id: null, environment: null, wallets: [] };
+  const wallets = await dbAll(env, `SELECT circle_wallet_id, display_name, network, allocation_status FROM workspace_wallets WHERE workspace_id = ? AND allocation_status IN ('available','assigned') ORDER BY display_name ASC, circle_wallet_id ASC`, [ws.workspace_id]);
+  return { workspace_id: ws.workspace_id, environment: ws.environment, wallets };
+}
+
+// environment -> allowed on-chain networks. Enforced in server code (never a
+// column CHECK), per the 0012 schema decision. testnet -> base-sepolia only.
+const ENVIRONMENT_NETWORKS = { testnet: ['base-sepolia'], mainnet: ['base'] };
+
+// The consent-page ownership gate. Order is load-bearing: D1 first (cheap,
+// authoritative for allocation), Circle last (authoritative for existence +
+// address). ownership_validated may be set to 1 ONLY when this returns ok:true.
+async function checkWalletOwnership(env, subject, selectedWalletId) {
+  const walletId = clean(selectedWalletId);
+  if (!walletId) return { ok: false, reason: 'no_wallet_selected' };
+  // (1) subject -> owned active workspace(s)
+  const ws = await dbFirst(env, `SELECT workspace_id, environment FROM workspaces WHERE owner_subject = ? AND status = 'active' ORDER BY created_at ASC`, [subject]);
+  if (!ws) return { ok: false, reason: 'no_workspace' };
+  // (2) wallet in that workspace AND assignable -- D1 authoritative
+  const row = await dbFirst(env, `SELECT circle_wallet_id, wallet_address, network, allocation_status FROM workspace_wallets WHERE workspace_id = ? AND circle_wallet_id = ?`, [ws.workspace_id, walletId]);
+  if (!row) return { ok: false, reason: 'wallet_not_in_workspace' };
+  if (row.allocation_status !== 'available' && row.allocation_status !== 'assigned') {
+    return { ok: false, reason: 'wallet_not_assignable' };
+  }
+  // env -> network mapping enforced here
+  const allowedNetworks = ENVIRONMENT_NETWORKS[ws.environment] || [];
+  if (!allowedNetworks.includes(clean(row.network).toLowerCase())) {
+    return { ok: false, reason: 'network_not_allowed_for_environment' };
+  }
+  // (3) Circle-verify existence + address match -- Circle authoritative
+  let circleWallet;
+  try {
+    circleWallet = await circleGetWallet(env, walletId);
+  } catch (e) {
+    return { ok: false, reason: 'circle_wallet_unresolved' };
+  }
+  if (clean(circleWallet.address).toLowerCase() !== clean(row.wallet_address).toLowerCase()) {
+    return { ok: false, reason: 'circle_address_mismatch' };
+  }
+  // (4) all passed
+  return { ok: true, workspace_id: ws.workspace_id, selected_wallet_id: walletId, network: clean(row.network).toLowerCase() };
+}
+
 // ---- /authorize request validation ----
 function loadOauthRequestParams(url) {
   const p = url.searchParams;
@@ -2285,9 +2338,19 @@ function oauthAuthorizeErrorResponse(v, params) {
   return htmlResponse('<h1>Authorization error</h1><p>' + escapeHtml(v.error) + ': ' + escapeHtml(v.error_description) + '</p>', 400);
 }
 
-function renderLoginForm(params, client, errorMsg) {
+function renderLoginForm(params, client, errorMsg, inventory) {
   const hidden = ['response_type', 'client_id', 'redirect_uri', 'scope', 'state', 'code_challenge', 'code_challenge_method', 'resource']
     .map(k => '<input type="hidden" name="' + k + '" value="' + escapeHtml(params[k] || '') + '">').join('\n    ');
+  // V1.4.6 Phase 2: workspace wallet dropdown. Label = display_name, stored
+  // value = circle_wallet_id. Empty inventory renders a disabled hint; the POST
+  // ownership check then rejects with no_wallet_selected / no_workspace.
+  const wallets = (inventory && inventory.wallets) || [];
+  const walletOptions = wallets.length
+    ? wallets.map(w => '<option value="' + escapeHtml(w.circle_wallet_id) + '">' + escapeHtml(w.display_name || w.circle_wallet_id) + '</option>').join('\n      ')
+    : '';
+  const walletField = wallets.length
+    ? '<label class="scope">Assign wallet<select name="selected_wallet_id" required style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;">\n      ' + walletOptions + '\n    </select></label>'
+    : '<p class="err">No wallets available in your workspace to assign.</p>';
   return `<!doctype html><html><head><meta charset="utf-8"><title>x402-sub-agent-mcp authorization</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
@@ -2303,6 +2366,7 @@ function renderLoginForm(params, client, errorMsg) {
   ${errorMsg ? '<p class="err">' + escapeHtml(errorMsg) + '</p>' : ''}
   <form method="POST" action="/authorize">
     ${hidden}
+    ${walletField}
     <input type="password" name="password" placeholder="Password" autofocus required>
     <label class="admin"><input type="checkbox" name="grant_admin" value="1"> Also grant full admin access (mcp:admin — every tool, static-token equivalence)</label>
     <button type="submit">Authorize</button>
@@ -2349,6 +2413,19 @@ async function handleAuthorizePost(req, env, origin) {
   }
   await dbRun(env, 'UPDATE oauth_subjects SET failed_attempts = 0, locked_until = NULL WHERE subject = ?', [subjectRow.subject]);
 
+  // V1.4.6 Phase 2: workspace wallet selection + ownership gate. Runs AFTER
+  // password success, BEFORE any code is issued. On failure we re-render the
+  // consent page (inventory reloaded) with an error and issue no code. D1 is
+  // authoritative for allocation; Circle for existence/address; env->network is
+  // enforced inside checkWalletOwnership.
+  const selectedWalletId = clean(form.get('selected_wallet_id'));
+  const ownership = await checkWalletOwnership(env, subjectRow.subject, selectedWalletId);
+  if (!ownership.ok) {
+    const failInventory = await loadWorkspaceInventory(env, subjectRow.subject);
+    await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 400, latency_ms: Date.now() - azT0, outcome: 'denied', error: 'wallet_ownership', metadata: { reason: ownership.reason } });
+    return htmlResponse(renderLoginForm(params, v.client, 'Wallet selection could not be validated (' + ownership.reason + ').', failInventory), 400);
+  }
+
   // The admin grant comes ONLY from this human-submitted checkbox -- it is
   // never accepted from the client's requested scope string.
   const grantAdmin = String(form.get('grant_admin') || '') === '1';
@@ -2373,9 +2450,10 @@ async function handleAuthorizePost(req, env, origin) {
     const sessionTs = nowIso();
     const sessionExpiresAt = new Date(nowMs + OAUTH_AUTHZ_SESSION_TTL_S * 1000).toISOString();
     await dbRun(env, `INSERT INTO oauth_authorization_sessions
-        (authorization_session_id, oauth_client_id, oauth_subject, scopes, state, code_challenge, code_challenge_method, redirect_uri, resource, auth_code, status, expires_at, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,'authorized',?,?,?)`,
-      [uid('azs'), v.client.client_id, subjectRow.subject, JSON.stringify(grantedScopes), params.state || null,
+        (authorization_session_id, oauth_client_id, oauth_subject, workspace_id, selected_wallet_id, allowed_network, ownership_validated, scopes, state, code_challenge, code_challenge_method, redirect_uri, resource, auth_code, status, expires_at, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,'authorized',?,?,?)`,
+      [uid('azs'), v.client.client_id, subjectRow.subject, ownership.workspace_id, ownership.selected_wallet_id, ownership.network,
+        JSON.stringify(grantedScopes), params.state || null,
         params.code_challenge, params.code_challenge_method, params.redirect_uri, v.resource || null, codeHash,
         sessionExpiresAt, sessionTs, sessionTs]);
   } catch (e) { /* authorization-session write is additive; never blocks the OAuth code */ }
@@ -2475,15 +2553,32 @@ async function handleTokenEndpoint(req, env) {
       await traceFromRequest(env, req, { event_type: 'pkce_failure', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 400, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'pkce_failure', error: 'invalid_grant' });
       return j({ error: 'invalid_grant', error_description: 'code_verifier does not match code_challenge' }, 400);
     }
-    // V1.4.6 Phase 1: atomically consume the authorization session tied to this code,
-    // exactly once, mirroring the auth-code one-time claim above. Additive and
-    // backward-compatible: codes minted before this feature have no session row, so a
-    // 0-row result is normal and must NOT block token issuance. When a wallet is later
-    // carried (Phase 2+), the atomic UPDATE ... WHERE consumed = 0 is what guarantees a
-    // replayed token exchange cannot drive a second Agent Context write.
+    // V1.4.6 Phase 2: consume the authorization session tied to this code, and
+    // GATE token issuance on it -- without colliding with legacy codes.
+    // Resolution (no-collision): look up the session row FIRST.
+    //   * No row (codes minted before sessions existed) -> legacy path, allow.
+    //   * Row exists but ownership_validated != 1, OR expired (its own TTL) ->
+    //     REFUSE: the wallet choice was never validated, so no token is issued
+    //     and no Agent Context write can follow.
+    //   * Row valid -> atomically claim it (UPDATE ... WHERE consumed = 0),
+    //     exactly once, mirroring the auth-code claim. A replayed exchange that
+    //     somehow got here finds consumed = 1 and 0 rows change (idempotent).
+    const nowMsTk = Date.now();
+    let sessionRow = null;
     try {
-      await dbRun(env, `UPDATE oauth_authorization_sessions SET consumed = 1, consumed_at = ?, status = 'consumed', updated_at = ? WHERE auth_code = ? AND consumed = 0`, [nowIso(), nowIso(), codeHash]);
-    } catch (e) { /* session consume is best-effort in Phase 1; no wallet state depends on it yet */ }
+      sessionRow = await dbFirst(env, 'SELECT * FROM oauth_authorization_sessions WHERE auth_code = ?', [codeHash]);
+    } catch (e) { sessionRow = null; }
+    if (sessionRow) {
+      const sessionExpired = sessionRow.expires_at && new Date(sessionRow.expires_at).getTime() < nowMsTk;
+      if (Number(sessionRow.ownership_validated) !== 1 || sessionExpired) {
+        await oauthAudit(env, 'authorization_session_refused', { client_id: clientId, detail: sessionExpired ? 'session expired' : 'ownership_validated=0' });
+        await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 400, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: sessionExpired ? 'expired' : 'error', error: 'invalid_grant', metadata: { reason: sessionExpired ? 'session_expired' : 'ownership_not_validated' } });
+        return j({ error: 'invalid_grant', error_description: 'authorization session was not validated or has expired' }, 400);
+      }
+      try {
+        await dbRun(env, `UPDATE oauth_authorization_sessions SET consumed = 1, consumed_at = ?, status = 'consumed', updated_at = ? WHERE auth_code = ? AND consumed = 0`, [nowIso(), nowIso(), codeHash]);
+      } catch (e) { /* claim best-effort; the auth-code one-time claim above already guaranteed single redemption */ }
+    }
     const scopes = codeRow.scope.split(/\s+/).filter(Boolean);
     const wantsRefresh = scopes.includes('offline_access');
     const tokens = await issueTokenPair(env, { clientId, subject: codeRow.subject, scope: codeRow.scope, resource: codeRow.resource, includeRefresh: wantsRefresh, familyId: null });
@@ -2734,7 +2829,10 @@ export default {
           return oauthAuthorizeErrorResponse(v, params);
         }
         await traceFromRequest(env, req, { event_type: 'authorize_view', client_id: v.client.client_id, resource: v.resource || null, http_status: 200, latency_ms: Date.now() - t0, outcome: 'ok', metadata: { scope: (v.scopes || []).join(' ') } });
-        return htmlResponse(renderLoginForm(params, v.client, null));
+        // V1.4.6 Phase 2: load the operator's workspace inventory for the wallet dropdown.
+        const getInvSubject = await getOrCreateSubject(env);
+        const getInventory = await loadWorkspaceInventory(env, getInvSubject.subject);
+        return htmlResponse(renderLoginForm(params, v.client, null, getInventory));
       }
       if (url.pathname === '/authorize' && req.method === 'POST') {
         return handleAuthorizePost(req, env, url.origin);
