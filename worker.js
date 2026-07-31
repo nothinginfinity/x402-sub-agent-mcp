@@ -2401,7 +2401,8 @@ async function handleAuthorizePost(req, env, origin) {
   const azT0 = Date.now();
   if (subjectRow.locked_until && new Date(subjectRow.locked_until).getTime() > nowMs) {
     await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 429, latency_ms: Date.now() - azT0, outcome: 'denied', error: 'locked', metadata: { reason: 'lockout' } });
-    return htmlResponse(renderLoginForm(params, v.client, 'Too many failed attempts. Try again later.'), 429);
+    const lockInventory = await loadWorkspaceInventory(env, subjectRow.subject);
+    return htmlResponse(renderLoginForm(params, v.client, 'Too many failed attempts. Try again later.', lockInventory), 429);
   }
   if (!timingSafeEqual(password, env.OAUTH_LOGIN_PASSWORD)) {
     const attempts = (subjectRow.failed_attempts || 0) + 1;
@@ -2409,7 +2410,8 @@ async function handleAuthorizePost(req, env, origin) {
     await dbRun(env, 'UPDATE oauth_subjects SET failed_attempts = ?, locked_until = ? WHERE subject = ?', [attempts, lockedUntil, subjectRow.subject]);
     await oauthAudit(env, 'login_fail', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'attempt ' + attempts });
     await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 401, latency_ms: Date.now() - azT0, outcome: 'error', error: 'invalid_credentials', metadata: { attempt: attempts, locked: !!lockedUntil } });
-    return htmlResponse(renderLoginForm(params, v.client, 'Incorrect password.'), 401);
+    const failPwInventory = await loadWorkspaceInventory(env, subjectRow.subject);
+    return htmlResponse(renderLoginForm(params, v.client, 'Incorrect password.', failPwInventory), 401);
   }
   await dbRun(env, 'UPDATE oauth_subjects SET failed_attempts = 0, locked_until = NULL WHERE subject = ?', [subjectRow.subject]);
 
@@ -2553,13 +2555,21 @@ async function handleTokenEndpoint(req, env) {
       await traceFromRequest(env, req, { event_type: 'pkce_failure', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 400, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'pkce_failure', error: 'invalid_grant' });
       return j({ error: 'invalid_grant', error_description: 'code_verifier does not match code_challenge' }, 400);
     }
-    // V1.4.6 Phase 2: consume the authorization session tied to this code, and
-    // GATE token issuance on it -- without colliding with legacy codes.
-    // Resolution (no-collision): look up the session row FIRST.
-    //   * No row (codes minted before sessions existed) -> legacy path, allow.
+    // V1.4.6 Phase 2 (Option B, fail-closed): consume the authorization session
+    // tied to this code, and GATE token issuance on it. The session row is the
+    // wallet-ownership gate, so a valid code that has NO session row must be
+    // refused, not allowed. Rationale: the deployed /authorize path ALWAYS
+    // writes a session row (ownership_validated=1) alongside the auth code, and
+    // auth codes have a ~120s TTL, so no genuine pre-sessions ("legacy") code
+    // can still be alive at redemption. Therefore a missing row on a live code
+    // means the gate write failed -> refuse, so a token is never issued without
+    // a validated wallet binding behind it. (Before Option B this fell through
+    // to token issuance, which could mint an unbound token on a swallowed
+    // session-write failure.)
+    // Resolution:
+    //   * No row -> REFUSE (no_authorization_session): gate write missing.
     //   * Row exists but ownership_validated != 1, OR expired (its own TTL) ->
-    //     REFUSE: the wallet choice was never validated, so no token is issued
-    //     and no Agent Context write can follow.
+    //     REFUSE: the wallet choice was never validated.
     //   * Row valid -> atomically claim it (UPDATE ... WHERE consumed = 0),
     //     exactly once, mirroring the auth-code claim. A replayed exchange that
     //     somehow got here finds consumed = 1 and 0 rows change (idempotent).
@@ -2568,7 +2578,12 @@ async function handleTokenEndpoint(req, env) {
     try {
       sessionRow = await dbFirst(env, 'SELECT * FROM oauth_authorization_sessions WHERE auth_code = ?', [codeHash]);
     } catch (e) { sessionRow = null; }
-    if (sessionRow) {
+    if (!sessionRow) {
+      await oauthAudit(env, 'authorization_session_refused', { client_id: clientId, detail: 'no authorization session row for live auth code (gate write missing)' });
+      await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 400, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'error', error: 'invalid_grant', metadata: { reason: 'no_authorization_session' } });
+      return j({ error: 'invalid_grant', error_description: 'authorization session was not validated or has expired' }, 400);
+    }
+    {
       const sessionExpired = sessionRow.expires_at && new Date(sessionRow.expires_at).getTime() < nowMsTk;
       if (Number(sessionRow.ownership_validated) !== 1 || sessionExpired) {
         await oauthAudit(env, 'authorization_session_refused', { client_id: clientId, detail: sessionExpired ? 'session expired' : 'ownership_validated=0' });
