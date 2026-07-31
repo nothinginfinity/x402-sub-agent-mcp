@@ -1125,9 +1125,27 @@ next — same discipline as V1.4.5's staged rollout:
       `expires_at` is populated + indexed but NOT yet enforced at consume —
       the auth code's own 120s TTL guards staleness today; session-expiry
       enforcement moves to Phase 2 when the row carries wallet state worth gating.
-- [ ] **Phase 2 — consent-page wallet selection (standard).** Load
-      operator-owned wallets, render the dropdown with friendly names,
-      store the choice on the session, validate ownership server-side.
+- [x] **Phase 2 — consent-page wallet selection (standard).** ✅ Shipped
+      (commit c7e819bb, deployed run 30603818288) and live-verified this
+      session. Load operator-owned wallets, render the dropdown with friendly
+      names, store the choice on the session, validate ownership server-side.
+      GET `/authorize` loads the workspace inventory (not the raw Circle list);
+      dropdown label = `display_name`, stored value = `circle_wallet_id`. POST
+      runs `checkWalletOwnership` AFTER password success, BEFORE code issuance:
+      (1) subject → owned active workspace; (2) wallet ∈ `workspace_wallets`
+      AND assignable — D1 authoritative; env→network (testnet→base-sepolia)
+      enforced in `ENVIRONMENT_NETWORKS`; (3) Circle-verify existence + address
+      match — Circle authoritative; (4) only then `ownership_validated=1`. The
+      `/token` consume REFUSES when `ownership_validated≠1` OR the session's own
+      `expires_at` has passed (closes the Phase 1 session-expiry deferral),
+      while legacy codes with no session row still pass. Live verification
+      (AFO-manual-admin-cli, real browser login): wallet select → session row
+      `ownership_validated=1` with correct wallet/workspace/network → `/token`
+      200 Bearer+refresh → session `consumed=1`; replay → `invalid_grant`;
+      injected `ownership_validated=0` session → `/token` 400 `invalid_grant`;
+      injected expired session → `/token` 400 `invalid_grant`; both refusals
+      left `consumed=0`. Test client re-disabled, fixtures deleted, test tokens
+      revoked. Wallet still assigned via the admin path until Phase 3.
 - [ ] **Phase 3 — budget configuration on the page.** Lifetime,
       per-transfer max, asset, network, optional expiry → initial
       Agent Context budget, atomically written at token exchange.
