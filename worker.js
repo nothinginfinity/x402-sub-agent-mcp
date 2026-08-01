@@ -91,6 +91,134 @@ function toAtomic(usd, decimals) {
   return BigInt(Math.round(n * Math.pow(10, d))).toString();
 }
 
+// ---- strict USDC decimal -> atomic (Phase 3; money-safe, integer math only) ----
+// The legacy toAtomic() above uses Number()/Math.round and is fine for server-set
+// prices, but the budget comes from a human text field so it is parsed strictly
+// with integer math (no float). Accepts "5", "5.0", "0.50", up to 6 dp. Rejects
+// empty, signs, exponents, >6 dp, zero, and non-numeric. Returns a decimal atomic
+// STRING; throws on invalid so callers can re-render consent with an error.
+function parseUsdcToAtomicStrict(input) {
+  const s = clean(input);
+  if (!/^\d+(\.\d{1,6})?$/.test(s)) throw new Error('budget must be a decimal USDC amount with up to 6 decimal places');
+  const [whole, frac = ''] = s.split('.');
+  const fracPadded = (frac + '000000').slice(0, 6);
+  const atomic = BigInt(whole) * 1000000n + BigInt(fracPadded || '0');
+  if (atomic <= 0n) throw new Error('budget must be greater than zero');
+  return atomic.toString();
+}
+
+// ---- Phase 3 budget constants (testnet pilot; named + server-side) ----
+// Lifetime budget = cumulative authority (total exposure). Per-transfer cap =
+// instantaneous authority (max single circle_gasless_transfer). Atomic strings.
+const BUDGET_DEFAULT_LIFETIME_ATOMIC = '5000000';   // 5.00 USDC default lifetime
+const BUDGET_MAX_LIFETIME_ATOMIC     = '50000000';  // 50.00 USDC hard ceiling
+const BUDGET_DEFAULT_TRANSFER_ATOMIC = '500000';    // 0.50 USDC default per-transfer
+// Per-transfer authority is DERIVED (min(default, lifetime)), never a second
+// consent input, and never raised implicitly on re-consent.
+
+// ---- trusted client-family identity (Phase 3) ----
+// Family derives from the REGISTERED redirect_uri host (exact-matched and
+// delivered-to during the OAuth flow), NEVER the self-reported client_name.
+// Keyed on registrable domain: host === domain OR host endsWith "." + domain,
+// so vendor subdomains (Perplexity's www./enterprise./staging.) resolve while
+// lookalikes (evilperplexity.com, perplexity.com.evil.com) do NOT. Unknown or
+// mixed hosts -> null -> client is isolated per client_id and cannot collide
+// with a trusted family bucket.
+const CLIENT_FAMILY_BY_DOMAIN = {
+  'claude.ai':      'claude',
+  'chatgpt.com':    'chatgpt',
+  'perplexity.ai':  'perplexity',
+  'perplexity.com': 'perplexity',
+};
+function familyForHost(host) {
+  const h = String(host || '').toLowerCase();
+  for (const dom in CLIENT_FAMILY_BY_DOMAIN) {
+    if (h === dom || h.endsWith('.' + dom)) return CLIENT_FAMILY_BY_DOMAIN[dom];
+  }
+  return null;
+}
+function clientRedirectHosts(client) {
+  let uris = [];
+  try { uris = JSON.parse((client && client.redirect_uris) || '[]'); } catch (_) { uris = []; }
+  const hosts = [];
+  for (const u of uris) { try { hosts.push(new URL(u).host.toLowerCase()); } catch (_) {} }
+  return hosts;
+}
+// Unanimous, known, non-null family only. One foreign/unknown host -> null.
+function resolveClientFamily(client) {
+  const hosts = clientRedirectHosts(client);
+  if (!hosts.length) return null;
+  const fams = new Set(hosts.map(familyForHost));
+  if (fams.size !== 1) return null;
+  return [...fams][0] || null;
+}
+// The ONE identity helper used by BOTH the read side (authCredentialEvidence)
+// and the write side (/token binding), so they cannot drift. Discriminator is
+// namespaced ('fam:'/'cid:') so a client_id string can never collide with a
+// family bucket. legacy_key is the pre-Phase-3 subject-only shape, returned
+// only to support dual-read during rollout.
+async function oauthIdentityKeys(subject, client) {
+  const subj = clean(subject);
+  const family = resolveClientFamily(client);
+  const discriminator = family ? ('fam:' + family) : ('cid:' + clean(client && client.client_id));
+  const credential_key = await sha256Hex(subj + ':' + discriminator);
+  const legacy_key = await sha256Hex(subj);
+  return { family, discriminator, credential_key, legacy_key };
+}
+
+// ---- Phase 3: non-escalation budget policy (OAuth re-consent) ----
+// OAuth re-consent may REDUCE authority but never INCREASE it; increases require
+// an admin operation. Given the identity's current active lifetime budget (row
+// or null) and the operator's requested atomic budget, decide what to write:
+//   * no existing binding -> use requested
+//   * requested == current -> idempotent allow
+//   * requested <  current -> allow, but never below spent; clamp per-transfer
+//   * requested >  current -> refuse: budget_escalation_requires_admin
+// Never resets/decreases spent. Never raises per-transfer implicitly.
+function resolveBudgetForBinding(requestedAtomicStr, currentBudget) {
+  const req = BigInt(requestedAtomicStr);
+  const deriveTransfer = (lifetime) => {
+    let t = BigInt(BUDGET_DEFAULT_TRANSFER_ATOMIC);
+    if (t > lifetime) t = lifetime;
+    if (t > BigInt(BUDGET_MAX_LIFETIME_ATOMIC)) t = BigInt(BUDGET_MAX_LIFETIME_ATOMIC);
+    return t.toString();
+  };
+  if (!currentBudget) return { ok: true, budget_atomic: req.toString(), transfer_max_atomic: deriveTransfer(req) };
+  const cur = BigInt(currentBudget.limit_atomic);
+  const spent = BigInt(currentBudget.spent_atomic || '0');
+  if (req === cur) return { ok: true, budget_atomic: cur.toString(), transfer_max_atomic: deriveTransfer(cur) };
+  if (req > cur) return { ok: false, error: 'budget_escalation_requires_admin', detail: 'the requested lifetime budget exceeds the current authorization; an administrator must approve a higher allowance' };
+  if (req < spent) return { ok: false, error: 'budget_below_spent', detail: 'the requested lifetime budget is below the amount already spent on this binding' };
+  return { ok: true, budget_atomic: req.toString(), transfer_max_atomic: deriveTransfer(req) };
+}
+
+// ---- Phase 3: statement builders (compose into ONE db.batch) ----
+// Split out of upsertAgentWallet so its context writes and the credential write
+// compose into a single atomic batch on the OAuth path. NO budget-escalation
+// policy here -- callers enforce that upstream via resolveBudgetForBinding.
+function buildAgentWalletStatements(db, p, ts) {
+  return [
+    db.prepare(`INSERT INTO agents (agent_id, display_name, status, created_at, updated_at) VALUES (?, ?, 'active', ?, ?)
+      ON CONFLICT(agent_id) DO UPDATE SET display_name = excluded.display_name, status = 'active', updated_at = excluded.updated_at`).bind(p.agent_id, p.display_name, ts, ts),
+    db.prepare(`INSERT INTO agent_wallets (id, agent_id, wallet_id, wallet_address, network, asset, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+      ON CONFLICT(wallet_id, network, asset) WHERE status = 'active' DO UPDATE SET wallet_address = excluded.wallet_address, updated_at = excluded.updated_at
+      WHERE agent_wallets.agent_id = excluded.agent_id`).bind(uid('awlt'), p.agent_id, p.wallet_id, p.wallet_address, p.network, p.asset, ts, ts),
+    db.prepare(`INSERT INTO agent_permissions (id, agent_id, capability, effect, network, asset, max_amount_atomic, created_at, updated_at) VALUES (?, ?, 'resolve_agent_context', 'allow', ?, ?, '0', ?, ?)
+      ON CONFLICT(agent_id, capability, effect, COALESCE(network, ''), COALESCE(asset, '')) DO UPDATE SET max_amount_atomic = excluded.max_amount_atomic, updated_at = excluded.updated_at`).bind(uid('aperm'), p.agent_id, p.network, p.asset, ts, ts),
+    db.prepare(`INSERT INTO agent_permissions (id, agent_id, capability, effect, network, asset, max_amount_atomic, created_at, updated_at) VALUES (?, ?, 'circle_gasless_transfer', 'allow', ?, ?, ?, ?, ?)
+      ON CONFLICT(agent_id, capability, effect, COALESCE(network, ''), COALESCE(asset, '')) DO UPDATE SET max_amount_atomic = excluded.max_amount_atomic, updated_at = excluded.updated_at`).bind(uid('aperm'), p.agent_id, p.network, p.asset, p.transfer_max_atomic, ts, ts),
+    db.prepare(`INSERT INTO agent_budgets (id, agent_id, network, asset, period, limit_atomic, spent_atomic, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'lifetime', ?, '0', 'active', ?, ?)
+      ON CONFLICT(agent_id, network, asset, period) WHERE status = 'active' DO UPDATE SET limit_atomic = excluded.limit_atomic, updated_at = excluded.updated_at`).bind(uid('abud'), p.agent_id, p.network, p.asset, p.budget_atomic, ts, ts),
+  ];
+}
+function buildCredentialStatements(db, p, ts) {
+  return [
+    db.prepare(`INSERT INTO agent_credentials (id, agent_id, credential_type, credential_key, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+      ON CONFLICT(credential_type, credential_key) DO UPDATE SET status = 'active', metadata_json = excluded.metadata_json, updated_at = excluded.updated_at
+      WHERE agent_credentials.agent_id = excluded.agent_id`).bind(uid('acred'), p.agent_id, p.credential_type, p.credential_key, p.metadata_json, ts, ts),
+  ];
+}
+
 function assetAddress(network, asset, override) {
   if (override) return override;
   return KNOWN_ASSETS[network + ':' + asset] || null;
@@ -172,11 +300,24 @@ async function writeAgentContextAudit(env, context, outcome, errorCode, fields) 
   } catch (e) { /* audit must not replace the primary result */ }
 }
 
-async function authCredentialEvidence(authContext) {
+async function authCredentialEvidence(authContext, env) {
   if (!authContext || !authContext.ok) return null;
   if (authContext.mode === 'oauth' && authContext.subject) {
+    // Phase 3 dual-read: primary key = sha256(subject:discriminator) where the
+    // discriminator is the trusted client-family (or client_id fallback);
+    // legacy_key = pre-Phase-3 subject-only sha256(subject), still accepted so
+    // bindings written before the family scheme keep resolving during rollout.
+    // env may be absent for very early callers -> degrade to legacy-only (safe).
+    let clientRow = null;
+    if (env && authContext.client_id) {
+      try { clientRow = await dbFirst(env, 'SELECT * FROM oauth_clients WHERE client_id = ?', [authContext.client_id]); } catch (_) { clientRow = null; }
+    }
+    if (env) {
+      const keys = await oauthIdentityKeys(authContext.subject, clientRow || { client_id: authContext.client_id, redirect_uris: '[]' });
+      return { type: 'oauth_subject_sha256', key: keys.credential_key, legacy_key: keys.legacy_key, caller_id: (authContext.driver || 'oauth') + ':' + keys.credential_key.slice(0, 16) };
+    }
     const digest = await sha256Hex(clean(authContext.subject));
-    return { type: 'oauth_subject_sha256', key: digest, caller_id: (authContext.driver || 'oauth') + ':' + digest.slice(0, 16) };
+    return { type: 'oauth_subject_sha256', key: digest, legacy_key: digest, caller_id: (authContext.driver || 'oauth') + ':' + digest.slice(0, 16) };
   }
   if ((authContext.mode === 'static' || authContext.mode === 'agent') && authContext.raw_token) {
     const digest = await sha256Hex(authContext.raw_token);
@@ -355,7 +496,7 @@ async function resolveAgentContext(env, authContext, request) {
   const network = (clean(r.network) || DEFAULT_CIRCLE_BLOCKCHAIN).toLowerCase();
   const asset = (clean(r.asset) || 'USDC').toUpperCase();
   const amountAtomic = clean(r.amount_atomic) || '0';
-  const evidence = await authCredentialEvidence(authContext);
+  const evidence = await authCredentialEvidence(authContext, env);
   if (!evidence) {
     const failure = agentContextError('unknown_agent', 'authenticated credential evidence is unavailable');
     await writeAgentContextAudit(env, { capability, network, asset, amount_atomic: amountAtomic }, 'denied', failure.error_code, { detail: failure.detail });
@@ -363,7 +504,7 @@ async function resolveAgentContext(env, authContext, request) {
   }
 
   const credentials = await dbAll(env, `SELECT * FROM agent_credentials
-    WHERE credential_type = ? AND credential_key = ? AND status = 'active'`, [evidence.type, evidence.key]);
+    WHERE credential_type = ? AND status = 'active' AND credential_key IN (?, ?)`, [evidence.type, evidence.key, evidence.legacy_key || evidence.key]);
   if (!credentials.length) {
     const failure = agentContextError('unknown_agent', 'no active agent credential matches the authenticated identity');
     await writeAgentContextAudit(env, { credential: evidence, capability, network, asset, amount_atomic: amountAtomic }, 'denied', failure.error_code, { detail: failure.detail });
@@ -2351,6 +2492,13 @@ function renderLoginForm(params, client, errorMsg, inventory) {
   const walletField = wallets.length
     ? '<label class="scope">Assign wallet<select name="selected_wallet_id" required style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;">\n      ' + walletOptions + '\n    </select></label>'
     : '<p class="err">No wallets available in your workspace to assign.</p>';
+  // V1.4.6 Phase 3: lifetime budget (cumulative authority). Per-transfer cap is
+  // derived server-side (min 0.50 USDC, lifetime); not a second input here.
+  // Default 5.00, max 50.00 (testnet). Re-consent may lower but never raise the
+  // budget -- an increase requires an admin operation.
+  const budgetField = wallets.length
+    ? '<label class="scope">Lifetime budget (USDC, max 50.00)<input type="text" inputmode="decimal" name="budget_usdc" value="5.00" pattern="\d+(\.\d{1,6})?" required style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;"></label>'
+    : '';
   return `<!doctype html><html><head><meta charset="utf-8"><title>x402-sub-agent-mcp authorization</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
@@ -2367,6 +2515,7 @@ function renderLoginForm(params, client, errorMsg, inventory) {
   <form method="POST" action="/authorize">
     ${hidden}
     ${walletField}
+    ${budgetField}
     <input type="password" name="password" placeholder="Password" autofocus required>
     <label class="admin"><input type="checkbox" name="grant_admin" value="1"> Also grant full admin access (mcp:admin — every tool, static-token equivalence)</label>
     <button type="submit">Authorize</button>
@@ -2428,6 +2577,24 @@ async function handleAuthorizePost(req, env, origin) {
     return htmlResponse(renderLoginForm(params, v.client, 'Wallet selection could not be validated (' + ownership.reason + ').', failInventory), 400);
   }
 
+  // V1.4.6 Phase 3: parse the lifetime budget strictly (integer atomic units,
+  // no floats). Invalid/zero/negative/over-max re-render consent with an error
+  // and issue NO code. The value is carried on the session (budget_atomic) and
+  // the actual Agent Context write happens at /token (fail-closed).
+  let budgetAtomicChosen;
+  try {
+    budgetAtomicChosen = parseUsdcToAtomicStrict(form.get('budget_usdc'));
+  } catch (e) {
+    const failInv = await loadWorkspaceInventory(env, subjectRow.subject);
+    await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 400, latency_ms: Date.now() - azT0, outcome: 'denied', error: 'budget_invalid', metadata: { reason: 'budget_parse' } });
+    return htmlResponse(renderLoginForm(params, v.client, 'Enter a valid budget (a positive USDC amount, up to 6 decimals).', failInv), 400);
+  }
+  if (BigInt(budgetAtomicChosen) > BigInt(BUDGET_MAX_LIFETIME_ATOMIC)) {
+    const failInv = await loadWorkspaceInventory(env, subjectRow.subject);
+    await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 400, latency_ms: Date.now() - azT0, outcome: 'denied', error: 'budget_over_max', metadata: { reason: 'budget_over_max' } });
+    return htmlResponse(renderLoginForm(params, v.client, 'Budget exceeds the maximum allowed (50.00 USDC).', failInv), 400);
+  }
+
   // The admin grant comes ONLY from this human-submitted checkbox -- it is
   // never accepted from the client's requested scope string.
   const grantAdmin = String(form.get('grant_admin') || '') === '1';
@@ -2441,24 +2608,25 @@ async function handleAuthorizePost(req, env, origin) {
      VALUES (?,?,?,?,?,?,?,?,0,?,?)`,
     [codeHash, v.client.client_id, subjectRow.subject, params.redirect_uri, grantedScopes.join(' '), v.resource,
       params.code_challenge, params.code_challenge_method, expiresAt, nowIso()]);
-  // V1.4.6 Phase 1: server-owned authorization session, keyed to this auth code.
-  // Carries the operator's (future) wallet + budget choice across authorize->token so
-  // it is never re-derived from a client parameter at the token step. Phase 1 stores
-  // no wallet yet (selected_wallet_id stays NULL; wallet is still assigned via the
-  // admin path); this phase only proves the row is created, threaded, atomically
-  // consumed once, and expires. Best-effort: a failure here must not break the code
-  // issuance that already succeeded above.
+  // V1.4.6 Phase 2/3: server-owned authorization session, keyed to this auth code.
+  // Carries the operator's validated wallet choice (selected_wallet_id, workspace,
+  // network, ownership_validated=1) AND the Phase 3 lifetime budget (budget_atomic)
+  // across authorize->token, so none of it is re-derived from a client parameter at
+  // the token step. The Agent Context write itself happens at /token (fail-closed).
+  // NOTE: the session row is the ownership GATE consumed at /token; a swallowed
+  // failure here means no row -> /token refuses with no_authorization_session
+  // (fail-closed), so this best-effort catch can no longer mint an unbound token.
   try {
     const sessionTs = nowIso();
     const sessionExpiresAt = new Date(nowMs + OAUTH_AUTHZ_SESSION_TTL_S * 1000).toISOString();
     await dbRun(env, `INSERT INTO oauth_authorization_sessions
-        (authorization_session_id, oauth_client_id, oauth_subject, workspace_id, selected_wallet_id, allowed_network, ownership_validated, scopes, state, code_challenge, code_challenge_method, redirect_uri, resource, auth_code, status, expires_at, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,'authorized',?,?,?)`,
-      [uid('azs'), v.client.client_id, subjectRow.subject, ownership.workspace_id, ownership.selected_wallet_id, ownership.network,
+        (authorization_session_id, oauth_client_id, oauth_subject, workspace_id, selected_wallet_id, budget_atomic, allowed_network, ownership_validated, scopes, state, code_challenge, code_challenge_method, redirect_uri, resource, auth_code, status, expires_at, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,'authorized',?,?,?)`,
+      [uid('azs'), v.client.client_id, subjectRow.subject, ownership.workspace_id, ownership.selected_wallet_id, budgetAtomicChosen, ownership.network,
         JSON.stringify(grantedScopes), params.state || null,
         params.code_challenge, params.code_challenge_method, params.redirect_uri, v.resource || null, codeHash,
         sessionExpiresAt, sessionTs, sessionTs]);
-  } catch (e) { /* authorization-session write is additive; never blocks the OAuth code */ }
+  } catch (e) { /* additive: on failure no row exists -> /token fails closed (no_authorization_session) */ }
   await oauthAudit(env, 'login_ok', { subject: subjectRow.subject, client_id: v.client.client_id, detail: 'code_issued scope=' + grantedScopes.join(' ') });
   await traceFromRequest(env, req, { event_type: 'login_ok', client_id: v.client.client_id, resource: v.resource || null, http_status: 302, latency_ms: Date.now() - azT0, authorization_code_hash: codeHash, outcome: 'ok', metadata: { scope: grantedScopes.join(' '), admin_granted: grantAdmin } });
 
@@ -2593,6 +2761,43 @@ async function handleTokenEndpoint(req, env) {
       try {
         await dbRun(env, `UPDATE oauth_authorization_sessions SET consumed = 1, consumed_at = ?, status = 'consumed', updated_at = ? WHERE auth_code = ? AND consumed = 0`, [nowIso(), nowIso(), codeHash]);
       } catch (e) { /* claim best-effort; the auth-code one-time claim above already guaranteed single redemption */ }
+
+      // V1.4.6 Phase 3 (fail-closed): establish the Agent Context binding from the
+      // session's validated wallet + chosen budget, in ONE atomic batch, BEFORE the
+      // token is issued. Any failure -> server_error and NO token (the code+session
+      // are already claimed, so a retry cannot slip through unbound). Non-escalation
+      // policy: re-consent may lower authority but never raise it (admin required).
+      try {
+        const bindClient = await dbFirst(env, 'SELECT * FROM oauth_clients WHERE client_id = ?', [clientId]);
+        const bindKeys = await oauthIdentityKeys(sessionRow.oauth_subject, bindClient || { client_id: clientId, redirect_uris: '[]' });
+        const existingCred = await dbFirst(env, `SELECT agent_id FROM agent_credentials WHERE credential_type = 'oauth_subject_sha256' AND status = 'active' AND credential_key IN (?, ?) LIMIT 1`, [bindKeys.credential_key, bindKeys.legacy_key]);
+        const bindAgentId = existingCred ? existingCred.agent_id : ('oauth-' + bindKeys.credential_key.slice(0, 24));
+        const bindNetwork = clean(sessionRow.allowed_network) || DEFAULT_CIRCLE_BLOCKCHAIN;
+        const curBudget = await dbFirst(env, `SELECT limit_atomic, spent_atomic FROM agent_budgets WHERE agent_id = ? AND network = ? AND asset = 'USDC' AND period = 'lifetime' AND status = 'active'`, [bindAgentId, bindNetwork]);
+        const requestedBudget = clean(sessionRow.budget_atomic) || BUDGET_DEFAULT_LIFETIME_ATOMIC;
+        const decided = resolveBudgetForBinding(requestedBudget, curBudget);
+        if (!decided.ok) {
+          await oauthAudit(env, 'agent_context_write_refused', { client_id: clientId, detail: decided.error });
+          await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 403, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'denied', error: decided.error, metadata: { reason: decided.error } });
+          return j({ error: decided.error, error_description: decided.detail }, 403);
+        }
+        const bindWalletRecord = await circleGetWallet(env, sessionRow.selected_wallet_id);
+        const bindWalletAddress = assertValidAddress(bindWalletRecord.address, 'wallet address');
+        if (clean(bindWalletRecord.blockchain).toLowerCase() !== bindNetwork) throw new Error('wallet network mismatch at bind time');
+        const bindDb = requireDb(env);
+        const bindTs = nowIso();
+        const bindDisplay = 'oauth-agent-' + (bindKeys.family || bindKeys.discriminator.replace(/[^a-z0-9]+/gi, '').slice(0, 12));
+        const bindStmts = [
+          ...buildAgentWalletStatements(bindDb, { agent_id: bindAgentId, display_name: bindDisplay, wallet_id: sessionRow.selected_wallet_id, wallet_address: bindWalletAddress, network: bindNetwork, asset: 'USDC', budget_atomic: decided.budget_atomic, transfer_max_atomic: decided.transfer_max_atomic }, bindTs),
+          ...buildCredentialStatements(bindDb, { agent_id: bindAgentId, credential_type: 'oauth_subject_sha256', credential_key: bindKeys.credential_key, metadata_json: JSON.stringify({ family: bindKeys.family, client_id: clientId, discriminator: bindKeys.discriminator, source: 'oauth_consent' }) }, bindTs),
+        ];
+        await bindDb.batch(bindStmts);
+        await oauthAudit(env, 'agent_context_bound', { client_id: clientId, detail: 'agent=' + bindAgentId + ' budget=' + decided.budget_atomic + ' transfer_max=' + decided.transfer_max_atomic });
+      } catch (e) {
+        await oauthAudit(env, 'agent_context_write_failed', { client_id: clientId, detail: String(e && e.message || e) });
+        await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 500, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'error', error: 'server_error', metadata: { reason: 'agent_context_write_failed' } });
+        return j({ error: 'server_error', error_description: 'could not establish agent context' }, 500);
+      }
     }
     const scopes = codeRow.scope.split(/\s+/).filter(Boolean);
     const wantsRefresh = scopes.includes('offline_access');
