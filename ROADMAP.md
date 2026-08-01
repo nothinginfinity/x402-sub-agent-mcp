@@ -1146,9 +1146,39 @@ next — same discipline as V1.4.5's staged rollout:
       injected expired session → `/token` 400 `invalid_grant`; both refusals
       left `consumed=0`. Test client re-disabled, fixtures deleted, test tokens
       revoked. Wallet still assigned via the admin path until Phase 3.
-- [ ] **Phase 3 — budget configuration on the page.** Lifetime,
-      per-transfer max, asset, network, optional expiry → initial
-      Agent Context budget, atomically written at token exchange.
+- [x] **Phase 3 — budget configuration on the page.** ✅ Shipped
+      (commits 2bacc98b build + 1521d365/afda66db fixes; deployed run
+      30679062558) and live-verified. Consent page takes a lifetime budget
+      (default 5.00, max 50.00 USDC, testnet); per-transfer cap is DERIVED
+      server-side as min(0.50 USDC, lifetime), never a second input and never
+      raised implicitly. Budget parsed with a strict integer-only decimal
+      parser (no floats). At /token, after the session gate + code claim and
+      BEFORE token issuance, the Agent Context (agents + agent_wallets + 2×
+      agent_permissions + agent_budgets + agent_credentials) is written in ONE
+      atomic db.batch(), FAIL-CLOSED: any write failure returns server_error and
+      issues no token. Identity uses a trusted client-family key: family derives
+      from the REGISTERED redirect-uri host (registrable-domain anchored;
+      claude.ai→claude, chatgpt.com→chatgpt, *.perplexity.ai/.com→perplexity),
+      NEVER the self-reported client_name; unknown/mixed hosts fall back to
+      per-client_id isolation (namespaced fam:/cid: discriminator). Read side
+      dual-reads new + legacy (subject-only) keys so pre-Phase-3 bindings keep
+      resolving; write-side agent selection uses the NEW key only (a legacy
+      match would collide every client sharing an OAuth subject). Non-escalation
+      policy: OAuth re-consent may LOWER authority but never RAISE it — equal =
+      idempotent, lower = allowed (never below spent_atomic; per-transfer clamps
+      down), higher = refused with budget_escalation_requires_admin (admin
+      required). Live verification (AFO-manual-admin-cli): budget 3.00 → session
+      budget_atomic=3000000 → /token 200, wrote agent with wallet + budget 3.00
+      + derived transfer 0.50 + cid-scoped credential; the escalation refusal
+      (403 budget_escalation_requires_admin) and fail-closed (0 tokens, no
+      partial write) both fired live; hijack test passed (test client bound to a
+      SEPARATE agent, pilot untouched). The one live legacy pilot credential was
+      re-keyed to its family key (fam:chatgpt) with a captured rollback record;
+      verified it resolves via the new key and the legacy key no longer matches.
+      No schema change needed (0011 pre-provisioned budget_atomic). Two bugs
+      found+fixed via live testing: a broken HTML pattern attr blocking consent
+      submit, and the write-side legacy-key collision. Dual-read legacy path
+      retained for now; drop it in a future cleanup once all creds are re-keyed.
 - [ ] **Phase 4 — advanced manual wallet-ID entry** with server-side
       ownership verification (identifier-not-secret enforced).
 - [ ] **Phase 5 — reassignment UX:** show existing assignment, confirm
