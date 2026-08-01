@@ -2497,7 +2497,7 @@ function renderLoginForm(params, client, errorMsg, inventory) {
   // Default 5.00, max 50.00 (testnet). Re-consent may lower but never raise the
   // budget -- an increase requires an admin operation.
   const budgetField = wallets.length
-    ? '<label class="scope">Lifetime budget (USDC, max 50.00)<input type="text" inputmode="decimal" name="budget_usdc" value="5.00" pattern="\d+(\.\d{1,6})?" required style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;"></label>'
+    ? '<label class="scope">Lifetime budget (USDC, max 50.00)<input type="text" inputmode="decimal" name="budget_usdc" value="5.00" required style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;"></label>'
     : '';
   return `<!doctype html><html><head><meta charset="utf-8"><title>x402-sub-agent-mcp authorization</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
