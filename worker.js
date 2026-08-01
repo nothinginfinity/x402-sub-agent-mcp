@@ -1587,6 +1587,26 @@ async function circleGaslessTransfer(env, a, authContext) {
   const amount = clean(a.amount);
   if (!amount || !Number.isFinite(Number(amount)) || Number(amount) <= 0) throw new Error('amount is required and must be a positive decimal USD string, e.g. "0.01"');
   const atomicValue = toAtomic(amount, 6);
+  // ---- facilitator preflight (A1/B1): classify the resolved facilitator BEFORE
+  // any Circle wallet fetch, signing, budget reservation, or identity resolution.
+  // Reuses the SAME facilitatorPolicyDecision classifier that guards facilitatorCall
+  // (no duplicated allowlist). On refusal we return a structured error with no
+  // Circle I/O performed, so payer_address is intentionally omitted (obtaining it
+  // would require the very circleGetWallet call this guard prevents). The guard
+  // inside facilitatorCall remains as authoritative defense in depth.
+  const preflightNetwork = (clean(a.blockchain) || DEFAULT_CIRCLE_BLOCKCHAIN).toLowerCase();
+  const preflight = facilitatorPolicyDecision(env, a.facilitator_url, { paymentRequirements: { extra: { name: 'USDC' }, asset: 'USDC' } });
+  if (!preflight.ok) {
+    return {
+      ok: false,
+      error: 'untrusted_facilitator',
+      detail: preflight.detail,
+      stage: 'facilitator_preflight',
+      facilitator_url: preflight.facilitator_url,
+      asset: preflight.asset,
+      __trace: { error_code: 'untrusted_facilitator', stage: 'facilitator_preflight', facilitator_mode: 'untrusted', asset: preflight.asset || 'USDC', network: preflightNetwork }
+    };
+  }
   // Resolve the agent's assigned wallet from its OAuth identity. We do NOT pass
   // wallet_id into the wallet_address slot -- that field matches the on-chain
   // address column, and a Circle UUID would never match it. When the agent has a
@@ -3027,12 +3047,17 @@ async function handleMcp(req, env) {
       try {
         result = await callTool(env, toolName, (rpc.params && rpc.params.arguments) || {}, auth);
         if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=' + auth.driver + ':' + auth.subject + ' outcome=ok' });
-        await traceFromRequest(env, req, { event_type: 'tool_call', client_id: auth.client_id || null, request_id: reqId, http_status: 200, latency_ms: Date.now() - mT0, outcome: result && result.ok === false ? 'error' : 'ok', metadata: { tool_name: toolName, mode: auth.mode, driver: auth.driver || null } });
+        // Surface only the secret-free structured trace fields a tool opted into
+        // exposing via result.__trace (error_code/stage/facilitator_mode/asset/network).
+        // __trace never carries tokens, addresses, signatures, or payloads.
+        const __tt = (result && result.__trace && typeof result.__trace === 'object') ? result.__trace : null;
+        await traceFromRequest(env, req, { event_type: 'tool_call', client_id: auth.client_id || null, request_id: reqId, http_status: 200, latency_ms: Date.now() - mT0, outcome: result && result.ok === false ? 'error' : 'ok', metadata: { tool_name: toolName, mode: auth.mode, driver: auth.driver || null, ...(__tt ? { error_code: __tt.error_code || null, stage: __tt.stage || null, facilitator_mode: __tt.facilitator_mode || null, asset: __tt.asset || null, network: __tt.network || null } : {}) } });
       } catch (e) {
         result = { ok: false, error: String(e.message || e) };
         if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: toolName, detail: 'caller_id=' + auth.driver + ':' + auth.subject + ' outcome=error: ' + result.error });
         await traceFromRequest(env, req, { event_type: 'tool_call', client_id: auth.client_id || null, request_id: reqId, http_status: 200, latency_ms: Date.now() - mT0, outcome: 'error', error: 'tool_error', metadata: { tool_name: toolName, mode: auth.mode, driver: auth.driver || null } });
       }
+      if (result && typeof result === 'object' && '__trace' in result) { const { __trace, ...rest } = result; result = rest; }
       return mcpResponse(req, { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: result && result.ok === false } });
     }
     return mcpResponse(req, { jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } });
@@ -3124,8 +3149,9 @@ export default {
           return j({ ok: false, error: 'insufficient_scope: this OAuth token cannot call ' + body.name }, 403);
         }
         try {
-          const result = await callTool(env, body.name, body.arguments || {}, auth);
+          let result = await callTool(env, body.name, body.arguments || {}, auth);
           if (auth.mode === 'oauth') await oauthAudit(env, 'tool_call', { subject: auth.subject, client_id: auth.client_id, tool_name: body.name, detail: 'caller_id=' + auth.driver + ':' + auth.subject + ' outcome=ok' });
+          if (result && typeof result === 'object' && '__trace' in result) { const { __trace, ...rest } = result; result = rest; }
           return j(result);
         } catch (e) { return j({ ok: false, error: String(e.message || e) }, 200); }
       }
