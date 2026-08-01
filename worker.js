@@ -2770,7 +2770,7 @@ async function handleTokenEndpoint(req, env) {
       try {
         const bindClient = await dbFirst(env, 'SELECT * FROM oauth_clients WHERE client_id = ?', [clientId]);
         const bindKeys = await oauthIdentityKeys(sessionRow.oauth_subject, bindClient || { client_id: clientId, redirect_uris: '[]' });
-        const existingCred = await dbFirst(env, `SELECT agent_id FROM agent_credentials WHERE credential_type = 'oauth_subject_sha256' AND status = 'active' AND credential_key IN (?, ?) LIMIT 1`, [bindKeys.credential_key, bindKeys.legacy_key]);
+        const existingCred = await dbFirst(env, `SELECT agent_id FROM agent_credentials WHERE credential_type = 'oauth_subject_sha256' AND status = 'active' AND credential_key = ? LIMIT 1`, [bindKeys.credential_key]);
         const bindAgentId = existingCred ? existingCred.agent_id : ('oauth-' + bindKeys.credential_key.slice(0, 24));
         const bindNetwork = clean(sessionRow.allowed_network) || DEFAULT_CIRCLE_BLOCKCHAIN;
         const curBudget = await dbFirst(env, `SELECT limit_atomic, spent_atomic FROM agent_budgets WHERE agent_id = ? AND network = ? AND asset = 'USDC' AND period = 'lifetime' AND status = 'active'`, [bindAgentId, bindNetwork]);
