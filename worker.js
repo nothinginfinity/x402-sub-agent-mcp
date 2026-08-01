@@ -20,6 +20,12 @@ const VERSION = '0.2.1';
 const WORKER = 'x402-sub-agent-mcp';
 const X402_VERSION = 1;
 const DEFAULT_FACILITATOR = 'https://x402.org/facilitator';
+const TRUSTED_REAL_FACILITATORS = new Set([
+  'https://x402.org/facilitator'
+]);
+const TEST_ONLY_MOCK_FACILITATORS = new Set([
+  'https://x402-mock-facilitator.jaredtechfit.workers.dev'
+]);
 
 // Known ERC-20 addresses for convenience auto-fill. Always verify against
 // https://developers.circle.com/stablecoins/usdc-contract-addresses before
@@ -1014,8 +1020,44 @@ async function getOnChainBalance(rpcUrl, tokenAddress, ownerAddress) {
   }
 }
 
+function canonicalFacilitatorUrl(value) {
+  try {
+    const parsed = new URL(clean(value));
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+    parsed.pathname = parsed.pathname.replace(/\/+$/, '') || '/';
+    return parsed.origin + (parsed.pathname === '/' ? '' : parsed.pathname);
+  } catch {
+    return null;
+  }
+}
+
+function paymentAssetSymbol(body) {
+  const requirements = body && body.paymentRequirements;
+  return clean(requirements && requirements.extra && requirements.extra.name || requirements && requirements.asset).toUpperCase();
+}
+
+function facilitatorPolicyDecision(env, facilitatorUrl, body) {
+  const resolved = clean(facilitatorUrl) || clean(env.X402_FACILITATOR_URL) || DEFAULT_FACILITATOR;
+  const canonical = canonicalFacilitatorUrl(resolved);
+  const asset = paymentAssetSymbol(body);
+  const mockMode = clean(env.X402_MOCK_ASSET_MODE).toLowerCase() === 'enabled';
+  if (canonical && TRUSTED_REAL_FACILITATORS.has(canonical)) return { ok: true, url: canonical, mode: 'trusted_real', asset };
+  if (canonical && TEST_ONLY_MOCK_FACILITATORS.has(canonical) && mockMode && asset === 'MOCKUSD') {
+    return { ok: true, url: canonical, mode: 'test_mock', asset };
+  }
+  return {
+    ok: false,
+    error: 'untrusted_facilitator',
+    detail: 'facilitator is not approved for this settlement asset',
+    facilitator_url: canonical || null,
+    asset: asset || null
+  };
+}
+
 async function facilitatorCall(env, facilitatorUrl, path, body) {
-  const base = clean(facilitatorUrl) || env.X402_FACILITATOR_URL || DEFAULT_FACILITATOR;
+  const policy = facilitatorPolicyDecision(env, facilitatorUrl, body);
+  if (!policy.ok) return policy;
+  const base = policy.url;
   const url = base.replace(/\/$/, '') + path;
   const req = { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) };
   let res;
