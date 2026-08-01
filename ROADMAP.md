@@ -757,9 +757,11 @@ Observed sample as of 2026-08-01: 7 on-chain settlements, 7 lease draws, and 17 
 A later administrative update/disable path for `internal_tokens` is useful registry hygiene but is not the primary safety boundary. Reconciliation alerts remain defense in depth, not the enforcement mechanism.
 
 - [x] Choose the durable safety design before code.
-- [ ] Implement trusted/test-only facilitator classification and fail-closed enforcement.
-- [ ] Add tests covering trusted USDC settlement, mock rejection for USDC, allowed MOCKUSD test mode, explicit override rejection, and fallback/default behavior.
-- [ ] Verify the deployed Worker live before marking this milestone shipped.
+- [x] Implement trusted/test-only facilitator classification and fail-closed enforcement. Direct verify/settle path already classifies inside `facilitatorCall`; the gasless path now runs the SAME classifier as a preflight BEFORE Circle wallet fetch/signing (A1+B1, commit 56084f89, worker stone 7b2d24f3280c).
+- [x] Add tests covering trusted USDC settlement, mock rejection for USDC, allowed MOCKUSD test mode, explicit override rejection, and fallback/default behavior. `test_preflight.mjs` — 27/27 green (no Circle fetch/signing/facilitator I/O on untrusted refusal; structured `untrusted_facilitator`/`stage:facilitator_preflight`; safe recorder metadata; trusted path still reaches signing; direct verify/settle unchanged).
+- [x] Verify the deployed Worker live before marking this milestone shipped. Live-verified 2026-08-01: deploy run 30717877595 green; safe untrusted gasless call returned `{error:untrusted_facilitator, stage:facilitator_preflight}` with NO payer_address (no Circle I/O), latency 38ms vs 1947ms pre-patch; Flight Recorder captured error_code/stage/facilitator_mode/asset/network with no secrets.
+
+**Still open under V1.5.4:** the dormant `tok_5a9652468f4142d98626` (MOCKUSD) internal_token remains registered on base-sepolia (no delete tool by design); it is harmless while `X402_MOCK_ASSET_MODE` is off and matching requires network+asset, but a later admin update/disable path for `internal_tokens` remains useful registry hygiene.
 
 ---
 
