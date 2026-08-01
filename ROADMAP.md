@@ -676,7 +676,9 @@ controls.
 
 ## V1.5 — Metering Interception Layer (THE FOUNDATION)
 
-**Status: NOT STARTED. This is the next step and everything below it depends on it.**
+**Status: FOUNDATION SHIPPED; fleet rollout remains gated on the V1.5.2 settlement-policy decision and the V1.5.4 facilitator-safety guard.**
+
+**Live-state reconciliation (2026-08-01):** The checkboxes in this section had drifted behind deployed state. V1.5.1 metering, V1.5.3 outcome recording, V1.5.5 paid stone operations, V1.6.0 leases, and V1.7.0 Agent Wallets Console are already shipped and live-verified. V1.4.6 Phase 6 is also complete: a real ChatGPT OAuth identity resolved to `pilot-agent-chatgpt` and sent 1 atomic USDC on Base Sepolia in transaction `0x52a487787e3d6ec480ef940431f1c1e732d263115ebe0e2af6cedc14785c78d1`. Plan from live repos, D1, and CairnStone HEADs rather than stale unchecked boxes.
 
 ### The finding that motivates this (2026-07-24)
 
@@ -706,13 +708,18 @@ Three candidate shapes. Decide before writing code; this choice is expensive to 
 - [ ] Pass honest `caller_id` through from the OAuth `<driver>:<subject>` attribution already shipped in stone ff7e86269eaa.
 - [ ] Live-verify: call the tool, confirm a `usage_events` row appears with correct route, caller, and outcome.
 
-### V1.5.2 — Measure the cost of metering itself (GATE)
+### V1.5.2 — Measure the cost of metering itself (GATE) ✅ DECIDED 2026-08-01
 
-This gates fleet rollout. Do not skip.
+This gate is now resolved from live `metered_calls` data. The sample is still small and should be revisited as volume grows, but it is sufficient to choose the rollout default.
 
-- [ ] Record added latency per metered call (the `usage_events` detail logging from stone 475f9ba742f8 already captures duration and facilitator latency).
-- [ ] Answer explicitly: **is a real EIP-3009 signature + facilitator round-trip per tool call economically and latency-wise viable?** CIRCLE-LIVE-02's settle was a real network hop. At 1/1000-cent pricing the payment may cost more in latency and facilitator load than it is worth.
-- [ ] If per-call settlement is too expensive, this is the evidence that forces **leases (V1.6) or batched/deferred settlement** *before* rollout, not after.
+Observed sample as of 2026-08-01: 7 on-chain settlements, 7 lease draws, and 17 unpaid calls. On-chain settlement averaged about 2618ms, with a 1622ms minimum and 5874ms maximum. Lease draws averaged about 584ms, with a 272ms minimum. The extra `evaluate_request` price fetch added roughly 330-490ms. Because settlement runs in `ctx.waitUntil`, this cost is off the caller's critical path, but facilitator traffic, cost, retry exposure, and reconciliation load remain real.
+
+**Decision:** use a hybrid billing policy. Cheap, repetitive, status/read, and loop-prone tools default to lease-based billing. Expensive, discrete units of work use per-call settlement, preferably `mode: 'upto'` with actual-cost clamping. Do not use direct on-chain settlement for every low-value tool invocation. Fleet architecture and pricing work must preserve the distinction between measurement per call and billing by lease or unit of work.
+
+- [x] Record added settlement and price-fetch latency in `metered_calls`.
+- [x] Answer the per-call viability question explicitly from live data.
+- [x] Choose leases as the default for cheap/high-frequency tools and selective per-call settlement for expensive units of work.
+- [ ] Revisit the thresholds after a larger production-shaped sample; this does not block the current implementation path.
 
 ### V1.5.3 — Record outcome, not just payment (do this from day one)
 
@@ -741,11 +748,18 @@ This gates fleet rollout. Do not skip.
 
 ---
 
-### V1.5.4 — Harden facilitator matching (prerequisite, see open item)
+### V1.5.4 — Harden facilitator matching (APPROVED DESIGN; IMPLEMENT NEXT)
 
-- [ ] `tok_5a9652468f4142d98626` (Mock USD) is **enabled**, on `base-sepolia`, pointing at a settlement-FAKE facilitator. It is inert today only because matching requires network AND asset.
-- [ ] Metering broadly means far more calls flowing through facilitator resolution. If any resolves to the fake facilitator, the ledger fills with successful-looking payments that never moved money — discovered only at reconciliation.
-- [ ] Add an explicit guard, or disable the token, before fleet rollout.
+`tok_5a9652468f4142d98626` (Mock USD) remains enabled on `base-sepolia` and points at a settlement-FAKE facilitator. It is currently a dormant landmine because matching requires both network and asset, but broader metering increases the chance of an accidental fake-settlement route.
+
+**Decision (2026-08-01):** implement a fail-closed trusted-facilitator policy in the settlement path. Real-value assets such as USDC may settle only through explicitly trusted real-settlement facilitators. Known mock/test facilitators must be classified test-only and rejected for real-value settlement. Preserve an explicit isolated test mode for MOCKUSD and deliberate mock-flow testing. Apply the guard after facilitator resolution so it covers explicit overrides, `internal_tokens`, `settlement_assets`, and the global default; do not rely on a hostname substring blocklist alone.
+
+A later administrative update/disable path for `internal_tokens` is useful registry hygiene but is not the primary safety boundary. Reconciliation alerts remain defense in depth, not the enforcement mechanism.
+
+- [x] Choose the durable safety design before code.
+- [ ] Implement trusted/test-only facilitator classification and fail-closed enforcement.
+- [ ] Add tests covering trusted USDC settlement, mock rejection for USDC, allowed MOCKUSD test mode, explicit override rejection, and fallback/default behavior.
+- [ ] Verify the deployed Worker live before marking this milestone shipped.
 
 ---
 
@@ -1183,9 +1197,14 @@ next — same discipline as V1.4.5's staged rollout:
       ownership verification (identifier-not-secret enforced).
 - [ ] **Phase 5 — reassignment UX:** show existing assignment, confirm
       replacement, archive prior, preserve audit; no silent budget raise.
-- [ ] **Phase 6 — full live verification** against a real ChatGPT OAuth
-      connection (the checklist above), then make this the default
-      onboarding path in docs.
+- [x] **Phase 6 — full live verification** against a real ChatGPT OAuth
+      connection. ✅ Completed 2026-08-01: ChatGPT resolved to
+      `pilot-agent-chatgpt` / `oauth-2b910ac9f97e0fd124d066ef`, the assigned
+      Base Sepolia wallet was read successfully, and a real 1-atomic USDC
+      gasless transfer settled in transaction
+      `0x52a487787e3d6ec480ef940431f1c1e732d263115ebe0e2af6cedc14785c78d1`.
+      Reconnection preserved the family-key assignment and the transfer used
+      the resolved wallet and budget path.
 
 **Long-term framing.** This is the intended default onboarding for
 ChatGPT and every future AI client connecting to the x402 ecosystem: the
