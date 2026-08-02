@@ -423,6 +423,66 @@ async function adminAssignAgentWallet(env, a, authContext) {
   return { ...assigned, credential_type: attached.credential_type, credential_fingerprint: fingerprint, token: rawToken, one_time_reveal: true };
 }
 
+// V1.5.6: OAuth-family binding as a first-class admin tool (capture-on-first-connect arm).
+// Admin-gated. Arms a PENDING binding of a trusted client family -> an explicit active agent.
+// The next OAuth session for that family that hits resolveAgentContext's no-credential branch
+// atomically consumes the arm and writes the family credential (see captureOnFirstConnect). This
+// tool ONLY writes the arm row; it never writes a credential itself and never derives a subject.
+// family MUST be one of the trusted CLIENT_FAMILY_BY_DOMAIN values (claude|chatgpt|perplexity) --
+// the 'cid:' isolation fallback is intentionally NOT armable. Idempotent: re-arming the same
+// family->same agent refreshes the existing armed row; arming a family already armed to a
+// DIFFERENT active agent, or already captured (an active oauth_subject_sha256 credential) to a
+// different agent, is refused (family_arm_conflict). Every arm writes an agent_context_audit row.
+async function adminBindOauthIdentity(env, a, authContext) {
+  if (!authContext || !authContext.ok || authContext.mode !== 'oauth' || !(authContext.scope || []).includes(OAUTH_ADMIN_SCOPE)) {
+    return agentContextError('permission_denied', 'OAuth mcp:admin authentication is required');
+  }
+  const agentId = clean(a.agent_id);
+  const family = clean(a.family).toLowerCase();
+  if (!agentId) return agentContextError('invalid_request', 'agent_id is required');
+  const knownFamilies = new Set(Object.values(CLIENT_FAMILY_BY_DOMAIN));
+  if (!family || !knownFamilies.has(family)) {
+    return agentContextError('invalid_request', 'family must be one of the trusted client families: ' + [...knownFamilies].sort().join(', '));
+  }
+  const agent = await dbFirst(env, `SELECT * FROM agents WHERE agent_id = ? AND status = 'active'`, [agentId]);
+  if (!agent) {
+    const failure = agentContextError('unknown_agent', 'active agent does not exist', { agent_id: agentId });
+    await writeAgentContextAudit(env, { agent: { agent_id: agentId }, capability: 'admin_bind_oauth_identity' }, 'denied', failure.error_code, { detail: failure.detail + ' (family=' + family + ')' });
+    return failure;
+  }
+  // Refuse if this family is already ARMED toward a different active agent.
+  const armedElsewhere = await dbFirst(env, `SELECT agent_id FROM oauth_capture_arms WHERE family = ? AND status = 'armed'`, [family]);
+  if (armedElsewhere && armedElsewhere.agent_id !== agentId) {
+    const failure = agentContextError('family_arm_conflict', 'this client family is already armed toward another active agent; cancel that arm first', { agent_id: armedElsewhere.agent_id, family });
+    await writeAgentContextAudit(env, { agent, capability: 'admin_bind_oauth_identity' }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  // Refuse if this family already resolves (via an existing active oauth_subject_sha256
+  // credential whose metadata.family matches) to a DIFFERENT active agent. Capturing again would
+  // create an ambiguous_identity at resolve time; the operator must unbind the prior agent first.
+  const capturedRows = await dbAll(env, `SELECT ac.agent_id AS agent_id FROM agent_credentials ac
+    JOIN agents ag ON ag.agent_id = ac.agent_id AND ag.status = 'active'
+    WHERE ac.credential_type = 'oauth_subject_sha256' AND ac.status = 'active'
+      AND json_extract(ac.metadata_json, '$.family') = ?`, [family]);
+  const capturedElsewhere = capturedRows.find(r => r.agent_id !== agentId);
+  if (capturedElsewhere) {
+    const failure = agentContextError('family_arm_conflict', 'this client family is already bound to another active agent via an existing credential; unbind it before re-arming', { agent_id: capturedElsewhere.agent_id, family });
+    await writeAgentContextAudit(env, { agent, capability: 'admin_bind_oauth_identity' }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  const ts = nowIso();
+  const armedBy = (authContext.driver || 'oauth') + ':' + clean(authContext.subject).slice(0, 16);
+  // Idempotent upsert keyed on the partial-unique (family) WHERE status='armed' index: re-arming
+  // the same family->same agent refreshes updated_at; the WHERE guard keeps a stray cross-agent
+  // conflict a no-op rather than a hijack (already ruled out above, defense in depth).
+  await dbRun(env, `INSERT INTO oauth_capture_arms (id, family, agent_id, status, armed_by, created_at, updated_at)
+    VALUES (?, ?, ?, 'armed', ?, ?, ?)
+    ON CONFLICT(family) WHERE status = 'armed' DO UPDATE SET agent_id = excluded.agent_id, armed_by = excluded.armed_by, updated_at = excluded.updated_at
+    WHERE oauth_capture_arms.agent_id = excluded.agent_id`, [uid('ocarm'), family, agentId, armedBy, ts, ts]);
+  await writeAgentContextAudit(env, { agent, capability: 'admin_bind_oauth_identity' }, 'allowed', null, { detail: 'oauth-family capture armed idempotently (family=' + family + ')' });
+  return { ok: true, agent_id: agentId, family, status: 'armed', detail: 'The next ' + family + ' OAuth session that resolves with no existing credential will be bound to this agent.' };
+}
+
 // DEPRECATED 2026-07-29 (Option A: unregister + stub). This tool derived agent identity
 // from the CALLER's OAuth subject digest, so with Claude+ChatGPT sharing one OAuth subject it
 // could not create distinct agents and twice hijacked an existing wallet. Onboarding now goes
@@ -496,6 +556,48 @@ function permissionMatches(row, capability, network, asset) {
   return true;
 }
 
+// V1.5.6 passive capture-on-first-connect. Called ONLY from resolveAgentContext's
+// no-credential branch for an OAuth identity. If the caller's trusted family has an ARMED
+// oauth_capture_arms row toward a still-active agent, atomically consume it (single guarded
+// UPDATE ... WHERE status='armed', so concurrent first-connects capture exactly once) and write
+// the family's oauth_subject_sha256 credential via attachAgentCredential, tagging metadata.family
+// so the arm-conflict check and this capture agree on family. Returns the bound agent_id on a
+// successful capture, else null (caller then returns its normal unknown_agent failure). Never
+// throws into the resolve path: any failure degrades to null (no capture) so resolve stays safe.
+async function captureOnFirstConnect(env, authContext, evidence) {
+  try {
+    if (!evidence || evidence.type !== 'oauth_subject_sha256') return null;
+    if (!authContext || authContext.mode !== 'oauth' || !authContext.subject) return null;
+    let clientRow = null;
+    if (authContext.client_id) {
+      try { clientRow = await dbFirst(env, 'SELECT * FROM oauth_clients WHERE client_id = ?', [authContext.client_id]); } catch (_) { clientRow = null; }
+    }
+    const keys = await oauthIdentityKeys(authContext.subject, clientRow || { client_id: authContext.client_id, redirect_uris: '[]' });
+    const family = keys.family;
+    // Only real, unanimous, known families are capturable -- never a 'cid:' isolation bucket.
+    if (!family) return null;
+    // The credential we would write MUST equal the steady-state read key, or the very next resolve
+    // would miss it. oauthIdentityKeys() is the single source both sides use, so this holds.
+    if (keys.credential_key !== evidence.key) return null;
+    const arm = await dbFirst(env, `SELECT * FROM oauth_capture_arms WHERE family = ? AND status = 'armed'`, [family]);
+    if (!arm) return null;
+    const agent = await dbFirst(env, `SELECT * FROM agents WHERE agent_id = ? AND status = 'active'`, [arm.agent_id]);
+    if (!agent) return null; // armed toward a since-disabled/deleted agent -> do not capture
+    const ts = nowIso();
+    // Atomic single-winner consume. If a concurrent resolve already consumed this arm, changes=0
+    // and we skip the write (the credential already exists; caller's re-query will find it).
+    const consume = await dbRun(env, `UPDATE oauth_capture_arms SET status = 'consumed', consumed_by = ?, consumed_at = ?, updated_at = ? WHERE family = ? AND status = 'armed'`, [keys.credential_key, ts, ts, family]);
+    const changed = consume && consume.meta && consume.meta.changes ? consume.meta.changes : (consume && consume.changes) || 0;
+    if (!changed) return null;
+    const attached = await attachAgentCredential(env, { agent_id: arm.agent_id, credential_type: 'oauth_subject_sha256', credential_key: keys.credential_key, metadata: { source: 'admin_bind_oauth_identity', family, captured_at: ts } });
+    if (!attached.ok) return null; // e.g. ambiguous_identity (raced onto another agent) -> no capture
+    await writeAgentContextAudit(env, { agent, credential: { type: 'oauth_subject_sha256', key: keys.credential_key }, capability: 'oauth_capture_on_first_connect' }, 'allowed', null, { detail: 'captured oauth-family binding on first connect (family=' + family + ')' });
+    return arm.agent_id;
+  } catch (_) {
+    return null; // capture is best-effort; never break resolve
+  }
+}
+
 async function resolveAgentContext(env, authContext, request) {
   const r = request || {};
   const capability = clean(r.capability) || 'resolve_agent_context';
@@ -509,8 +611,17 @@ async function resolveAgentContext(env, authContext, request) {
     return failure;
   }
 
-  const credentials = await dbAll(env, `SELECT * FROM agent_credentials
+  let credentials = await dbAll(env, `SELECT * FROM agent_credentials
     WHERE credential_type = ? AND status = 'active' AND credential_key IN (?, ?)`, [evidence.type, evidence.key, evidence.legacy_key || evidence.key]);
+  if (!credentials.length) {
+    // V1.5.6: passive capture-on-first-connect. If this OAuth family was armed by an admin, bind
+    // it now and re-query; otherwise fall through to the normal unknown_agent failure below.
+    const capturedAgentId = await captureOnFirstConnect(env, authContext, evidence);
+    if (capturedAgentId) {
+      credentials = await dbAll(env, `SELECT * FROM agent_credentials
+        WHERE credential_type = ? AND status = 'active' AND credential_key IN (?, ?)`, [evidence.type, evidence.key, evidence.legacy_key || evidence.key]);
+    }
+  }
   if (!credentials.length) {
     const failure = agentContextError('unknown_agent', 'no active agent credential matches the authenticated identity');
     await writeAgentContextAudit(env, { credential: evidence, capability, network, asset, amount_atomic: amountAtomic }, 'denied', failure.error_code, { detail: failure.detail });
@@ -1813,6 +1924,7 @@ const toolSchemas = [
     inputSchema: obj({ wallet_id: str, destination_address: str, amount: str, blockchain: str, token_address: str, facilitator_url: str, caller_id: str, resource: str, valid_for_seconds: num }, ['wallet_id', 'destination_address', 'amount']) },
 
   { name: 'admin_assign_agent_wallet', description: 'Admin-only: assign a Circle wallet, budget, permissions, and a server-generated one-time bearer credential to an explicit agent_id.', inputSchema: obj({ agent_id: str, display_name: str, wallet_id: str, network: str, asset: str, budget_atomic: str, transfer_max_atomic: str }, ['agent_id', 'wallet_id', 'budget_atomic']) },
+  { name: 'admin_bind_oauth_identity', description: 'Admin-only: arm capture-on-first-connect for a trusted OAuth client family (claude|chatgpt|perplexity) toward an explicit active agent_id. Writes only a pending arm; the next OAuth session for that family with no existing credential is atomically bound to the agent at resolve time. Idempotent; refuses if the family is already armed or bound to a different active agent.', inputSchema: obj({ agent_id: str, family: str }, ['agent_id', 'family']) },
 
   { name: 'oauth_trace_list', description: 'OAuth Flight Recorder: list recorded OAuth trace events, folded into distinct traces. Filter by trace_id, client_id, event_type, grant_type, outcome, resource, error, http_status, and a date_from/date_to (ISO) window. No secrets are ever returned -- only hashes and non-secret metadata.',
     inputSchema: obj({ trace_id: str, client_id: str, event_type: str, grant_type: str, outcome: str, resource: str, error: str, http_status: str, date_from: str, date_to: str, limit: num }) },
@@ -1833,6 +1945,7 @@ async function callTool(env, name, args, authContext) {
     case 'resolve_agent_context': return resolveAgentContextTool(env, a, authContext);
     case 'provision_agent_context_self': return agentContextError('deprecated', 'provision_agent_context_self is deprecated; use admin_assign_agent_wallet for onboarding');
     case 'admin_assign_agent_wallet': return adminAssignAgentWallet(env, a, authContext);
+    case 'admin_bind_oauth_identity': return adminBindOauthIdentity(env, a, authContext);
     case 'create_payment_rule': return createPaymentRule(env, a);
     case 'list_payment_rules': return listPaymentRules(env, a);
     case 'update_payment_rule': return updatePaymentRule(env, a);
