@@ -1247,3 +1247,92 @@ next — same discipline as V1.4.5's staged rollout:
 ChatGPT and every future AI client connecting to the x402 ecosystem: the
 operator chooses the wallet and limits once, during authorization, and
 the assignment is automatic and invisible afterward.
+
+---
+
+## V1.8 — Paid Messages (agent-to-agent paid inbox)
+
+### V1.8.0 — Pay-to-send (Option B), design decided before code
+
+**Where this lives.** Code + migration land in the **x402-cairnstone**
+repo (the metered/paid worker, `src/index.js`, live VERSION 0.4.4), NOT in
+this policy-engine repo. This ROADMAP records the decision because it is
+the canonical product record; the x402-cairnstone repo has no ROADMAP of
+its own. CairnStone chain for both repos remains `x402-sub-agent-mcp`.
+
+**The money-shaped decision (Jared picked Option B, 2026-08-02).** A paid
+message has two natural value-transfer points, and which one carries the
+money defines the whole protocol:
+
+- **Option A — pay-to-answer (escrow-on-send, release-on-answer).** Sender
+  locks a bounty; `message_answer` releases it to the recipient; no answer
+  means refund/expire. This is the honest "pay for work" primitive but
+  requires escrow/hold accounting (a logical hold in D1 against a
+  lease/balance, since EIP-3009 does not natively escrow). Deferred to
+  V1.8.1 as the SECOND build.
+- **Option B — pay-to-send (fire-and-settle, no escrow). CHOSEN as the
+  first build.** `message_send` IS the payment: serve-then-settle fires
+  `circle_gasless_transfer` sender→recipient the moment the message lands,
+  via the already-proven `ctx.waitUntil` path. `message_answer` just writes
+  a reply (no second transfer). Reuses existing verified machinery, so the
+  first agent-to-agent transfer on a new path carries almost no novel
+  risk — the right first step. Its weakness (postage, not a reward for
+  work) is exactly what Option A later fixes; B leaves A a working
+  `paid_messages` table and inbox to extend.
+
+**Schema — migration `0009_paid_messages.sql`** (shared cairnstone-v5 D1
+`60b8210c-7d5a-4d54-b0aa-7411fb4b9b95`; applied MANUALLY before the
+dependent deploy, per standing convention):
+
+```
+paid_messages(
+  id TEXT PRIMARY KEY,
+  sender_caller TEXT NOT NULL,
+  recipient_caller TEXT NOT NULL,
+  body TEXT NOT NULL,
+  price_atomic TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'sent',   -- sent | answered
+  tx_hash TEXT,                          -- on-chain tx id, or lease:<caller>
+  answer_body TEXT,
+  settle_ms INTEGER,
+  price_fetch_ms INTEGER,
+  created_at TEXT NOT NULL,
+  answered_at TEXT
+)
+```
+Plus indexes on `recipient_caller` (inbox reads) and `status`.
+
+**Four tools** (in x402-cairnstone `src/index.js`, all gated by the
+existing `MCP_AUTH_TOKENS` caller map; sender/recipient identities resolved
+from the authenticated caller and `agent_identity`, NEVER client-supplied):
+
+- `message_send(recipient_caller, body, price_atomic?)` — insert row,
+  return immediately, then `ctx.waitUntil(settleMessagePayment(...))`.
+- `message_inbox(status?)` — read: messages where `recipient_caller` = the
+  authenticated caller.
+- `message_status(id)` — read: one message's state + tx_hash.
+- `message_answer(id, answer_body)` — write reply, set `status='answered'`.
+  No transfer (Option A's job). Only the recipient may answer.
+
+**One new settle function** `settleMessagePayment(env, msgId, senderCaller,
+recipientCaller, priceAtomic)` — a parameterized fork of the proven
+`settleStonePayment`: resolves the sender's `wallet_id` and the
+recipient's `address` from `agent_identity`, runs the same
+lease-draw-then-gasless-transfer idiom, backfills `paid_messages` (not
+`metered_calls`). This is the ONLY genuinely new machinery — the existing
+settle is hardwired Wallet A → rule payTo, which cannot vary per message.
+
+**First transfer.** Reuse existing wallets for the first proof: sender =
+Wallet A payer `6b3af813-59c5-57e9-9dcf-bde05fc24aa2`, recipient = Wallet B
+`b31057a8-3aec-5c42-9d03-f477e742afec` (`0xa3b8d584…`). Fresh sender/
+receiver pair deferred until needed. Jared gave an explicit standing go for
+the first testnet transfer on 2026-08-02.
+
+**Guards.** `atomicToDecimalString()` / `parseUsdcToAtomicStrict()` on all
+amounts; `circle_gasless_transfer` (EIP-3009), never `circle_transfer`;
+BASE-SEPOLIA only.
+
+- [ ] Migration 0009 written + applied manually to live D1 + committed.
+- [ ] Four tools + `settleMessagePayment` implemented in src/index.js.
+- [ ] Lint clean; deploy green; tools callable after reconnect.
+- [ ] First live testnet transfer verified (tx hash + recipient row).
