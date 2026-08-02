@@ -1332,7 +1332,32 @@ the first testnet transfer on 2026-08-02.
 amounts; `circle_gasless_transfer` (EIP-3009), never `circle_transfer`;
 BASE-SEPOLIA only.
 
-- [ ] Migration 0009 written + applied manually to live D1 + committed.
-- [ ] Four tools + `settleMessagePayment` implemented in src/index.js.
-- [ ] Lint clean; deploy green; tools callable after reconnect.
-- [ ] First live testnet transfer verified (tx hash + recipient row).
+- [x] Migration 0009 written + applied manually to live D1 + committed (`698c5393`).
+- [x] Four tools + `settleMessagePayment` implemented in src/index.js (commit `87c4625a`, deploy green, all four tools live in tools/list).
+- [x] Lint clean; deploy green; tools callable after reconnect.
+- [~] First live testnet transfer: the on-chain agent-to-agent transfer itself is PROVEN (real tx `0x79d49c23c4bd7342d8c529b411db1666062158b9bdf13f56a3e87755c63fec19`, claude's wallet -> stone-vault, 0.005 USDC), but the MESSAGE-driven settle path is blocked by finding #4 below. message_send stores + returns correctly; settle leaves the row unpaid.
+
+### V1.8.0 session outcome (2026-08-02)
+
+**Shipped & verified:** ROADMAP decision (`40113471`); migration 0009 live; four message tools + `settleMessagePayment` (`87c4625a`); payer-wallet reconciliation (`e56eaff7`). All lint-clean, all deploys green.
+
+**Finding #3 (RESOLVED this session) - identity-table divergence.** The V1.5.6 OAuth capture work (2026-08-01 23:51) created + funded a new wallet `84c64a17-46f5-55d1-a329-57c74509282d` (`0xbb8e19...`, 19.999 USDC) as `claude-pilot`'s active assigned wallet, but cairnstone `agent_identity` and the hardcoded literals in `settleStonePayment`/`lease_topup` still named the old Wallet A (`6b3af813...`). Reconciled: `agent_identity` row for `claude:jared` repointed to `84c64a17...` (old Wallet A row retired, caller_id nulled); the two hardcoded literals replaced with `resolvePayerWalletId(env, callerId)` (dynamic lookup, falls back to the new wallet id, never the retired one); console fallback constant updated. Also: `stone-vault` given `caller_id='stone-vault:jared'` so recipients are addressable.
+
+### Finding #4 (OPEN - THE NEXT TASK) - binding-path settle credential mismatch
+
+**Symptom.** After finding #3 was fixed, message settle STILL leaves rows unpaid, and so does the metered-tool settle (`settleStonePayment`): a fresh `cairnstone_health` call on 2026-08-02 20:32 has `payment_id=null`. Yet a direct `circle_gasless_transfer` from `84c64a17...` -> stone-vault SUCCEEDS on-chain (tx `0x79d49c23...`).
+
+**Root cause (diagnosed, not yet fixed).** Two auth paths resolve to different identities on the x402 side:
+- The OAuth-connector path (how a live client or Claude calls `circle_gasless_transfer`) presents `credential_type: oauth_subject_sha256`, resolves to `claude-pilot`, whose assigned wallet is `84c64a17...` -> MATCH -> transfer succeeds.
+- The service-binding path (`env.PAYMENT_WORKER` + the static `X402_MCP_AUTH_TOKEN` secret) is how BOTH `settleMessagePayment` and `settleStonePayment` call the payment worker. That static-token credential no longer resolves to a caller/agent whose assigned wallet matches the `wallet_id` being sent -> transfer fails the identity check -> swallowed by design -> row left unpaid.
+
+So every serve-then-settle ON-CHAIN payment through the binding (metered tools, lease topup, messages) has been silently broken since the 2026-08-01 OAuth-capture change. It was masked until now because leases covered spend; draining the lease this session exposed it.
+
+**Fix options (money/auth-shaped - decide before code next session):**
+1. Give the static `X402_MCP_AUTH_TOKEN` credential its own agent-wallet assignment on the x402 side (via `admin_assign_agent_wallet` / `admin_bind_oauth_identity`) so the binding-path caller resolves to an agent whose active wallet is `84c64a17...`.
+2. Have the settle functions present a credential on the binding call that resolves to `claude-pilot` (e.g. bind the static token's caller to the same agent, or pass the OAuth-subject-derived caller the payment worker expects).
+3. Reconcile at the x402 permission/assignment layer so the caller_id the binding sends (`claude:jared`) is itself an accepted credential mapped to `claude-pilot`'s wallet.
+
+All three touch cross-worker auth on the money path. Recommended: diagnose which agent/caller the static-token binding path actually resolves to on the x402 side FIRST (read `agent_wallets`/credential rows for the token's identity), then pick the option that makes that resolution point at `84c64a17...`.
+
+**State left clean:** `claude:jared` lease drained to 0 (adjustment -10000 recorded, audit identity holds); two unpaid message rows exist (`msg_5539f1e1` at 20000 which also hit the 10000 transfer cap, `msg_c700ee1f` and `msg_5de9c34f` at 5000) - all honestly `status=sent, tx_hash=null`. `claude-pilot` transfer cap is 10000 atomic (relevant: a message price must be <= 10000 to pass the cap, but > lease balance to force on-chain; with lease at 0 any price in (0, 10000] works once #4 is fixed).
