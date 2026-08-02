@@ -763,6 +763,17 @@ A later administrative update/disable path for `internal_tokens` is useful regis
 
 **Still open under V1.5.4:** the dormant `tok_5a9652468f4142d98626` (MOCKUSD) internal_token remains registered on base-sepolia (no delete tool by design); it is harmless while `X402_MOCK_ASSET_MODE` is off and matching requires network+asset, but a later admin update/disable path for `internal_tokens` remains useful registry hygiene.
 
+### V1.5.5 — Claude assigned its own payer wallet (multi-LLM wallet assignment) ✅ live-verified 2026-08-01
+
+Goal: give Claude the same wallet-assignment capability ChatGPT has, so a Claude OAuth session resolves to its own agent + funded wallet instead of `unknown_agent`. Chosen approach: OAuth client-family binding (the V1.4.6 Phase 3 family scheme), which the system was already built for.
+
+- [x] Confirm the family discriminator resolves distinctly for Claude (read-only viability check). Live evidence: this Claude session's identity key = `ffdc2f88…` (= `sha256(subject:fam:claude)`), distinct from ChatGPT's `2b910ac9…`; Claude client `oauth_DsrHJnobTvVetnmI` has redirect host `claude.ai` → `resolveClientFamily='claude'` → `fam:claude` (unanimous known host, not a `cid:` fallback). No subject-only collision.
+- [x] Provision `claude-pilot` and assign a funded wallet. `admin_assign_agent_wallet(agent_id='claude-pilot', wallet_id=84c64a17… = 0xbb8e196a…, budget_atomic=100000, transfer_max_atomic=10000)`. Wallet had 20 USDC, was unbound. Also minted a one-time static bearer (fingerprint `b7fb64a0…`) for the future headless/API-key path.
+- [x] Bind this Claude OAuth identity → `claude-pilot`. Done via a **raw D1 insert** into `agent_credentials` (`credential_type=oauth_subject_sha256`, `credential_key=ffdc2f88…`, `metadata.family=claude`) mirroring ChatGPT's phase3_rekey row — because `admin_assign_agent_wallet` only mints a *bearer_token* credential; there is no first-class OAuth-family binding tool yet.
+- [x] Live-verify Claude-as-payer. `resolve_agent_context` now returns `agent_id=claude-pilot`, `caller_id=claude:ffdc2f8885962715`. Gasless 0.001 USDC → `0xa4861a74…`: `verify.isValid=true`, `settle.success=true`, tx `0x96683c7d6a1e6ac288a30e7f0ad5f8761a6bfc14626c30d3afc6a0ae11583f54`; on-chain 20 → 19.999 (−0.001 exact); budget spent 0 → 1000. V1.5.4 preflight did not interfere with the trusted success path.
+
+**GAP / next build (money-shaped, design-first before coding):** the OAuth-family binding was a raw D1 insert, not a tool. For a real control surface — a mobile-app dropdown now, and API-key / Cloudflare-worker assignment at the 1000-wallet scale — this must become a first-class admin operation (e.g. `admin_bind_oauth_identity(agent_id, family)`, or a `credential_mode:'oauth_family'` option folded into `admin_assign_agent_wallet`) so assignment never writes raw SQL. Both access modes (OAuth-family for connector LLMs; static bearer for headless LLMs) are already backed by the same `admin_assign_agent_wallet` primitive; only the OAuth-family credential attach lacks a tool. "Which wallets are free" = `circle_list_wallets` minus active `agent_wallets` rows. Provisioning report stone: `35425c3104c0`.
+
 ---
 
 ## V1.6 — Billing models (BUILT ON V1.5, do not start first)
