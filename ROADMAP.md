@@ -1230,6 +1230,37 @@ next — same discipline as V1.4.5's staged rollout:
       found+fixed via live testing: a broken HTML pattern attr blocking consent
       submit, and the write-side legacy-key collision. Dual-read legacy path
       retained for now; drop it in a future cleanup once all creds are re-keyed.
+
+### Post–Phase 3 infrastructure extension — Cloudflare Mesh private agent network
+
+**Status: PLANNED. Do not interrupt or redesign Phase 3 around Mesh.** Phase 3 establishes the trusted identity and financial-authority boundary first. Mesh is the next bounded infrastructure experiment after that boundary is verified.
+
+**Purpose.** Add a private network-authority plane beneath the x402 Sub-Agent architecture. Agent Context answers *who the agent is and what it may do*; x402 wallet policy answers *how much value it may move*; Cloudflare Mesh/VPC/Gateway should answer *which private infrastructure it may reach*. AI Gateway may later add a separate compute/inference-authority plane.
+
+Target capability model:
+
+```text
+Agent Context
+  ├── identity/capability authority — OAuth + trusted client family
+  ├── financial authority — x402 wallet + lifetime budget + transfer cap
+  ├── network authority — Cloudflare Mesh/VPC/Gateway
+  └── later: compute authority — AI Gateway routing/spend controls
+```
+
+**Architectural direction.** Keep the OAuth/MCP edge public. Evaluate moving internal wallet-control, payment-policy, settlement/verifier adapters, internal MCPs, and other non-public APIs/services behind Mesh so they do not require public ingress. Mesh is complementary to Agent Context; it must never become a substitute for OAuth identity, wallet ownership validation, budget enforcement, or x402 settlement policy.
+
+**First proof of concept — deliberately small:**
+
+- [ ] Create one private test service with no public endpoint.
+- [ ] Connect the x402 Worker to it through a VPC Network binding / Mesh path.
+- [ ] Verify the authorized Worker can reach it and an unauthorized participant cannot.
+- [ ] Confirm Cloudflare Gateway visibility/logging identifies the Worker/service path.
+- [ ] Add a Gateway policy that blocks the connection and verify deterministic denial.
+- [ ] Remove/adjust the policy and verify access is restored.
+- [ ] Confirm Mesh/private-routing failure fails safely and cannot broaden wallet or payment authority.
+
+**POC acceptance criterion:** prove `Agent Context controls authority; x402 controls money; Mesh controls reachability` without weakening any Phase 3 OAuth, session, wallet, budget, credential, or fail-closed invariant. Only after this proof should production services be decomposed or moved behind Mesh.
+
 - [ ] **Phase 4 — advanced manual wallet-ID entry** with server-side
       ownership verification (identifier-not-secret enforced).
 - [ ] **Phase 5 — reassignment UX:** show existing assignment, confirm
