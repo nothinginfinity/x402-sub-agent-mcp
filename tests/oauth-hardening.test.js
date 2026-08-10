@@ -221,6 +221,7 @@ class MemoryStatement {
         const token = values[index];
         if (token === '?') row[column] = this.params[paramIndex++];
         else if (/^NULL$/i.test(token)) row[column] = null;
+        else if (/^'([^']*)'$/.test(token)) row[column] = token.slice(1, -1);
         else if (/^\d+$/.test(token)) row[column] = Number(token);
         else throw new Error('Unsupported INSERT value in test D1 mock: ' + token);
       });
