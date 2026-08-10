@@ -110,9 +110,11 @@ class MemoryD1 {
   }
 
   async batch(statements) {
-    const results = [];
-    for (const statement of statements) results.push(await statement.run());
-    return results;
+    return this.atomic(async () => {
+      const results = [];
+      for (const statement of statements) results.push(await statement.run({ skipAtomic: true }));
+      return results;
+    });
   }
 
   async atomic(fn) {
@@ -144,7 +146,8 @@ class MemoryStatement {
     return { results: await this.#select() };
   }
 
-  async run() {
+  async run(options = {}) {
+    if (options.skipAtomic) return this.#mutate();
     return this.db.atomic(async () => this.#mutate());
   }
 
