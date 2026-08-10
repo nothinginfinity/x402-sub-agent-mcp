@@ -235,7 +235,7 @@ class MemoryStatement {
       }
       if (conflictEnd >= 0) {
         const suffix = this.sql.slice(conflictEnd + 1).trim();
-        const marker = ' DO UPDATE SET ';
+        const marker = 'DO UPDATE SET ';
         const markerIndex = suffix.indexOf(marker);
         if (markerIndex >= 0) {
           const beforeUpdate = suffix.slice(0, markerIndex).trim();
