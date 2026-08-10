@@ -306,7 +306,8 @@ function makeEnv() {
     OAUTH_LOGIN_PASSWORD: LOGIN_PASSWORD,
     MCP_AUTH_TOKEN: STATIC_TOKEN,
     WORKER_NAME: 'x402-test',
-    CIRCLE_API_KEY: 'test-circle-key',
+    AFO_X402: 'test-circle-key',
+    CIRCLE_ENTITY_SECRET: '00'.repeat(32),
     CIRCLE_WALLET_SET_ID: 'test-wallet-set'
   };
   const ts = nowIsoTest();
