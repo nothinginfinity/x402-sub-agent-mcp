@@ -90,6 +90,12 @@ class MemoryD1 {
     return new MemoryStatement(this, sql);
   }
 
+  async batch(statements) {
+    const results = [];
+    for (const statement of statements) results.push(await statement.run());
+    return results;
+  }
+
   async atomic(fn) {
     const previous = this.lock;
     let release;
