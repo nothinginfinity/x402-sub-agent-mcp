@@ -388,13 +388,17 @@ async function authorize(env, client, overrides = {}) {
   });
   if (overrides.grantAdmin) params.set('grant_admin', '1');
   const restoreCircle = stubCircleWallet(overrides.selectedWalletId || 'wallet-test');
-  const response = await request(env, '/authorize', {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: params,
-    redirect: 'manual'
-  });
-  restoreCircle();
+  let response;
+  try {
+    response = await request(env, '/authorize', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: params,
+      redirect: 'manual'
+    });
+  } finally {
+    restoreCircle();
+  }
   return { response, verifier, redirectUri };
 }
 
