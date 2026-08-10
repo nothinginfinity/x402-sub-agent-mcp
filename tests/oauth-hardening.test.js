@@ -239,6 +239,7 @@ class MemoryStatement {
         const markerMatch = /DO UPDATE SET\s+/i.exec(suffix);
         if (!markerMatch) throw new Error('Unsupported UPSERT suffix in test D1 mock: ' + suffix);
         const beforeUpdate = suffix.slice(0, markerMatch.index).trim();
+        if (beforeUpdate && !/^WHERE\s+/i.test(beforeUpdate)) throw new Error('Unsupported UPSERT conflict predicate in test D1 mock: ' + beforeUpdate);
         const conflictWhereText = /^WHERE\s+/i.test(beforeUpdate) ? beforeUpdate.replace(/^WHERE\s+/i, '') : null;
         const updateAndWhereText = suffix.slice(markerMatch.index + markerMatch[0].length);
         match = [this.sql, upsertPrefix[1], upsertPrefix[2], upsertPrefix[3], this.sql.slice(conflictStart, conflictEnd), conflictWhereText, updateAndWhereText];
