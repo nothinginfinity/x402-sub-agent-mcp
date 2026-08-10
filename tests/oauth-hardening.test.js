@@ -236,12 +236,12 @@ class MemoryStatement {
       if (conflictEnd < 0) throw new Error('Unbalanced UPSERT conflict target in test D1 mock: ' + this.sql);
       if (conflictEnd >= 0) {
         const suffix = this.sql.slice(conflictEnd + 1).trim();
-        const marker = 'DO UPDATE SET ';
-        const markerIndex = suffix.indexOf(marker);
+        const markerMatch = /DO UPDATE SET\s+/i.exec(suffix);
+        const markerIndex = markerMatch ? markerMatch.index : -1;
         if (markerIndex >= 0) {
           const beforeUpdate = suffix.slice(0, markerIndex).trim();
           const conflictWhereText = /^WHERE\s+/i.test(beforeUpdate) ? beforeUpdate.replace(/^WHERE\s+/i, '') : null;
-          const updateAndWhereText = suffix.slice(markerIndex + marker.length);
+          const updateAndWhereText = suffix.slice(markerIndex + markerMatch[0].length);
           match = [this.sql, upsertPrefix[1], upsertPrefix[2], upsertPrefix[3], this.sql.slice(conflictStart, conflictEnd), conflictWhereText, updateAndWhereText];
         }
       }
