@@ -245,6 +245,7 @@ class MemoryStatement {
         }
       }
     }
+    if (upsertPrefix && !match) throw new Error('Unsupported UPSERT syntax in test D1 mock: ' + this.sql);
     if (match) {
       const [, tableName, columnsText, valuesText, conflictText, conflictWhereText, updateAndWhereText] = match;
       const trailingWhereMatch = /\s+WHERE\s+(\w+\.\w+\s*=\s*excluded\.\w+)\s*$/i.exec(updateAndWhereText);
