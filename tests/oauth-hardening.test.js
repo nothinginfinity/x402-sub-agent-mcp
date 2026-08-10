@@ -216,9 +216,9 @@ class MemoryStatement {
   }
 
   async #mutate() {
-    let match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT\((.+\))(?=\s+(?:WHERE|DO UPDATE))\s*(?:WHERE (?:(?! DO UPDATE SET ).)+)?DO UPDATE SET (.+)$/i.exec(this.sql);
+    let match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT\((.+)\) (?:WHERE (.+?) )?DO UPDATE SET (.+)$/i.exec(this.sql);
     if (match) {
-      const [, tableName, columnsText, valuesText, conflictText, updateAndWhereText] = match;
+      const [, tableName, columnsText, valuesText, conflictText, conflictWhereText, updateAndWhereText] = match;
       const updateText = updateAndWhereText.replace(/\s+WHERE\s+.+$/i, '');
       const columns = splitCsv(columnsText);
       const values = splitCsv(valuesText);
