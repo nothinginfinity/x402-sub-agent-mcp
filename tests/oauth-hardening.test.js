@@ -271,6 +271,7 @@ class MemoryStatement {
         return { meta: { changes: 1 } };
       }
       if (updateWhereText && !/^\w+\.\w+\s*=\s*excluded\.\w+$/i.test(updateWhereText)) throw new Error('Unsupported UPSERT update predicate in test D1 mock: ' + updateWhereText);
+      if (/\s+WHERE\s+/i.test(updateText)) throw new Error('Unsupported UPSERT update predicate in test D1 mock: ' + updateText);
       for (const clause of splitCsv(updateText)) {
         const updateMatch = /^(\w+) = excluded\.(\w+)$/i.exec(clause);
         if (!updateMatch) throw new Error('Unsupported UPSERT setter in test D1 mock: ' + clause);
