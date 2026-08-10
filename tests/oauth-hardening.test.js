@@ -247,7 +247,7 @@ class MemoryStatement {
     }
     if (match) {
       const [, tableName, columnsText, valuesText, conflictText, conflictWhereText, updateAndWhereText] = match;
-      const updateText = updateAndWhereText.replace(/\s+WHERE\s+.+$/i, '');
+      const updateText = updateAndWhereText.replace(/\s+WHERE\s+\w+\.\w+\s*=\s*excluded\.\w+\s*$/i, '');
       const columns = splitCsv(columnsText);
       const values = splitCsv(valuesText);
       let paramIndex = 0;
