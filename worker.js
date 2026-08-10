@@ -3034,6 +3034,21 @@ async function handleTokenEndpoint(req, env) {
         const bindDb = requireDb(env);
         const bindTs = nowIso();
         const bindDisplay = 'oauth-agent-' + (bindKeys.family || bindKeys.discriminator.replace(/[^a-z0-9]+/gi, '').slice(0, 12));
+        const previousWalletId = clean(sessionRow.previous_wallet_id);
+        const isReplacement = !!previousWalletId && previousWalletId !== sessionRow.selected_wallet_id;
+        if (isReplacement && Number(sessionRow.replacement_confirmed) !== 1) {
+          await oauthAudit(env, 'wallet_reassignment_refused', { client_id: clientId, detail: 'replacement confirmation missing from authorization session' });
+          await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 409, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'denied', error: 'wallet_replacement_confirmation_required', metadata: { previous_wallet_id: previousWalletId, selected_wallet_id: sessionRow.selected_wallet_id } });
+          return j({ error: 'wallet_replacement_confirmation_required', error_description: 'wallet replacement was not explicitly confirmed' }, 409);
+        }
+        if (isReplacement) {
+          const liveAssignments = await dbAll(env, `SELECT wallet_id FROM agent_wallets WHERE agent_id = ? AND network = ? AND asset = 'USDC' AND status = 'active'`, [bindAgentId, bindNetwork]);
+          if (liveAssignments.length !== 1 || clean(liveAssignments[0].wallet_id) !== previousWalletId) {
+            await oauthAudit(env, 'wallet_reassignment_refused', { client_id: clientId, detail: 'current wallet changed after consent' });
+            await traceFromRequest(env, req, { event_type: 'token', client_id: clientId, grant_type: 'authorization_code', resource: codeRow.resource || null, http_status: 409, latency_ms: Date.now() - tkT0, authorization_code_hash: codeHash, outcome: 'denied', error: 'wallet_assignment_changed', metadata: { previous_wallet_id: previousWalletId, selected_wallet_id: sessionRow.selected_wallet_id } });
+            return j({ error: 'wallet_assignment_changed', error_description: 'current wallet assignment changed after consent; authorize again' }, 409);
+          }
+        }
         // Phase 4: a manually-entered wallet ID has no pre-existing workspace_wallets
         // row (checkManualWalletOwnership already refused the flow if one existed).
         // Insert it here, inside the SAME atomic batch as the Agent Context write, so
@@ -3043,8 +3058,14 @@ async function handleTokenEndpoint(req, env) {
           bindDb.prepare(`INSERT INTO workspace_wallets (workspace_wallet_id, workspace_id, provider, circle_wallet_id, wallet_address, network, asset, display_name, allocation_status, funding_status, created_at, updated_at) VALUES (?, ?, 'circle', ?, ?, ?, 'USDC', ?, 'assigned', 'unknown', ?, ?)`)
             .bind(uid('wsw'), sessionRow.workspace_id, sessionRow.selected_wallet_id, bindWalletAddress, bindNetwork, 'manual-' + sessionRow.selected_wallet_id.slice(0, 8), bindTs, bindTs)
         ];
+        const reassignmentStmts = isReplacement ? [
+          bindDb.prepare(`UPDATE agent_wallets SET status = 'archived', updated_at = ? WHERE agent_id = ? AND wallet_id = ? AND network = ? AND asset = 'USDC' AND status = 'active'`).bind(bindTs, bindAgentId, previousWalletId, bindNetwork),
+          bindDb.prepare(`UPDATE workspace_wallets SET allocation_status = 'archived', updated_at = ? WHERE workspace_id = ? AND circle_wallet_id = ? AND allocation_status = 'assigned'`).bind(bindTs, sessionRow.workspace_id, previousWalletId),
+        ] : [];
         const bindStmts = [
+          ...reassignmentStmts,
           ...walletAllocStmts,
+          bindDb.prepare(`UPDATE workspace_wallets SET allocation_status = 'assigned', updated_at = ? WHERE workspace_id = ? AND circle_wallet_id = ? AND allocation_status IN ('available','assigned')`).bind(bindTs, sessionRow.workspace_id, sessionRow.selected_wallet_id),
           ...buildAgentWalletStatements(bindDb, { agent_id: bindAgentId, display_name: bindDisplay, wallet_id: sessionRow.selected_wallet_id, wallet_address: bindWalletAddress, network: bindNetwork, asset: 'USDC', budget_atomic: decided.budget_atomic, transfer_max_atomic: decided.transfer_max_atomic }, bindTs),
           ...buildCredentialStatements(bindDb, { agent_id: bindAgentId, credential_type: 'oauth_subject_sha256', credential_key: bindKeys.credential_key, metadata_json: JSON.stringify({ family: bindKeys.family, client_id: clientId, discriminator: bindKeys.discriminator, source: 'oauth_consent' }) }, bindTs),
         ];
