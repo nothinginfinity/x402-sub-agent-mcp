@@ -233,6 +233,7 @@ class MemoryStatement {
         if (ch === '(') depth++;
         else if (ch === ')' && --depth === 0) { conflictEnd = i; break; }
       }
+      if (conflictEnd < 0) throw new Error('Unbalanced UPSERT conflict target in test D1 mock: ' + this.sql);
       if (conflictEnd >= 0) {
         const suffix = this.sql.slice(conflictEnd + 1).trim();
         const marker = 'DO UPDATE SET ';
