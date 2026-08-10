@@ -272,7 +272,7 @@ class MemoryStatement {
       if (conflictColumns.some(column => !/^\w+$/.test(column))) throw new Error('Unsupported UPSERT conflict target in test D1 mock: ' + conflictText);
       if (conflictWhereText && !/^\w+\s*=\s*'[^']*'$/i.test(conflictWhereText)) throw new Error('Unsupported UPSERT conflict predicate in test D1 mock: ' + conflictWhereText);
       const table = this.db.table(tableName);
-      const conflictPredicate = conflictWhereText ? /^([\w]+)\s*=\s*'([^']*)'$/i.exec(conflictWhereText) : null;
+      const conflictPredicate = conflictWhereText ? /^(\w+)\s*=\s*'([^']*)'$/i.exec(conflictWhereText) : null;
       const existing = table.find(candidate => conflictColumns.every(column => candidate[column] === row[column]) && (!conflictPredicate || String(candidate[conflictPredicate[1]]) === conflictPredicate[2]));
       if (!existing) {
         table.push(row);
