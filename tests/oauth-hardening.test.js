@@ -216,7 +216,7 @@ class MemoryStatement {
   }
 
   async #mutate() {
-    const upsertPrefix = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT\(/i.exec(this.sql);
+    const upsertPrefix = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT\s*\(/i.exec(this.sql);
     let match = null;
     if (upsertPrefix) {
       const conflictStart = upsertPrefix[0].length;
