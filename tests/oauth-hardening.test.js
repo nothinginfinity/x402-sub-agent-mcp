@@ -216,7 +216,29 @@ class MemoryStatement {
   }
 
   async #mutate() {
-    let match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT\((.+)\) (?:WHERE (.+?) )?DO UPDATE SET (.+)$/i.exec(this.sql);
+    const upsertPrefix = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT\(/i.exec(this.sql);
+    let match = null;
+    if (upsertPrefix) {
+      const conflictStart = upsertPrefix[0].length;
+      let depth = 1;
+      let quote = null;
+      let conflictEnd = -1;
+      for (let i = conflictStart; i < this.sql.length; i++) {
+        const ch = this.sql[i];
+        if (quote) {
+          if (ch === quote && this.sql[i - 1] !== '\\') quote = null;
+          continue;
+        }
+        if (ch === "'" || ch === '"') { quote = ch; continue; }
+        if (ch === '(') depth++;
+        else if (ch === ')' && --depth === 0) { conflictEnd = i; break; }
+      }
+      if (conflictEnd >= 0) {
+        const suffix = this.sql.slice(conflictEnd + 1).trim();
+        const suffixMatch = /^(?:WHERE (.+?) )?DO UPDATE SET (.+)$/i.exec(suffix);
+        if (suffixMatch) match = [this.sql, upsertPrefix[1], upsertPrefix[2], upsertPrefix[3], this.sql.slice(conflictStart, conflictEnd), suffixMatch[1] || null, suffixMatch[2]];
+      }
+    }
     if (match) {
       const [, tableName, columnsText, valuesText, conflictText, conflictWhereText, updateAndWhereText] = match;
       const updateText = updateAndWhereText.replace(/\s+WHERE\s+.+$/i, '');
