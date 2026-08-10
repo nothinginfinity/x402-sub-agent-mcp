@@ -253,6 +253,7 @@ class MemoryStatement {
       const updateWhereText = trailingWhereMatch ? trailingWhereMatch[1] : null;
       const columns = splitCsv(columnsText);
       const values = splitCsv(valuesText);
+      if (columns.length !== values.length) throw new Error('UPSERT column/value count mismatch in test D1 mock: ' + this.sql);
       let paramIndex = 0;
       const row = {};
       columns.forEach((column, index) => {
