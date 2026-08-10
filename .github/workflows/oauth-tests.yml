@@ -33,7 +33,9 @@ jobs:
       - name: OAuth integration tests
         id: oauth_tests
         continue-on-error: true
-        run: npm run test:oauth 2>&1 | tee oauth-test-output.txt
+        run: |
+          set -o pipefail
+          npm run test:oauth 2>&1 | tee oauth-test-output.txt
 
       - name: Publish OAuth test diagnostics
         if: steps.oauth_tests.outcome == 'failure'
