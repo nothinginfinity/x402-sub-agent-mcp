@@ -431,6 +431,18 @@ async function mcp(env, bearer, method, params = {}) {
   }));
 }
 
+test('Phase 5 worker contains explicit reassignment consent, race guard, and archival transition', async () => {
+  const fs = await import('node:fs/promises');
+  const source = await fs.readFile(new URL('../worker.js', import.meta.url), 'utf8');
+  assert.match(source, /confirm_wallet_replacement/);
+  assert.match(source, /previous_wallet_id, replacement_confirmed/);
+  assert.match(source, /wallet_replacement_confirmation_required/);
+  assert.match(source, /wallet_assignment_changed/);
+  assert.match(source, /UPDATE agent_wallets SET status = 'archived'/);
+  assert.match(source, /UPDATE workspace_wallets SET allocation_status = 'archived'/);
+  assert.match(source, /UPDATE workspace_wallets SET allocation_status = 'assigned'/);
+});
+
 test('authorization-server metadata publishes the protected resource list', async () => {
   const env = makeEnv();
   const { response, body } = await json(await request(env, '/.well-known/oauth-authorization-server'));
