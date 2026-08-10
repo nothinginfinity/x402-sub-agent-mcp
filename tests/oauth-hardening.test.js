@@ -319,7 +319,7 @@ function stubCircleWallet(walletId, address = '0x1111111111111111111111111111111
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async input => {
     const url = String(input);
-    if (url.includes('/developer/wallets/' + walletId)) {
+    if (url.includes('/wallets/' + walletId)) {
       return new Response(JSON.stringify({ data: { wallet: { id: walletId, address, blockchain } } }), {
         status: 200,
         headers: { 'content-type': 'application/json' }
