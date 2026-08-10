@@ -29,7 +29,26 @@ function clone(value) {
 }
 
 function splitCsv(value) {
-  return value.split(',').map(part => part.trim()).filter(Boolean);
+  const parts = [];
+  let start = 0;
+  let depth = 0;
+  let quote = null;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (quote) {
+      if (ch === quote && value[i - 1] !== '\\') quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    else if (ch === ',' && depth === 0) {
+      parts.push(value.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  parts.push(value.slice(start).trim());
+  return parts.filter(Boolean);
 }
 
 function compareValues(left, op, right) {
