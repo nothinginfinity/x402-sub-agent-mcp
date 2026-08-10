@@ -298,7 +298,7 @@ class MemoryStatement {
 }
 
 function makeEnv() {
-  return {
+  const env = {
     DB: new MemoryD1(),
     OAUTH_LOGIN_PASSWORD: LOGIN_PASSWORD,
     MCP_AUTH_TOKEN: STATIC_TOKEN,
@@ -306,6 +306,10 @@ function makeEnv() {
     CIRCLE_API_KEY: 'test-circle-key',
     CIRCLE_WALLET_SET_ID: 'test-wallet-set'
   };
+  const ts = nowIsoTest();
+  env.DB.table('workspaces').push({ workspace_id: 'workspace-test', owner_subject: 'operator', environment: 'testnet', status: 'active', created_at: ts, updated_at: ts });
+  env.DB.table('workspace_wallets').push({ workspace_wallet_id: 'ww-test', workspace_id: 'workspace-test', circle_wallet_id: 'wallet-test', display_name: 'Test Wallet', wallet_address: '0x1111111111111111111111111111111111111111', network: 'base-sepolia', allocation_status: 'available', created_at: ts, updated_at: ts });
+  return env;
 }
 
 function stubCircleWallet(walletId, address = '0x1111111111111111111111111111111111111111', blockchain = 'BASE-SEPOLIA') {
@@ -365,6 +369,10 @@ async function authorize(env, client, overrides = {}) {
   const scope = overrides.scope ?? 'wallet:read offline_access';
   const resource = overrides.resource ?? ORIGIN + '/mcp';
   const redirectUri = overrides.redirectUri || REDIRECT_URI;
+  const subject = (env.DB.table('oauth_subjects')[0] && env.DB.table('oauth_subjects')[0].subject) || 'operator';
+  if (!env.DB.table('oauth_subjects').length) env.DB.table('oauth_subjects').push({ subject, failed_attempts: 0, locked_until: null, created_at: nowIsoTest(), updated_at: nowIsoTest() });
+  const workspace = env.DB.table('workspaces')[0];
+  if (workspace) workspace.owner_subject = subject;
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: overrides.clientId || client.client_id,
@@ -374,15 +382,19 @@ async function authorize(env, client, overrides = {}) {
     code_challenge: challenge,
     code_challenge_method: overrides.challengeMethod || 'S256',
     resource,
-    password: overrides.password || LOGIN_PASSWORD
+    password: overrides.password || LOGIN_PASSWORD,
+    selected_wallet_id: overrides.selectedWalletId || 'wallet-test',
+    budget_usdc: overrides.budgetUsdc || '5.00'
   });
   if (overrides.grantAdmin) params.set('grant_admin', '1');
+  const restoreCircle = stubCircleWallet(overrides.selectedWalletId || 'wallet-test');
   const response = await request(env, '/authorize', {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: params,
     redirect: 'manual'
   });
+  restoreCircle();
   return { response, verifier, redirectUri };
 }
 
