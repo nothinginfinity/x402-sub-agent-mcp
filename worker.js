@@ -2589,6 +2589,16 @@ async function checkWalletOwnership(env, subject, selectedWalletId) {
 // (CIRCLE_WALLET_SET_ID), not any address that happens to resolve via Circle.
 // Rejects IDs already allocated in workspace_wallets -- that case belongs to
 // the dropdown path (checkWalletOwnership), not here.
+async function loadCurrentOauthAssignment(env, subject, client) {
+  const keys = await oauthIdentityKeys(subject, client);
+  const credentials = await dbAll(env, `SELECT agent_id FROM agent_credentials WHERE credential_type = 'oauth_subject_sha256' AND status = 'active' AND credential_key IN (?, ?)`, [keys.credential_key, keys.legacy_key]);
+  const agentIds = [...new Set(credentials.map(r => r.agent_id))];
+  if (agentIds.length !== 1) return { agent_id: null, wallet: null, ambiguous: agentIds.length > 1 };
+  const wallets = await dbAll(env, `SELECT * FROM agent_wallets WHERE agent_id = ? AND status = 'active' ORDER BY created_at DESC`, [agentIds[0]]);
+  if (wallets.length > 1) return { agent_id: agentIds[0], wallet: null, ambiguous: true };
+  return { agent_id: agentIds[0], wallet: wallets[0] || null, ambiguous: false };
+}
+
 async function checkManualWalletOwnership(env, subject, manualWalletId) {
   const walletId = clean(manualWalletId);
   if (!walletId) return { ok: false, reason: 'no_wallet_selected' };
@@ -2685,7 +2695,7 @@ function oauthAuthorizeErrorResponse(v, params) {
   return htmlResponse('<h1>Authorization error</h1><p>' + escapeHtml(v.error) + ': ' + escapeHtml(v.error_description) + '</p>', 400);
 }
 
-function renderLoginForm(params, client, errorMsg, inventory) {
+function renderLoginForm(params, client, errorMsg, inventory, currentAssignment) {
   const hidden = ['response_type', 'client_id', 'redirect_uri', 'scope', 'state', 'code_challenge', 'code_challenge_method', 'resource']
     .map(k => '<input type="hidden" name="' + k + '" value="' + escapeHtml(params[k] || '') + '">').join('\n    ');
   // V1.4.6 Phase 2: workspace wallet dropdown. Label = display_name, stored
@@ -2694,6 +2704,13 @@ function renderLoginForm(params, client, errorMsg, inventory) {
   const wallets = (inventory && inventory.wallets) || [];
   const walletOptions = wallets.length
     ? wallets.map(w => '<option value="' + escapeHtml(w.circle_wallet_id) + '">' + escapeHtml(w.display_name || w.circle_wallet_id) + '</option>').join('\n      ')
+    : '';
+  const currentWallet = currentAssignment && currentAssignment.wallet;
+  const currentAssignmentField = currentWallet
+    ? '<div class="scope" style="padding:10px;border:1px solid #ddd;margin:10px 0;"><b>Current assignment</b><br>' + escapeHtml(currentWallet.wallet_id) + '<br>' + escapeHtml(currentWallet.wallet_address || '') + '</div>'
+    : '';
+  const replacementField = currentWallet
+    ? '<label class="admin"><input type="checkbox" name="confirm_wallet_replacement" value="1"> I explicitly confirm replacing the current wallet if I select a different wallet.</label>'
     : '';
   const walletField = wallets.length
     ? '<label class="scope">Assign wallet<select name="selected_wallet_id" style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;">\n      <option value="">-- choose from workspace --</option>\n      ' + walletOptions + '\n    </select></label>\n    <label class="scope">Or enter a wallet ID manually<input type="text" name="manual_wallet_id" placeholder="Circle wallet ID" style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;"></label>'
@@ -2720,7 +2737,9 @@ function renderLoginForm(params, client, errorMsg, inventory) {
   ${errorMsg ? '<p class="err">' + escapeHtml(errorMsg) + '</p>' : ''}
   <form method="POST" action="/authorize">
     ${hidden}
+    ${currentAssignmentField}
     ${walletField}
+    ${replacementField}
     ${budgetField}
     <input type="password" name="password" placeholder="Password" autofocus required>
     <label class="admin"><input type="checkbox" name="grant_admin" value="1"> Also grant full admin access (mcp:admin — every tool, static-token equivalence)</label>
@@ -2777,6 +2796,11 @@ async function handleAuthorizePost(req, env, origin) {
   // enforced inside checkWalletOwnership.
   const selectedWalletId = clean(form.get('selected_wallet_id'));
   const manualWalletId = clean(form.get('manual_wallet_id'));
+  const currentAssignment = await loadCurrentOauthAssignment(env, subjectRow.subject, v.client);
+  if (currentAssignment.ambiguous) {
+    const failInventory = await loadWorkspaceInventory(env, subjectRow.subject);
+    return htmlResponse(renderLoginForm(params, v.client, 'Current Agent Context has an ambiguous active-wallet assignment; repair it before reauthorizing.', failInventory, currentAssignment), 409);
+  }
   if (selectedWalletId && manualWalletId) {
     const ambigInventory = await loadWorkspaceInventory(env, subjectRow.subject);
     await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 400, latency_ms: Date.now() - azT0, outcome: 'denied', error: 'wallet_ownership', metadata: { reason: 'ambiguous_selection' } });
@@ -2789,6 +2813,15 @@ async function handleAuthorizePost(req, env, origin) {
     const failInventory = await loadWorkspaceInventory(env, subjectRow.subject);
     await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 400, latency_ms: Date.now() - azT0, outcome: 'denied', error: 'wallet_ownership', metadata: { reason: ownership.reason } });
     return htmlResponse(renderLoginForm(params, v.client, 'Wallet selection could not be validated (' + ownership.reason + ').', failInventory), 400);
+  }
+
+  const previousWalletId = currentAssignment.wallet ? clean(currentAssignment.wallet.wallet_id) : '';
+  const isReplacement = !!previousWalletId && previousWalletId !== ownership.selected_wallet_id;
+  const replacementConfirmed = String(form.get('confirm_wallet_replacement') || '') === '1';
+  if (isReplacement && !replacementConfirmed) {
+    const failInventory = await loadWorkspaceInventory(env, subjectRow.subject);
+    await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 409, latency_ms: Date.now() - azT0, outcome: 'denied', error: 'wallet_replacement_confirmation_required', metadata: { reason: 'replacement_not_confirmed' } });
+    return htmlResponse(renderLoginForm(params, v.client, 'Selecting a different wallet requires explicit replacement confirmation.', failInventory, currentAssignment), 409);
   }
 
   // V1.4.6 Phase 3: parse the lifetime budget strictly (integer atomic units,
@@ -2834,9 +2867,9 @@ async function handleAuthorizePost(req, env, origin) {
     const sessionTs = nowIso();
     const sessionExpiresAt = new Date(nowMs + OAUTH_AUTHZ_SESSION_TTL_S * 1000).toISOString();
     await dbRun(env, `INSERT INTO oauth_authorization_sessions
-        (authorization_session_id, oauth_client_id, oauth_subject, workspace_id, selected_wallet_id, budget_atomic, allowed_network, ownership_validated, scopes, state, code_challenge, code_challenge_method, redirect_uri, resource, auth_code, status, expires_at, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,'authorized',?,?,?)`,
-      [uid('azs'), v.client.client_id, subjectRow.subject, ownership.workspace_id, ownership.selected_wallet_id, budgetAtomicChosen, ownership.network,
+        (authorization_session_id, oauth_client_id, oauth_subject, workspace_id, selected_wallet_id, previous_wallet_id, replacement_confirmed, budget_atomic, allowed_network, ownership_validated, scopes, state, code_challenge, code_challenge_method, redirect_uri, resource, auth_code, status, expires_at, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,'authorized',?,?,?)`,
+      [uid('azs'), v.client.client_id, subjectRow.subject, ownership.workspace_id, ownership.selected_wallet_id, previousWalletId || null, isReplacement && replacementConfirmed ? 1 : 0, budgetAtomicChosen, ownership.network,
         JSON.stringify(grantedScopes), params.state || null,
         params.code_challenge, params.code_challenge_method, params.redirect_uri, v.resource || null, codeHash,
         sessionExpiresAt, sessionTs, sessionTs]);
@@ -3281,7 +3314,8 @@ export default {
         // V1.4.6 Phase 2: load the operator's workspace inventory for the wallet dropdown.
         const getInvSubject = await getOrCreateSubject(env);
         const getInventory = await loadWorkspaceInventory(env, getInvSubject.subject);
-        return htmlResponse(renderLoginForm(params, v.client, null, getInventory));
+        const getCurrentAssignment = await loadCurrentOauthAssignment(env, getInvSubject.subject, v.client);
+        return htmlResponse(renderLoginForm(params, v.client, null, getInventory, getCurrentAssignment));
       }
       if (url.pathname === '/authorize' && req.method === 'POST') {
         return handleAuthorizePost(req, env, url.origin);
