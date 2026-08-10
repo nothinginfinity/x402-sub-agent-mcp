@@ -2583,6 +2583,37 @@ async function checkWalletOwnership(env, subject, selectedWalletId) {
   return { ok: true, workspace_id: ws.workspace_id, selected_wallet_id: walletId, network: clean(row.network).toLowerCase() };
 }
 
+// V1.4.6 Phase 4: advanced manual wallet-ID entry. Option A ownership gate --
+// a wallet ID is an identifier, not a secret, so "ownership" for a manually
+// typed ID means it belongs to a Circle wallet_set this deployment controls
+// (CIRCLE_WALLET_SET_ID), not any address that happens to resolve via Circle.
+// Rejects IDs already allocated in workspace_wallets -- that case belongs to
+// the dropdown path (checkWalletOwnership), not here.
+async function checkManualWalletOwnership(env, subject, manualWalletId) {
+  const walletId = clean(manualWalletId);
+  if (!walletId) return { ok: false, reason: 'no_wallet_selected' };
+  const ws = await dbFirst(env, `SELECT workspace_id, environment FROM workspaces WHERE owner_subject = ? AND status = 'active' ORDER BY created_at ASC`, [subject]);
+  if (!ws) return { ok: false, reason: 'no_workspace' };
+  const existing = await dbFirst(env, `SELECT workspace_wallet_id FROM workspace_wallets WHERE circle_wallet_id = ?`, [walletId]);
+  if (existing) return { ok: false, reason: 'wallet_already_allocated' };
+  let circleWallet;
+  try {
+    circleWallet = await circleGetWallet(env, walletId);
+  } catch (e) {
+    return { ok: false, reason: 'circle_wallet_unresolved' };
+  }
+  const allowedSets = (env.CIRCLE_WALLET_SET_ID || '').split(',').map(s => clean(s)).filter(Boolean);
+  if (!allowedSets.length || !allowedSets.includes(clean(circleWallet.walletSetId))) {
+    return { ok: false, reason: 'wallet_set_not_allowed' };
+  }
+  const network = clean(circleWallet.blockchain).toLowerCase();
+  const allowedNetworks = ENVIRONMENT_NETWORKS[ws.environment] || [];
+  if (!allowedNetworks.includes(network)) {
+    return { ok: false, reason: 'network_not_allowed_for_environment' };
+  }
+  return { ok: true, workspace_id: ws.workspace_id, selected_wallet_id: walletId, network, manual: true };
+}
+
 // ---- /authorize request validation ----
 function loadOauthRequestParams(url) {
   const p = url.searchParams;
@@ -2665,8 +2696,8 @@ function renderLoginForm(params, client, errorMsg, inventory) {
     ? wallets.map(w => '<option value="' + escapeHtml(w.circle_wallet_id) + '">' + escapeHtml(w.display_name || w.circle_wallet_id) + '</option>').join('\n      ')
     : '';
   const walletField = wallets.length
-    ? '<label class="scope">Assign wallet<select name="selected_wallet_id" required style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;">\n      ' + walletOptions + '\n    </select></label>'
-    : '<p class="err">No wallets available in your workspace to assign.</p>';
+    ? '<label class="scope">Assign wallet<select name="selected_wallet_id" style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;">\n      <option value="">-- choose from workspace --</option>\n      ' + walletOptions + '\n    </select></label>\n    <label class="scope">Or enter a wallet ID manually<input type="text" name="manual_wallet_id" placeholder="Circle wallet ID" style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;"></label>'
+    : '<label class="scope">Enter a wallet ID manually<input type="text" name="manual_wallet_id" placeholder="Circle wallet ID" required style="width:100%;padding:10px;font-size:16px;margin:10px 0;box-sizing:border-box;"></label>';
   // V1.4.6 Phase 3: lifetime budget (cumulative authority). Per-transfer cap is
   // derived server-side (min 0.50 USDC, lifetime); not a second input here.
   // Default 5.00, max 50.00 (testnet). Re-consent may lower but never raise the
@@ -2745,7 +2776,15 @@ async function handleAuthorizePost(req, env, origin) {
   // authoritative for allocation; Circle for existence/address; env->network is
   // enforced inside checkWalletOwnership.
   const selectedWalletId = clean(form.get('selected_wallet_id'));
-  const ownership = await checkWalletOwnership(env, subjectRow.subject, selectedWalletId);
+  const manualWalletId = clean(form.get('manual_wallet_id'));
+  if (selectedWalletId && manualWalletId) {
+    const ambigInventory = await loadWorkspaceInventory(env, subjectRow.subject);
+    await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 400, latency_ms: Date.now() - azT0, outcome: 'denied', error: 'wallet_ownership', metadata: { reason: 'ambiguous_selection' } });
+    return htmlResponse(renderLoginForm(params, v.client, 'Choose either the dropdown or manual entry, not both.', ambigInventory), 400);
+  }
+  const ownership = manualWalletId
+    ? await checkManualWalletOwnership(env, subjectRow.subject, manualWalletId)
+    : await checkWalletOwnership(env, subjectRow.subject, selectedWalletId);
   if (!ownership.ok) {
     const failInventory = await loadWorkspaceInventory(env, subjectRow.subject);
     await traceFromRequest(env, req, { event_type: 'login_fail', client_id: v.client.client_id, resource: v.resource || null, http_status: 400, latency_ms: Date.now() - azT0, outcome: 'denied', error: 'wallet_ownership', metadata: { reason: ownership.reason } });
@@ -2962,7 +3001,17 @@ async function handleTokenEndpoint(req, env) {
         const bindDb = requireDb(env);
         const bindTs = nowIso();
         const bindDisplay = 'oauth-agent-' + (bindKeys.family || bindKeys.discriminator.replace(/[^a-z0-9]+/gi, '').slice(0, 12));
+        // Phase 4: a manually-entered wallet ID has no pre-existing workspace_wallets
+        // row (checkManualWalletOwnership already refused the flow if one existed).
+        // Insert it here, inside the SAME atomic batch as the Agent Context write, so
+        // the allocation only persists if the whole bind succeeds -- fail-closed.
+        const existingWalletRow = await dbFirst(env, `SELECT workspace_wallet_id FROM workspace_wallets WHERE circle_wallet_id = ?`, [sessionRow.selected_wallet_id]);
+        const walletAllocStmts = existingWalletRow ? [] : [
+          bindDb.prepare(`INSERT INTO workspace_wallets (workspace_wallet_id, workspace_id, provider, circle_wallet_id, wallet_address, network, asset, display_name, allocation_status, funding_status, created_at, updated_at) VALUES (?, ?, 'circle', ?, ?, ?, 'USDC', ?, 'assigned', 'unknown', ?, ?)`)
+            .bind(uid('wsw'), sessionRow.workspace_id, sessionRow.selected_wallet_id, bindWalletAddress, bindNetwork, 'manual-' + sessionRow.selected_wallet_id.slice(0, 8), bindTs, bindTs)
+        ];
         const bindStmts = [
+          ...walletAllocStmts,
           ...buildAgentWalletStatements(bindDb, { agent_id: bindAgentId, display_name: bindDisplay, wallet_id: sessionRow.selected_wallet_id, wallet_address: bindWalletAddress, network: bindNetwork, asset: 'USDC', budget_atomic: decided.budget_atomic, transfer_max_atomic: decided.transfer_max_atomic }, bindTs),
           ...buildCredentialStatements(bindDb, { agent_id: bindAgentId, credential_type: 'oauth_subject_sha256', credential_key: bindKeys.credential_key, metadata_json: JSON.stringify({ family: bindKeys.family, client_id: clientId, discriminator: bindKeys.discriminator, source: 'oauth_consent' }) }, bindTs),
         ];
