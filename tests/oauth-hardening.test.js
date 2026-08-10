@@ -235,8 +235,14 @@ class MemoryStatement {
       }
       if (conflictEnd >= 0) {
         const suffix = this.sql.slice(conflictEnd + 1).trim();
-        const suffixMatch = /^(?:WHERE (.+?) )?DO UPDATE SET (.+)$/i.exec(suffix);
-        if (suffixMatch) match = [this.sql, upsertPrefix[1], upsertPrefix[2], upsertPrefix[3], this.sql.slice(conflictStart, conflictEnd), suffixMatch[1] || null, suffixMatch[2]];
+        const marker = ' DO UPDATE SET ';
+        const markerIndex = suffix.indexOf(marker);
+        if (markerIndex >= 0) {
+          const beforeUpdate = suffix.slice(0, markerIndex).trim();
+          const conflictWhereText = /^WHERE\s+/i.test(beforeUpdate) ? beforeUpdate.replace(/^WHERE\s+/i, '') : null;
+          const updateAndWhereText = suffix.slice(markerIndex + marker.length);
+          match = [this.sql, upsertPrefix[1], upsertPrefix[2], upsertPrefix[3], this.sql.slice(conflictStart, conflictEnd), conflictWhereText, updateAndWhereText];
+        }
       }
     }
     if (match) {
