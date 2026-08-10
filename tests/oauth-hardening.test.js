@@ -186,7 +186,7 @@ class MemoryStatement {
   }
 
   async #mutate() {
-    let match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT \((.+?)\) DO UPDATE SET (.+)$/i.exec(this.sql);
+    let match = /^INSERT INTO (\w+) \((.+?)\) VALUES \((.+?)\) ON CONFLICT \((.+?)\)(?: WHERE .+?)? DO UPDATE SET (.+?)(?: WHERE .+)?$/i.exec(this.sql);
     if (match) {
       const [, tableName, columnsText, valuesText, conflictText, updateText] = match;
       const columns = splitCsv(columnsText);
@@ -201,7 +201,7 @@ class MemoryStatement {
         else if (/^\d+$/.test(token)) row[column] = Number(token);
         else throw new Error('Unsupported UPSERT value in test D1 mock: ' + token);
       });
-      const conflictColumns = splitCsv(conflictText);
+      const conflictColumns = splitCsv(conflictText).map(column => column.replace(/^COALESCE\((\w+),\s*'[^']*'\)$/i, '$1'));
       const table = this.db.table(tableName);
       const existing = table.find(candidate => conflictColumns.every(column => candidate[column] === row[column]));
       if (!existing) {
