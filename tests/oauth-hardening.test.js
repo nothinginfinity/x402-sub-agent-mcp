@@ -138,6 +138,14 @@ class MemoryStatement {
       return [{ ...clone(token), client_name: client?.client_name || null }];
     }
 
+    const agentCredentialJoinMatch = /^SELECT ac\.agent_id FROM agent_credentials ac JOIN agents ag ON ag\.agent_id = ac\.agent_id WHERE ac\.credential_type = 'bearer_token' AND ac\.credential_key = \? AND ac\.status = 'active' AND ag\.status = 'active'$/i.exec(this.sql);
+    if (agentCredentialJoinMatch) {
+      const credential = this.db.table('agent_credentials').find(row => row.credential_type === 'bearer_token' && row.credential_key === this.params[0] && row.status === 'active');
+      if (!credential) return [];
+      const agent = this.db.table('agents').find(row => row.agent_id === credential.agent_id && row.status === 'active');
+      return agent ? [{ agent_id: credential.agent_id }] : [];
+    }
+
     const match = /^SELECT (.+?) FROM (\w+)(?: WHERE (.+?))?(?: ORDER BY .+?)?(?: LIMIT (\?|\d+))?$/i.exec(this.sql);
     if (!match) throw new Error('Unsupported SELECT in test D1 mock: ' + this.sql);
     const [, select, tableName, whereClause, limitToken] = match;
@@ -255,6 +263,8 @@ class MemoryStatement {
         if (m) return { column: m[1], value: this.params[paramIndex++] };
         m = /^(\w+) = (\d+)$/.exec(clause);
         if (m) return { column: m[1], value: Number(m[2]) };
+        m = /^(\w+) = '([^']*)'$/.exec(clause);
+        if (m) return { column: m[1], value: m[2] };
         m = /^(\w+) = NULL$/i.exec(clause);
         if (m) return { column: m[1], value: null };
         m = /^(\w+) = \1 \+ 1$/.exec(clause);
