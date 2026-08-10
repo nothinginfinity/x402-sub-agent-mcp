@@ -2053,14 +2053,12 @@ function authErrorPayload(env) {
 // access token issued by this Worker's own minimal authorization server.
 //
 // Scope model (deliberately narrow):
-//   wallet:read              -> subagent_status, circle_list_wallet_sets,
-//                                circle_list_wallets, circle_get_wallet_balance,
-//                                circle_get_transaction.
-//   wallet:transfer:testnet  -> defined in the token model, wired to NO tool
-//                                this stage. circle_gasless_transfer and every
-//                                other tool stay OAuth-unreachable; they remain
-//                                reachable only via the existing static
-//                                MCP_AUTH_TOKEN path (Claude, driven by Jared).
+//   wallet:read              -> subagent_status, resolve_agent_context,
+//                                circle_list_wallet_sets, circle_list_wallets,
+//                                circle_get_wallet_balance, circle_get_transaction.
+//   wallet:transfer:testnet  -> circle_gasless_transfer only. Agent Context,
+//                                permission, budget, and network enforcement
+//                                remain authoritative inside the tool.
 //
 // One-time state (authorization codes, refresh-token families, revocations)
 // lives in D1, never KV, for real transactional guarantees. Tokens are
@@ -2078,11 +2076,11 @@ const OAUTH_LOGIN_LOCKOUT_SECONDS = 15 * 60;
 const OAUTH_ADMIN_SCOPE = 'mcp:admin'; // static-token equivalence; grantable ONLY via the consent-page checkbox, never by client request
 const OAUTH_SCOPES_SUPPORTED = ['wallet:read', 'wallet:transfer:testnet', 'offline_access', OAUTH_ADMIN_SCOPE];
 
-// wallet:read is wired to exactly these 5 read-only tools. wallet:transfer:testnet
-// is intentionally mapped to an EMPTY list this stage.
+// OAuth scopes gate tool invocation only. Agent Context remains authoritative
+// for identity, wallet assignment, permissions, budgets, and network policy.
 const OAUTH_SCOPE_TOOLS = {
-  'wallet:read': ['subagent_status', 'circle_list_wallet_sets', 'circle_list_wallets', 'circle_get_wallet_balance', 'circle_get_transaction'],
-  'wallet:transfer:testnet': []
+  'wallet:read': ['subagent_status', 'resolve_agent_context', 'circle_list_wallet_sets', 'circle_list_wallets', 'circle_get_wallet_balance', 'circle_get_transaction'],
+  'wallet:transfer:testnet': ['circle_gasless_transfer']
 };
 
 function oauthToolAllowedForScopes(toolName, grantedScopes) {
