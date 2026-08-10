@@ -261,6 +261,7 @@ class MemoryStatement {
         else throw new Error('Unsupported UPSERT value in test D1 mock: ' + token);
       });
       const conflictColumns = splitCsv(conflictText).map(column => column.replace(/^COALESCE\((\w+),\s*'[^']*'\)$/i, '$1'));
+      if (conflictColumns.some(column => !/^\w+$/.test(column))) throw new Error('Unsupported UPSERT conflict target in test D1 mock: ' + conflictText);
       const table = this.db.table(tableName);
       const existing = table.find(candidate => conflictColumns.every(column => candidate[column] === row[column]));
       if (!existing) {
