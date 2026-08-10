@@ -2591,8 +2591,9 @@ async function checkWalletOwnership(env, subject, selectedWalletId) {
 // the dropdown path (checkWalletOwnership), not here.
 async function loadCurrentOauthAssignment(env, subject, client) {
   const keys = await oauthIdentityKeys(subject, client);
-  const credentials = await dbAll(env, `SELECT agent_id FROM agent_credentials WHERE credential_type = 'oauth_subject_sha256' AND status = 'active' AND credential_key IN (?, ?)`, [keys.credential_key, keys.legacy_key]);
-  const agentIds = [...new Set(credentials.map(r => r.agent_id))];
+  const primaryCredentials = await dbAll(env, `SELECT agent_id FROM agent_credentials WHERE credential_type = 'oauth_subject_sha256' AND status = 'active' AND credential_key = ?`, [keys.credential_key]);
+  const legacyCredentials = keys.legacy_key === keys.credential_key ? [] : await dbAll(env, `SELECT agent_id FROM agent_credentials WHERE credential_type = 'oauth_subject_sha256' AND status = 'active' AND credential_key = ?`, [keys.legacy_key]);
+  const agentIds = [...new Set([...primaryCredentials, ...legacyCredentials].map(r => r.agent_id))];
   if (agentIds.length !== 1) return { agent_id: null, wallet: null, ambiguous: agentIds.length > 1 };
   const wallets = await dbAll(env, `SELECT * FROM agent_wallets WHERE agent_id = ? AND status = 'active' ORDER BY created_at DESC`, [agentIds[0]]);
   if (wallets.length > 1) return { agent_id: agentIds[0], wallet: null, ambiguous: true };
