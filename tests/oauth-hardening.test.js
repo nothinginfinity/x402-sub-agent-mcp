@@ -247,7 +247,9 @@ class MemoryStatement {
     }
     if (match) {
       const [, tableName, columnsText, valuesText, conflictText, conflictWhereText, updateAndWhereText] = match;
-      const updateText = updateAndWhereText.replace(/\s+WHERE\s+\w+\.\w+\s*=\s*excluded\.\w+\s*$/i, '');
+      const trailingWhereMatch = /\s+WHERE\s+(.+)$/i.exec(updateAndWhereText);
+      const updateText = trailingWhereMatch ? updateAndWhereText.slice(0, trailingWhereMatch.index) : updateAndWhereText;
+      const updateWhereText = trailingWhereMatch ? trailingWhereMatch[1] : null;
       const columns = splitCsv(columnsText);
       const values = splitCsv(valuesText);
       let paramIndex = 0;
@@ -268,6 +270,7 @@ class MemoryStatement {
         table.push(row);
         return { meta: { changes: 1 } };
       }
+      if (updateWhereText && !/^\w+\.\w+\s*=\s*excluded\.\w+$/i.test(updateWhereText)) throw new Error('Unsupported UPSERT update predicate in test D1 mock: ' + updateWhereText);
       for (const clause of splitCsv(updateText)) {
         const updateMatch = /^(\w+) = excluded\.(\w+)$/i.exec(clause);
         if (!updateMatch) throw new Error('Unsupported UPSERT setter in test D1 mock: ' + clause);
