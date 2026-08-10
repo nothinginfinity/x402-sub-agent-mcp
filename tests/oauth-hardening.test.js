@@ -245,6 +245,7 @@ class MemoryStatement {
         match = [this.sql, upsertPrefix[1], upsertPrefix[2], upsertPrefix[3], this.sql.slice(conflictStart, conflictEnd), conflictWhereText, updateAndWhereText];
       }
     }
+    if (/^INSERT\s+INTO\b/i.test(this.sql) && /\bON\s+CONFLICT\b/i.test(this.sql) && !upsertPrefix) throw new Error('Unsupported UPSERT prefix in test D1 mock: ' + this.sql);
     if (upsertPrefix && !match) throw new Error('Unsupported UPSERT syntax in test D1 mock: ' + this.sql);
     if (match) {
       const [, tableName, columnsText, valuesText, conflictText, conflictWhereText, updateAndWhereText] = match;
