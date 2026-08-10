@@ -152,6 +152,8 @@ class MemoryStatement {
       if (m) return { column: m[1], op: m[2], value: this.params[whereParamIndex++] };
       m = /^(\w+) IS NOT NULL$/i.exec(clause);
       if (m) return { column: m[1], op: 'notnull' };
+      m = /^(\w+) IN \((.+)\)$/i.exec(clause);
+      if (m) return { column: m[1], op: 'in', values: splitCsv(m[2]).map(value => value.replace(/^'|'$/g, '')) };
       throw new Error('Unsupported WHERE clause in test D1 mock: ' + clause);
     }) : [];
     let rows = this.db.table(tableName).filter(row => predicates.every(p => {
@@ -161,6 +163,7 @@ class MemoryStatement {
         case '=str': return String(row[p.column]) === p.value;
         case '!=str': return row[p.column] !== p.value;
         case 'notnull': return row[p.column] != null;
+        case 'in': return p.values.includes(String(row[p.column]));
         case '>=': case '<=': case '<': case '>': return compareValues(row[p.column], p.op, p.value);
         default: return false;
       }
