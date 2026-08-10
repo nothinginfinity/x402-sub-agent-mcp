@@ -263,7 +263,10 @@ class MemoryStatement {
         else if (/^\d+$/.test(token)) row[column] = Number(token);
         else throw new Error('Unsupported UPSERT value in test D1 mock: ' + token);
       });
-      const conflictColumns = splitCsv(conflictText).map(column => column.replace(/^COALESCE\((\w+),\s*'[^']*'\)$/i, '$1'));
+      const conflictColumns = splitCsv(conflictText).map(column => {
+        const coalesce = /^COALESCE\((\w+),\s*'[^']*'\)$/i.exec(column);
+        return coalesce ? coalesce[1] : column;
+      });
       if (conflictColumns.some(column => !/^\w+$/.test(column))) throw new Error('Unsupported UPSERT conflict target in test D1 mock: ' + conflictText);
       if (conflictWhereText && !/^\w+\s*=\s*'[^']*'$/i.test(conflictWhereText)) throw new Error('Unsupported UPSERT conflict predicate in test D1 mock: ' + conflictWhereText);
       const table = this.db.table(tableName);
