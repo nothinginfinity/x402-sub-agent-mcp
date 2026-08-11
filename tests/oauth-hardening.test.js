@@ -189,7 +189,16 @@ class MemoryStatement {
       m = /^(\w+) IS NOT NULL$/i.exec(clause);
       if (m) return { column: m[1], op: 'notnull' };
       m = /^(\w+) IN \((.+)\)$/i.exec(clause);
-      if (m) return { column: m[1], op: 'in', values: splitCsv(m[2]).map(value => value.replace(/^'|'$/g, '')) };
+      if (m) {
+        const values = splitCsv(m[2]).map(token => {
+          if (token === '?') return this.params[whereParamIndex++];
+          const quoted = /^'([^']*)'$/.exec(token);
+          if (quoted) return quoted[1];
+          if (/^\d+$/.test(token)) return Number(token);
+          throw new Error('Unsupported IN value in test D1 mock: ' + token);
+        });
+        return { column: m[1], op: 'in', values };
+      }
       throw new Error('Unsupported WHERE clause in test D1 mock: ' + clause);
     }) : [];
     let rows = this.db.table(tableName).filter(row => predicates.every(p => {
@@ -199,7 +208,7 @@ class MemoryStatement {
         case '=str': return String(row[p.column]) === p.value;
         case '!=str': return row[p.column] !== p.value;
         case 'notnull': return row[p.column] != null;
-        case 'in': return p.values.includes(String(row[p.column]));
+        case 'in': return p.values.some(value => String(value) === String(row[p.column]));
         case '>=': case '<=': case '<': case '>': return compareValues(row[p.column], p.op, p.value);
         default: return false;
       }
@@ -346,11 +355,15 @@ class MemoryStatement {
         if (m) return { column: m[1], op: '=', value: Number(m[2]) };
         m = /^(\w+) = '([^']*)'$/.exec(clause);
         if (m) return { column: m[1], op: '=', value: m[2] };
+        m = /^(\w+) IN \((.+)\)$/i.exec(clause);
+        if (m) return { column: m[1], op: 'in', values: splitCsv(m[2]).map(value => value.replace(/^'|'$/g, '')) };
         throw new Error('Unsupported UPDATE predicate in test D1 mock: ' + clause);
       });
       let changes = 0;
       for (const row of this.db.table(tableName)) {
-        if (!whereClauses.every(condition => row[condition.column] === condition.value)) continue;
+        if (!whereClauses.every(condition => condition.op === 'in'
+          ? condition.values.includes(String(row[condition.column]))
+          : row[condition.column] === condition.value)) continue;
         for (const setter of setters) {
           if (setter.increment) row[setter.column] = Number(row[setter.column] || 0) + setter.increment;
           else row[setter.column] = setter.value;
