@@ -960,16 +960,16 @@ test('resolve_agent_context appears in tools/list', async () => {
   assert.ok(result.body.result.tools.some(tool => tool.name === 'resolve_agent_context'));
 });
 
-test('wallet:read OAuth subject resolves to an agent through MCP without mcp:admin', async () => {
+test('wallet:read OAuth subject resolves to its token-time Agent Context binding without mcp:admin', async () => {
   const env = makeEnv();
   const client = await registerClient(env, { client_name: 'ChatGPT' });
   const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
   const issued = await exchangeCode(env, client, grant);
-  const subject = env.DB.table('oauth_access_tokens')[0].subject;
-  seedAgentContext(env, { subject });
+  const boundCredential = env.DB.table('agent_credentials').find(row => row.credential_type === 'oauth_subject_sha256' && row.status === 'active');
+  assert.ok(boundCredential, 'token exchange should establish an OAuth Agent Context credential');
   const result = await mcp(env, issued.body.access_token, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
   assert.equal(result.response.status, 200);
-  assert.equal(toolPayload(result).agent_id, 'agent-1');
+  assert.equal(toolPayload(result).agent_id, boundCredential.agent_id);
 });
 
 test('wallet:read alone cannot invoke circle_gasless_transfer', async () => {
@@ -981,14 +981,14 @@ test('wallet:read alone cannot invoke circle_gasless_transfer', async () => {
   assert.equal(denied.response.status, 403);
 });
 
-test('wallet:transfer:testnet reaches Agent Context enforcement for circle_gasless_transfer', async () => {
+test('wallet:transfer:testnet reaches Agent Context permission enforcement for circle_gasless_transfer', async () => {
   const env = makeEnv();
   const client = await registerClient(env, { client_name: 'ChatGPT' });
   const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:transfer:testnet offline_access' });
   const issued = await exchangeCode(env, client, grant);
-  const result = await mcp(env, issued.body.access_token, 'tools/call', { name: 'circle_gasless_transfer', arguments: { destination_address: '0x2222222222222222222222222222222222222222', amount: '0.000001', blockchain: 'BASE-SEPOLIA' } });
+  const result = await mcp(env, issued.body.access_token, 'tools/call', { name: 'circle_gasless_transfer', arguments: { destination_address: '0x2222222222222222222222222222222222222222', amount: '0.500001', blockchain: 'BASE-SEPOLIA' } });
   assert.equal(result.response.status, 200);
-  assert.equal(toolPayload(result).error_code, 'unknown_agent');
+  assert.equal(toolPayload(result).error_code, 'permission_denied');
 });
 
 test('wallet:transfer:testnet does not expose admin tools and mcp:admin still does', async () => {
