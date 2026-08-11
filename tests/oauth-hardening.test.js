@@ -509,7 +509,7 @@ async function issueAuthorizationCode(env, client, overrides = {}) {
   assert.equal(result.response.status, 302);
   const location = new URL(result.response.headers.get('location'));
   assert.equal(location.origin + location.pathname, REDIRECT_URI);
-  return { code: location.searchParams.get('code'), verifier: result.verifier, redirectUri: result.redirectUri };
+  return { code: location.searchParams.get('code'), verifier: result.verifier, redirectUri: result.redirectUri, selectedWalletId: overrides.selectedWalletId || 'wallet-test' };
 }
 
 async function exchangeCode(env, client, grant, overrides = {}) {
@@ -521,11 +521,16 @@ async function exchangeCode(env, client, grant, overrides = {}) {
     code_verifier: overrides.verifier || grant.verifier
   });
   if (overrides.clientSecret) body.set('client_secret', overrides.clientSecret);
-  return json(await request(env, '/token', {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body
-  }));
+  const restoreCircle = stubCircleWallet(grant.selectedWalletId || 'wallet-test');
+  try {
+    return json(await request(env, '/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body
+    }));
+  } finally {
+    restoreCircle();
+  }
 }
 
 async function refresh(env, client, token, overrides = {}) {
