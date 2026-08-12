@@ -656,6 +656,119 @@ async function resolveAgentWalletInternal(env, a, authContext) {
   return result;
 }
 
+// ---- U1 shared authoritative fleet projection ---------------------------------
+// Internal/service-scoped and secret-free. This is a read projection over Agent Context
+// authority, not a new wallet authority. It deliberately never reads agent_credentials.
+async function internalGetAgentFleet(env, a, authContext) {
+  const isStaticService = authContext && authContext.ok && authContext.mode === 'static';
+  const isOauthAdmin = authContext && authContext.ok && authContext.mode === 'oauth' && (authContext.scope || []).includes(OAUTH_ADMIN_SCOPE);
+  if (!isStaticService && !isOauthAdmin) {
+    return agentContextError('permission_denied', 'static service token or OAuth mcp:admin authentication is required');
+  }
+  const network = (clean(a.network) || DEFAULT_CIRCLE_BLOCKCHAIN).toLowerCase();
+  const asset = (clean(a.asset) || 'USDC').toUpperCase();
+  const includeArchived = a.include_archived !== false;
+  const generatedAt = nowIso();
+
+  const agents = await dbAll(env, 'SELECT * FROM agents');
+  const walletRows = await dbAll(env, 'SELECT * FROM agent_wallets WHERE network = ? AND asset = ?', [network, asset]);
+  const permissionRows = await dbAll(env, 'SELECT * FROM agent_permissions WHERE network = ? AND asset = ?', [network, asset]);
+  const budgetRows = await dbAll(env, 'SELECT * FROM agent_budgets WHERE network = ? AND asset = ?', [network, asset]);
+  const callerBindings = await dbAll(env, "SELECT * FROM agent_caller_bindings WHERE status = 'active'");
+  let workspaceWalletRows = [];
+  try { workspaceWalletRows = await dbAll(env, 'SELECT * FROM workspace_wallets WHERE network = ?', [network]); } catch (_) { workspaceWalletRows = []; }
+  const workspaceByWalletId = new Map(workspaceWalletRows.map(row => [clean(row.circle_wallet_id), row]));
+
+  const wallets = walletRows
+    .filter(row => includeArchived || row.status === 'active')
+    .map(row => {
+      const workspace = workspaceByWalletId.get(clean(row.wallet_id)) || null;
+      return {
+        wallet_id: row.wallet_id,
+        address: row.wallet_address,
+        network: row.network,
+        asset: row.asset,
+        provider: 'circle',
+        lifecycle_status: row.status === 'active' ? 'current' : 'archived',
+        assignment_status: row.status,
+        assigned_agent_id: row.agent_id,
+        alias: workspace && clean(workspace.display_name) || null,
+        role: workspace && clean(workspace.allocation_status) || null,
+        created_at: row.created_at || null,
+        updated_at: row.updated_at || null,
+        freshness: { state: 'verified', observed_at: generatedAt, source: 'x402-sub-agent-mcp:agent_wallets' },
+        evidence: { source: 'agent_context', source_record_id: row.id || row.wallet_id, authoritative: true }
+      };
+    });
+
+  const agentViews = agents.map(agent => {
+    const all = walletRows.filter(row => row.agent_id === agent.agent_id);
+    const active = all.filter(row => row.status === 'active');
+    const archived = all.filter(row => row.status !== 'active');
+    const selection = active.length === 1 ? active[0] : null;
+    const relationshipState = agent.status !== 'active' ? 'unavailable' : (active.length === 1 ? 'verified' : (active.length > 1 ? 'conflicting' : 'unavailable'));
+    const budgets = budgetRows.filter(row => row.agent_id === agent.agent_id && row.status === 'active').map(row => {
+      const limit = BigInt(row.limit_atomic || '0');
+      const spent = BigInt(row.spent_atomic || '0');
+      const remaining = limit > spent ? limit - spent : 0n;
+      return {
+        budget_id: row.id,
+        period: row.period,
+        lifetime_limit_atomic: limit.toString(),
+        spent_atomic: spent.toString(),
+        remaining_atomic: remaining.toString(),
+        reserved_atomic: row.reserved_atomic == null ? null : String(row.reserved_atomic),
+        status: row.status,
+        updated_at: row.updated_at || null
+      };
+    });
+    const transferPermissions = permissionRows.filter(row => row.agent_id === agent.agent_id && row.capability === 'circle_gasless_transfer');
+    const explicitDeny = transferPermissions.find(row => row.effect === 'deny');
+    const allow = transferPermissions.find(row => row.effect === 'allow');
+    const bindings = callerBindings.filter(row => row.agent_id === agent.agent_id).map(row => ({ source: row.source, caller_id: row.caller_id, status: row.status, updated_at: row.updated_at || null }));
+    const providers = [...new Set(bindings.map(row => row.caller_id.split(':')[0]).filter(Boolean))];
+    return {
+      agent_id: agent.agent_id,
+      display_name: agent.display_name || agent.agent_id,
+      status: agent.status,
+      runtime_provider: providers.length === 1 ? providers[0] : (providers.length > 1 ? 'multiple' : 'unknown'),
+      caller_bindings: bindings,
+      current_wallet_id: selection && selection.wallet_id || null,
+      current_wallet_address: selection && selection.wallet_address || null,
+      current_wallet_relationship_state: relationshipState,
+      active_wallet_count: active.length,
+      archived_wallet_count: archived.length,
+      budgets,
+      transfer_capability: {
+        state: explicitDeny ? 'denied' : (allow ? 'allowed' : 'unavailable'),
+        transfer_max_atomic: allow && allow.max_amount_atomic != null ? String(allow.max_amount_atomic) : null
+      },
+      created_at: agent.created_at || null,
+      updated_at: agent.updated_at || null,
+      freshness: { state: relationshipState, observed_at: generatedAt, source: 'x402-sub-agent-mcp' },
+      evidence: { source: 'agent_context', source_record_id: agent.agent_id, authoritative: true }
+    };
+  });
+
+  return {
+    ok: true,
+    schema_version: 'x402-read-model-v1',
+    generated_at: generatedAt,
+    environment: clean(env.X402_ENVIRONMENT) || 'testnet',
+    network,
+    asset,
+    agents: agentViews,
+    wallets,
+    totals: {
+      agents: agentViews.length,
+      wallets: wallets.length,
+      current_wallets: wallets.filter(wallet => wallet.lifecycle_status === 'current').length,
+      archived_wallets: wallets.filter(wallet => wallet.lifecycle_status === 'archived').length
+    },
+    freshness: { state: 'verified', observed_at: generatedAt, source: 'x402-sub-agent-mcp' }
+  };
+}
+
 // Admin-gated bind/rebind of an external caller_id to an agent_id. Supported mutation path
 // for agent_caller_bindings -- do not rely on raw seed SQL for future bindings/rebindings.
 async function adminBindCaller(env, a, authContext) {
@@ -2027,6 +2140,7 @@ async function callTool(env, name, args, authContext) {
     case 'admin_bind_oauth_identity': return adminBindOauthIdentity(env, a, authContext);
     case 'admin_bind_caller': return adminBindCaller(env, a, authContext);
     case 'internal_get_agent_wallet': return resolveAgentWalletInternal(env, a, authContext);
+    case 'internal_get_agent_fleet': return internalGetAgentFleet(env, a, authContext);
     case 'create_payment_rule': return createPaymentRule(env, a);
     case 'list_payment_rules': return listPaymentRules(env, a);
     case 'update_payment_rule': return updatePaymentRule(env, a);
