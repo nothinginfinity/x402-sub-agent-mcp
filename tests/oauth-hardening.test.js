@@ -1086,4 +1086,65 @@ test('successful and denied Agent Context decisions write secret-free audit rows
   assert.ok(rows.every(row => !JSON.stringify(row).includes(STATIC_TOKEN)));
 });
 
+test('U1 internal fleet projection returns secret-free authoritative current and archived wallet state', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), max_amount_atomic: '10000', limit_atomic: '100000', spent_atomic: '2500' });
+  const active = env.DB.table('agent_wallets')[0];
+  active.wallet_id = 'wallet-current';
+  active.wallet_address = '0x1111111111111111111111111111111111111111';
+  env.DB.table('agent_wallets').push({ id: 'aw-old', agent_id: 'agent-1', wallet_id: 'wallet-archived', wallet_address: '0x2222222222222222222222222222222222222222', network: 'base-sepolia', asset: 'USDC', status: 'archived', created_at: nowIsoTest(), updated_at: nowIsoTest() });
+  env.DB.table('agent_permissions').push({ id: 'perm-transfer', agent_id: 'agent-1', capability: 'circle_gasless_transfer', effect: 'allow', network: 'base-sepolia', asset: 'USDC', max_amount_atomic: '10000', created_at: nowIsoTest(), updated_at: nowIsoTest() });
+  env.DB.table('agent_caller_bindings').push({ id: 'binding-1', source: 'x402-cairnstone', caller_id: 'chatgpt:jared', agent_id: 'agent-1', status: 'active', created_at: nowIsoTest(), updated_at: nowIsoTest() });
+  env.DB.table('workspace_wallets').push({ workspace_wallet_id: 'ww-current', workspace_id: 'workspace-test', circle_wallet_id: 'wallet-current', display_name: 'ChatGPT Current', wallet_address: active.wallet_address, network: 'base-sepolia', allocation_status: 'assigned', created_at: nowIsoTest(), updated_at: nowIsoTest() });
+
+  const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'internal_get_agent_fleet', arguments: { network: 'base-sepolia', asset: 'USDC' } });
+  assert.equal(result.response.status, 200);
+  const payload = toolPayload(result);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.environment, 'testnet');
+  assert.equal(payload.agents.length, 1);
+  assert.equal(payload.agents[0].runtime_provider, 'chatgpt');
+  assert.equal(payload.agents[0].current_wallet_id, 'wallet-current');
+  assert.equal(payload.agents[0].current_wallet_relationship_state, 'verified');
+  assert.equal(payload.agents[0].archived_wallet_count, 1);
+  assert.equal(payload.agents[0].budgets[0].remaining_atomic, '97500');
+  assert.equal(payload.agents[0].transfer_capability.transfer_max_atomic, '10000');
+  assert.equal(payload.wallets.find(wallet => wallet.wallet_id === 'wallet-current').alias, 'ChatGPT Current');
+  assert.equal(payload.wallets.find(wallet => wallet.wallet_id === 'wallet-archived').lifecycle_status, 'archived');
+  const serialized = JSON.stringify(payload);
+  assert.ok(!serialized.includes(STATIC_TOKEN));
+  assert.ok(!serialized.includes(sha256Hex(STATIC_TOKEN)));
+});
+
+test('U1 internal fleet projection preserves conflicting and unavailable wallet relationship states', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN) });
+  const first = env.DB.table('agent_wallets')[0];
+  first.wallet_id = 'wallet-one';
+  first.wallet_address = '0x1111111111111111111111111111111111111111';
+  env.DB.table('agent_wallets').push({ id: 'aw-two', agent_id: 'agent-1', wallet_id: 'wallet-two', wallet_address: '0x2222222222222222222222222222222222222222', network: 'base-sepolia', asset: 'USDC', status: 'active', created_at: nowIsoTest(), updated_at: nowIsoTest() });
+
+  let result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'internal_get_agent_fleet', arguments: {} });
+  let payload = toolPayload(result);
+  assert.equal(payload.agents[0].current_wallet_relationship_state, 'conflicting');
+  assert.equal(payload.agents[0].current_wallet_id, null);
+
+  env.DB.table('agent_wallets').forEach(wallet => { wallet.status = 'archived'; });
+  result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'internal_get_agent_fleet', arguments: {} });
+  payload = toolPayload(result);
+  assert.equal(payload.agents[0].current_wallet_relationship_state, 'unavailable');
+  assert.equal(payload.agents[0].current_wallet_id, null);
+});
+
+test('U1 internal fleet projection is hidden from ordinary wallet:read OAuth scope', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env, { client_name: 'ChatGPT' });
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
+  const issued = await exchangeCode(env, client, grant);
+  const denied = await mcp(env, issued.body.access_token, 'tools/call', { name: 'internal_get_agent_fleet', arguments: {} });
+  assert.equal(denied.response.status, 403);
+  const listed = await mcp(env, STATIC_TOKEN, 'tools/list');
+  assert.ok(!listed.body.result.tools.some(tool => tool.name === 'internal_get_agent_fleet'));
+});
+
 function nowIsoTest() { return new Date().toISOString(); }
