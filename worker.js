@@ -598,6 +598,91 @@ async function captureOnFirstConnect(env, authContext, evidence) {
   }
 }
 
+// ---- shared active-wallet selection (used by resolveAgentContext AND the internal
+// cross-service resolver below) -- ONE implementation so wallet-selection logic cannot
+// drift between the two callers, which is exactly the kind of duplication that produced
+// the identity-table-divergence bug class (see x402-cairnstone chain, 2026-08-11/12).
+async function selectActiveWallet(env, agentId, network, asset, requestedWalletAddress) {
+  const wallets = await dbAll(env, `SELECT * FROM agent_wallets
+    WHERE agent_id = ? AND network = ? AND asset = ? AND status = 'active'`, [agentId, network, asset]);
+  let wallet = null;
+  const requested = clean(requestedWalletAddress);
+  if (requested) wallet = wallets.find(row => clean(row.wallet_address).toLowerCase() === requested.toLowerCase()) || null;
+  else if (wallets.length === 1) wallet = wallets[0];
+  else if (wallets.length > 1) return { ok: false, reason: 'ambiguous', wallets };
+  if (!wallet) return { ok: false, reason: requested ? 'mismatch' : 'not_assigned', wallets };
+  return { ok: true, wallet };
+}
+
+// ---- agent_caller_bindings: authoritative caller_id -> agent_id mapping for external
+// services (migration 0015). Lets a service resolve "the CURRENT active wallet for this
+// caller" at call time instead of caching a wallet_id/address locally, which is what went
+// stale in x402-cairnstone (ROADMAP Finding #3, recurred 2026-08-11).
+async function resolveAgentWalletInternal(env, a, authContext) {
+  const isStaticService = authContext && authContext.ok && authContext.mode === 'static';
+  const isOauthAdmin = authContext && authContext.ok && authContext.mode === 'oauth' && (authContext.scope || []).includes(OAUTH_ADMIN_SCOPE);
+  if (!isStaticService && !isOauthAdmin) {
+    return agentContextError('permission_denied', 'static service token or OAuth mcp:admin authentication is required');
+  }
+  const source = clean(a.source);
+  const callerId = clean(a.caller_id);
+  const network = (clean(a.network) || DEFAULT_CIRCLE_BLOCKCHAIN).toLowerCase();
+  const asset = (clean(a.asset) || 'USDC').toUpperCase();
+  if (!source) return agentContextError('invalid_request', 'source is required');
+  if (!callerId) return agentContextError('invalid_request', 'caller_id is required');
+
+  const binding = await dbFirst(env, `SELECT * FROM agent_caller_bindings WHERE source = ? AND caller_id = ? AND status = 'active'`, [source, callerId]);
+  if (!binding) {
+    const failure = agentContextError('no_binding', 'no active caller binding exists for this source/caller_id', { source, caller_id: callerId });
+    await writeAgentContextAudit(env, { capability: 'internal_get_agent_wallet', network, asset }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  const agent = await dbFirst(env, `SELECT * FROM agents WHERE agent_id = ?`, [binding.agent_id]);
+  if (!agent || agent.status !== 'active') {
+    const failure = agentContextError('agent_disabled', 'the agent bound to this caller is missing or not active', { agent_id: binding.agent_id });
+    await writeAgentContextAudit(env, { agent: { agent_id: binding.agent_id }, capability: 'internal_get_agent_wallet', network, asset }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  const selection = await selectActiveWallet(env, agent.agent_id, network, asset, null);
+  if (!selection.ok) {
+    const code = selection.reason === 'ambiguous' ? 'ambiguous_wallet' : 'no_active_wallet';
+    const detail = selection.reason === 'ambiguous' ? 'multiple active wallets match; resolution is ambiguous' : 'no active wallet is assigned to this agent';
+    const failure = agentContextError(code, detail, { agent_id: agent.agent_id });
+    await writeAgentContextAudit(env, { agent, capability: 'internal_get_agent_wallet', network, asset }, 'denied', failure.error_code, { detail: failure.detail });
+    return failure;
+  }
+  const result = { ok: true, agent_id: agent.agent_id, wallet_id: selection.wallet.wallet_id, wallet_address: selection.wallet.wallet_address, network, asset, status: 'active' };
+  await writeAgentContextAudit(env, { agent, wallet: selection.wallet, capability: 'internal_get_agent_wallet', network, asset }, 'allowed', null, { detail: 'internal agent wallet resolved for ' + source + ':' + callerId });
+  return result;
+}
+
+// Admin-gated bind/rebind of an external caller_id to an agent_id. Supported mutation path
+// for agent_caller_bindings -- do not rely on raw seed SQL for future bindings/rebindings.
+async function adminBindCaller(env, a, authContext) {
+  if (!authContext || !authContext.ok || authContext.mode !== 'oauth' || !(authContext.scope || []).includes(OAUTH_ADMIN_SCOPE)) {
+    return agentContextError('permission_denied', 'OAuth mcp:admin authentication is required');
+  }
+  const source = clean(a.source);
+  const callerId = clean(a.caller_id);
+  const agentId = clean(a.agent_id);
+  if (!source) return agentContextError('invalid_request', 'source is required');
+  if (!callerId) return agentContextError('invalid_request', 'caller_id is required');
+  if (!agentId) return agentContextError('invalid_request', 'agent_id is required');
+  const agent = await dbFirst(env, `SELECT * FROM agents WHERE agent_id = ? AND status = 'active'`, [agentId]);
+  if (!agent) {
+    const failure = agentContextError('unknown_agent', 'active agent does not exist', { agent_id: agentId });
+    await writeAgentContextAudit(env, { agent: { agent_id: agentId }, capability: 'admin_bind_caller' }, 'denied', failure.error_code, { detail: failure.detail + ' (source=' + source + ' caller_id=' + callerId + ')' });
+    return failure;
+  }
+  const ts = nowIso();
+  await dbRun(env, `INSERT INTO agent_caller_bindings (id, source, caller_id, agent_id, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, 'active', ?, ?)
+    ON CONFLICT(source, caller_id) DO UPDATE SET agent_id = excluded.agent_id, status = 'active', updated_at = excluded.updated_at`,
+    [uid('acb'), source, callerId, agentId, ts, ts]);
+  await writeAgentContextAudit(env, { agent, capability: 'admin_bind_caller' }, 'allowed', null, { detail: 'caller binding upserted (source=' + source + ' caller_id=' + callerId + ')' });
+  return { ok: true, source, caller_id: callerId, agent_id: agentId };
+}
+
 async function resolveAgentContext(env, authContext, request) {
   const r = request || {};
   const capability = clean(r.capability) || 'resolve_agent_context';
@@ -652,23 +737,16 @@ async function resolveAgentContext(env, authContext, request) {
     return failure;
   }
 
-  const wallets = await dbAll(env, `SELECT * FROM agent_wallets
-    WHERE agent_id = ? AND network = ? AND asset = ? AND status = 'active'`, [agent.agent_id, network, asset]);
-  let wallet = null;
   const requestedWallet = clean(r.wallet_address);
-  if (requestedWallet) wallet = wallets.find(row => clean(row.wallet_address).toLowerCase() === requestedWallet.toLowerCase()) || null;
-  else if (wallets.length === 1) wallet = wallets[0];
-  else if (wallets.length > 1) {
-    const failure = agentContextError('ambiguous_identity', 'multiple wallets are assigned; a confirming wallet is required', { agent_id: agent.agent_id });
-    await writeAgentContextAudit(env, baseContext, 'denied', failure.error_code, { detail: failure.detail });
-    return failure;
-  }
-  if (!wallet) {
-    const code = requestedWallet && wallets.length ? 'wallet_mismatch' : 'wallet_not_assigned';
-    const failure = agentContextError(code, requestedWallet ? 'request wallet does not match an assigned wallet' : 'no active wallet is assigned', { agent_id: agent.agent_id });
+  const selection = await selectActiveWallet(env, agent.agent_id, network, asset, requestedWallet);
+  if (!selection.ok) {
+    const code = selection.reason === 'ambiguous' ? 'ambiguous_identity' : (selection.reason === 'mismatch' ? 'wallet_mismatch' : 'wallet_not_assigned');
+    const detail = selection.reason === 'ambiguous' ? 'multiple wallets are assigned; a confirming wallet is required' : (selection.reason === 'mismatch' ? 'request wallet does not match an assigned wallet' : 'no active wallet is assigned');
+    const failure = agentContextError(code, detail, { agent_id: agent.agent_id });
     await writeAgentContextAudit(env, baseContext, 'denied', failure.error_code, { wallet_address: requestedWallet || null, detail: failure.detail });
     return failure;
   }
+  const wallet = selection.wallet;
 
   const permissions = await dbAll(env, 'SELECT * FROM agent_permissions WHERE agent_id = ?', [agent.agent_id]);
   const matchingPermissions = permissions.filter(row => permissionMatches(row, capability, network, asset));
@@ -1925,6 +2003,7 @@ const toolSchemas = [
 
   { name: 'admin_assign_agent_wallet', description: 'Admin-only: assign a Circle wallet, budget, permissions, and a server-generated one-time bearer credential to an explicit agent_id.', inputSchema: obj({ agent_id: str, display_name: str, wallet_id: str, network: str, asset: str, budget_atomic: str, transfer_max_atomic: str }, ['agent_id', 'wallet_id', 'budget_atomic']) },
   { name: 'admin_bind_oauth_identity', description: 'Admin-only: arm capture-on-first-connect for a trusted OAuth client family (claude|chatgpt|perplexity) toward an explicit active agent_id. Writes only a pending arm; the next OAuth session for that family with no existing credential is atomically bound to the agent at resolve time. Idempotent; refuses if the family is already armed or bound to a different active agent.', inputSchema: obj({ agent_id: str, family: str }, ['agent_id', 'family']) },
+  { name: 'admin_bind_caller', description: 'Admin-only: bind or rebind an external service caller_id (source + caller_id) to an explicit agent_id. Supported mutation path for agent_caller_bindings -- the authoritative source+caller_id -> agent_id mapping used by the internal cross-service wallet resolver. Idempotent upsert.', inputSchema: obj({ source: str, caller_id: str, agent_id: str }, ['source', 'caller_id', 'agent_id']) },
 
   { name: 'oauth_trace_list', description: 'OAuth Flight Recorder: list recorded OAuth trace events, folded into distinct traces. Filter by trace_id, client_id, event_type, grant_type, outcome, resource, error, http_status, and a date_from/date_to (ISO) window. No secrets are ever returned -- only hashes and non-secret metadata.',
     inputSchema: obj({ trace_id: str, client_id: str, event_type: str, grant_type: str, outcome: str, resource: str, error: str, http_status: str, date_from: str, date_to: str, limit: num }) },
@@ -1946,6 +2025,8 @@ async function callTool(env, name, args, authContext) {
     case 'provision_agent_context_self': return agentContextError('deprecated', 'provision_agent_context_self is deprecated; use admin_assign_agent_wallet for onboarding');
     case 'admin_assign_agent_wallet': return adminAssignAgentWallet(env, a, authContext);
     case 'admin_bind_oauth_identity': return adminBindOauthIdentity(env, a, authContext);
+    case 'admin_bind_caller': return adminBindCaller(env, a, authContext);
+    case 'internal_get_agent_wallet': return resolveAgentWalletInternal(env, a, authContext);
     case 'create_payment_rule': return createPaymentRule(env, a);
     case 'list_payment_rules': return listPaymentRules(env, a);
     case 'update_payment_rule': return updatePaymentRule(env, a);
