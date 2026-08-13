@@ -51,9 +51,13 @@ The backend foundation is sufficiently proven to begin product UI development:
 
 These facts justify moving the primary development focus from backend rescue to operator UX while preserving backend regression coverage.
 
+## Accepted implementation lineage
+
+The accepted product lineage supersedes the original draft numbering: **U1 shared authoritative read model → U2 operational Wallet Cockpit → U3 Wallet Brain read-only + BYOK**. Those three phases are complete and live-accepted. The next bounded phase is **U4 transaction drafts, requests, and explicit previews**. Controlled transfer execution remains a later phase and is not implied by creating a draft.
+
 # Execution order
 
-## Phase U0 — Unified contracts and read models
+## Phase U1 — Shared authoritative read model
 
 **Goal:** make both UIs consume the same normalized authoritative data before adding new mutation paths.
 
@@ -83,7 +87,7 @@ These facts justify moving the primary development focus from backend rescue to 
 
 **Exit condition:** the Cockpit and Universe can render the same small real testnet fixture and agree on agent, current wallet, balance, budget, and recent transaction state.
 
-## Phase U1 — Wallet Cockpit v1
+## Phase U2 — Operational Wallet Cockpit
 
 **Goal:** make day-to-day wallet operation understandable before scaling mutation.
 
@@ -104,7 +108,7 @@ Ship:
 
 **Exit condition:** an operator can identify any currently active test wallet, who/what controls it, its balance, recent activity, and its authoritative agent relationship without memorizing UUIDs.
 
-## Phase U2 — Wallet Brain read-only + BYOK
+## Phase U3 — Wallet Brain read-only + BYOK
 
 **Goal:** place a provider-agnostic LLM inside the wallet product without giving it mutation authority yet.
 
@@ -132,7 +136,7 @@ Example requests:
 
 **Exit condition:** the Brain correctly answers wallet/fleet/economic questions from tools and generates portable external-agent prompts without executing transfers itself.
 
-## Phase U3 — Transaction drafts, requests, and explicit previews
+## Phase U4 — Transaction drafts, requests, and explicit previews
 
 **Goal:** turn natural language into safe structured economic actions.
 
@@ -161,7 +165,7 @@ Cockpit renders the precision preview. Universe may originate drafts from graph 
 
 **Exit condition:** users can create, inspect, edit, cancel, and copy/promote transaction drafts without moving funds.
 
-## Phase U4 — Controlled execution from Wallet Brain/Cockpit
+## Phase U5 — Controlled execution from Wallet Brain/Cockpit
 
 **Goal:** allow the in-wallet LLM and UI to execute only through deterministic wallet tools and existing policy.
 
@@ -180,7 +184,7 @@ Ship:
 
 **Exit condition:** a user can say “send 0.01 USDC from Claude to Jared 3,” approve a resolved preview, execute exactly one testnet transfer, and independently verify the resulting receipt/on-chain event.
 
-## Phase U5 — Agent Universe live read-only fleet view
+## Phase U6 — Agent Universe live read-only fleet view
 
 **Goal:** turn Agent Universe into the fleet-scale Command Map over real x402 state.
 
@@ -201,7 +205,7 @@ Ship:
 
 **Exit condition:** an operator can navigate hundreds or thousands of entities without rendering an unreadable cloud of individual wallet icons.
 
-## Phase U6 — Shared Wallet Brain across Cockpit and Universe
+## Phase U7 — Shared Wallet Brain across Cockpit and Universe
 
 **Goal:** make the Brain the common semantic navigation/control layer rather than a chat widget tied to one page.
 
@@ -223,7 +227,7 @@ Examples:
 
 **Exit condition:** a conversation can move between semantic fleet exploration and exact transactional inspection without losing identity or action context.
 
-## Phase U7 — x402 commerce cockpit
+## Phase U8 — x402 commerce cockpit
 
 **Goal:** make paid tools/data/resources a first-class wallet workflow, not merely raw transfers.
 
@@ -239,7 +243,7 @@ Ship:
 
 **Exit condition:** an operator can understand not just that money moved, but what an agent paid for or earned from and whether access/work followed correctly.
 
-## Phase U8 — 1,000+ wallet/operator scale
+## Phase U9 — 1,000+ wallet/operator scale
 
 **Goal:** make a large autonomous wallet fleet operable by exception rather than manual inspection.
 
@@ -350,12 +354,12 @@ Local repo roadmaps may contain deeper implementation detail but should referenc
 
 # Immediate next bounded slice
 
-Begin **Phase U0 + U1**, not direct Brain transaction execution.
+Begin **Phase U4 — Transaction drafts, requests, and explicit previews**, not controlled Brain/Cockpit execution.
 
-1. Define the normalized shared read model against the now-authoritative Agent Context/wallet substrate.
-2. Upgrade `agent-wallets-console` into the precision Cockpit using that model.
-3. Add aliases, clear Agent vs Current Wallet presentation, activity ledger, search/filter, and live freshness/status.
-4. In parallel, prepare `agent-universe` to consume the same read model and render a small live read-only Agent Cell fixture.
-5. Design the BYOK Wallet Brain interface and tool boundary during U1, then implement read-only Brain capability in U2.
+1. Promote the existing non-executing prompt composer into the common deterministic action-draft contract.
+2. Support `send`, `request_payment`, `x402_purchase`, and `external_agent_prompt` drafts with explicit actor, authoritative source wallet, destination, network, asset, exact atomic amount, display amount, purpose/resource, budget/policy evidence, confirmation requirement, and idempotency identity.
+3. Resolve draft identity/wallet fields only from `x402-read-model-v1`; fail closed on missing, archived, ambiguous, stale, conflicting, or mismatched authority.
+4. Render a precision Cockpit preview that can be created, inspected, edited, canceled, copied, and promoted to an external-agent prompt without moving funds.
+5. Keep Wallet Brain and the Cockpit at `execution: none`. Controlled testnet execution begins only in U5 after a separate review and explicit safety implementation.
 
-This ordering gets immediate operator relief while keeping the 1,000-wallet Universe and Wallet Brain on the same foundation from the beginning.
+This ordering preserves the proven U1→U2→U3 foundation while creating a machine-structured bridge from semantic intent to future deterministic execution.
