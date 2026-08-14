@@ -2128,8 +2128,12 @@ async function executeActionDraft(env, a, authContext) {
     throw e;
   }
 
+  // Field name confirmed against a real live settle response 2026-08-14: the facilitator
+  // returns the on-chain hash as settle.transaction, not settle.txHash/transactionId as
+  // originally assumed. Keep the old names as a defensive fallback in case a different
+  // facilitator wire format is ever used.
   const txHash = (transferResult && transferResult.receipt && transferResult.receipt.transaction_id)
-    || (transferResult && transferResult.settle && (transferResult.settle.txHash || transferResult.settle.transactionId))
+    || (transferResult && transferResult.settle && (transferResult.settle.transaction || transferResult.settle.txHash || transferResult.settle.transactionId))
     || null;
   const finalStatus = transferResult && transferResult.ok ? 'executed' : 'failed';
   const errorDetail = transferResult && transferResult.ok ? null : JSON.stringify(transferResult && (transferResult.error || transferResult.verify || transferResult)).slice(0, 500);
