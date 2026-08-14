@@ -2252,6 +2252,7 @@ async function callTool(env, name, args, authContext) {
     case 'admin_bind_caller': return adminBindCaller(env, a, authContext);
     case 'internal_get_agent_wallet': return resolveAgentWalletInternal(env, a, authContext);
     case 'internal_get_agent_fleet': return internalGetAgentFleet(env, a, authContext);
+    case 'execute_action_draft': return executeActionDraft(env, a, authContext);
     case 'create_payment_rule': return createPaymentRule(env, a);
     case 'list_payment_rules': return listPaymentRules(env, a);
     case 'update_payment_rule': return updatePaymentRule(env, a);
@@ -2386,7 +2387,7 @@ const OAUTH_SCOPES_SUPPORTED = ['wallet:read', 'wallet:transfer:testnet', 'offli
 // for identity, wallet assignment, permissions, budgets, and network policy.
 const OAUTH_SCOPE_TOOLS = {
   'wallet:read': ['subagent_status', 'resolve_agent_context', 'circle_list_wallet_sets', 'circle_list_wallets', 'circle_get_wallet_balance', 'circle_get_transaction'],
-  'wallet:transfer:testnet': ['circle_gasless_transfer']
+  'wallet:transfer:testnet': ['circle_gasless_transfer', 'execute_action_draft']
 };
 
 function oauthToolAllowedForScopes(toolName, grantedScopes) {
@@ -2412,6 +2413,7 @@ const AGENT_ALLOWED_TOOLS = new Set([
   'subagent_status',
   'resolve_agent_context',
   'circle_gasless_transfer',
+  'execute_action_draft',
   'circle_get_wallet_balance',
   'circle_get_transaction',
   'circle_list_wallets',
