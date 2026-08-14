@@ -2036,6 +2036,115 @@ async function circleGaslessTransfer(env, a, authContext) {
   };
 }
 
+// ---- U5: controlled execution of Agent Wallets Console action drafts ----------------
+// x402-action-draft-v1 (kind='send' only in this phase). Thin wrapper around the
+// already-proven circleGaslessTransfer -- no parallel signing/submission path, no new
+// wallet authority. draft_id is the sole idempotency key: a UNIQUE PRIMARY KEY on
+// executed_drafts.draft_id means the first call claims the row (status='pending')
+// BEFORE any signing/submission is attempted, and every subsequent call for that
+// draft_id reads the existing terminal row instead of re-executing. A genuine retry
+// after failure requires a NEW draft (new draft_id) from the Cockpit -- this function
+// never mutates a terminal row back to pending.
+function atomicToDecimalUsdc(atomic) {
+  const s = String(atomic || '0').replace(/[^0-9]/g, '') || '0';
+  const padded = s.padStart(7, '0');
+  const whole = padded.slice(0, -6).replace(/^0+(?=\d)/, '') || '0';
+  const frac = padded.slice(-6);
+  return `${whole}.${frac}`;
+}
+
+async function executeActionDraft(env, a, authContext) {
+  const draft = a && a.draft;
+  if (!draft || typeof draft !== 'object') throw new Error('draft object is required');
+  if (draft.kind !== 'send') {
+    return { ok: false, error: 'unsupported_draft_kind', detail: 'only kind="send" drafts can be executed in this phase', draft_id: clean(draft.draft_id) || null };
+  }
+  const draftId = clean(draft.draft_id);
+  if (!draftId) throw new Error('draft.draft_id is required');
+
+  const existing = await dbFirst(env, 'SELECT * FROM executed_drafts WHERE draft_id = ?', [draftId]);
+  if (existing) {
+    return {
+      ok: existing.status === 'executed',
+      draft_id: draftId,
+      lifecycle: existing.status,
+      tx_hash: existing.tx_hash || null,
+      agent_id: existing.agent_id || null,
+      detail: existing.error_detail || null,
+      replayed: true
+    };
+  }
+
+  const amountAtomic = clean(draft.amount_atomic);
+  if (!amountAtomic || !/^[0-9]+$/.test(amountAtomic)) throw new Error('draft.amount_atomic must be a positive atomic integer string');
+  const network = (clean(draft.network) || DEFAULT_CIRCLE_BLOCKCHAIN).toLowerCase();
+  const asset = (clean(draft.asset) || 'USDC').toUpperCase();
+  const destinationAddress = assertValidAddress(draft.destination_address, 'draft.destination_address');
+
+  // Fresh re-resolution -- never trust the draft's cached identity/wallet/budget.
+  const context = await resolveAgentContext(env, authContext, {
+    capability: 'circle_gasless_transfer', network, asset, amount_atomic: amountAtomic
+  });
+  if (!context.ok) {
+    await dbRun(env, `INSERT INTO executed_drafts (draft_id, agent_id, status, network, asset, amount_atomic, destination_address, error_detail, created_at, updated_at) VALUES (?, NULL, 'rejected', ?, ?, ?, ?, ?, ?, ?)`,
+      [draftId, network, asset, amountAtomic, destinationAddress, context.error_code || context.error || 'resolution_failed', nowIso(), nowIso()]);
+    return { ok: false, error: 'resolution_failed', detail: context.detail || context.error, draft_id: draftId };
+  }
+
+  // Drift check: the draft's declared source wallet, if present, must match the fresh
+  // resolution exactly. A wallet reassignment between draft creation and execution must
+  // block execution rather than silently sending from a different wallet.
+  const declaredWalletId = clean(draft.source_wallet_id);
+  if (declaredWalletId && declaredWalletId !== context.wallet.wallet_id) {
+    await dbRun(env, `INSERT INTO executed_drafts (draft_id, agent_id, status, network, asset, amount_atomic, destination_address, error_detail, created_at, updated_at) VALUES (?, ?, 'rejected', ?, ?, ?, ?, 'resolution_drifted', ?, ?)`,
+      [draftId, context.agent.agent_id, network, asset, amountAtomic, destinationAddress, nowIso(), nowIso()]);
+    return { ok: false, error: 'resolution_drifted', detail: "current wallet no longer matches the draft's resolved wallet", draft_id: draftId, agent_id: context.agent.agent_id };
+  }
+
+  // Claim the row BEFORE calling the transfer so a concurrent/racing retry for the same
+  // draft_id fails the UNIQUE constraint and falls into the existing-row branch above.
+  try {
+    await dbRun(env, `INSERT INTO executed_drafts (draft_id, agent_id, status, network, asset, amount_atomic, destination_address, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
+      [draftId, context.agent.agent_id, network, asset, amountAtomic, destinationAddress, nowIso(), nowIso()]);
+  } catch (e) {
+    const raced = await dbFirst(env, 'SELECT * FROM executed_drafts WHERE draft_id = ?', [draftId]);
+    if (raced) {
+      return { ok: raced.status === 'executed', draft_id: draftId, lifecycle: raced.status, tx_hash: raced.tx_hash || null, agent_id: raced.agent_id || null, detail: raced.error_detail || null, replayed: true };
+    }
+    throw e;
+  }
+
+  let transferResult;
+  try {
+    transferResult = await circleGaslessTransfer(env, {
+      wallet_id: context.wallet.wallet_id,
+      destination_address: destinationAddress,
+      amount: atomicToDecimalUsdc(amountAtomic),
+      blockchain: network,
+      resource: `action-draft:${draftId}`
+    }, authContext);
+  } catch (e) {
+    await dbRun(env, `UPDATE executed_drafts SET status='failed', error_detail=?, updated_at=? WHERE draft_id=?`, [String((e && e.message) || e).slice(0, 500), nowIso(), draftId]);
+    throw e;
+  }
+
+  const txHash = (transferResult && transferResult.receipt && transferResult.receipt.transaction_id)
+    || (transferResult && transferResult.settle && (transferResult.settle.txHash || transferResult.settle.transactionId))
+    || null;
+  const finalStatus = transferResult && transferResult.ok ? 'executed' : 'failed';
+  const errorDetail = transferResult && transferResult.ok ? null : JSON.stringify(transferResult && (transferResult.error || transferResult.verify || transferResult)).slice(0, 500);
+  await dbRun(env, `UPDATE executed_drafts SET status=?, tx_hash=?, error_detail=?, updated_at=? WHERE draft_id=?`, [finalStatus, txHash, errorDetail, nowIso(), draftId]);
+
+  return {
+    ok: !!(transferResult && transferResult.ok),
+    draft_id: draftId,
+    lifecycle: finalStatus,
+    tx_hash: txHash,
+    agent_id: context.agent.agent_id,
+    result: transferResult
+  };
+}
+
 // =======================================================================
 // MCP plumbing
 // =======================================================================
