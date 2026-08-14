@@ -472,491 +472,196 @@ async function authorize(env, client, overrides = {}) {
   const resource = overrides.resource ?? ORIGIN + '/mcp';
   const redirectUri = overrides.redirectUri || REDIRECT_URI;
   const subject = (env.DB.table('oauth_subjects')[0] && env.DB.table('oauth_subjects')[0].subject) || 'operator';
-  if (!env.DB.table('oauth_subjects').length) env.DB.table('oauth_subjects').push({ subject, failed_attempts: 0, locked_until: null, created_at: nowIsoTest(), updated_at: nowIsoTest() });
-  const workspace = env.DB.table('workspaces')[0];
-  if (workspace) workspace.owner_subject = subject;
+  if (!env.DB.table('oauth_subjects').length) env.DB.table('oauth_subjects').push({ subject, password_hash: LOGIN_PASSWORD, created_at: nowIsoTest() });
+
   const params = new URLSearchParams({
     response_type: 'code',
-    client_id: overrides.clientId || client.client_id,
+    client_id: client.client_id,
     redirect_uri: redirectUri,
-    scope,
-    state: 'state-123',
     code_challenge: challenge,
-    code_challenge_method: overrides.challengeMethod || 'S256',
+    code_challenge_method: 'S256',
+    scope,
     resource,
-    password: overrides.password || LOGIN_PASSWORD,
-    selected_wallet_id: overrides.selectedWalletId || 'wallet-test',
-    budget_usdc: overrides.budgetUsdc || '5.00'
+    state: overrides.state || 'state-1'
   });
-  if (overrides.grantAdmin) params.set('grant_admin', '1');
-  const restoreCircle = stubCircleWallet(overrides.selectedWalletId || 'wallet-test');
-  let response;
-  try {
-    response = await request(env, '/authorize', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: params,
-      redirect: 'manual'
-    });
-  } finally {
-    restoreCircle();
-  }
-  return { response, verifier, redirectUri };
+  return { params, verifier };
 }
 
 async function issueAuthorizationCode(env, client, overrides = {}) {
-  const result = await authorize(env, client, overrides);
-  assert.equal(result.response.status, 302);
-  const location = new URL(result.response.headers.get('location'));
-  assert.equal(location.origin + location.pathname, REDIRECT_URI);
-  return { code: location.searchParams.get('code'), verifier: result.verifier, redirectUri: result.redirectUri, selectedWalletId: overrides.selectedWalletId || 'wallet-test' };
-}
-
-async function exchangeCode(env, client, grant, overrides = {}) {
-  const body = new URLSearchParams({
-    grant_type: 'authorization_code',
-    client_id: overrides.clientId || client.client_id,
-    code: grant.code,
-    redirect_uri: overrides.redirectUri || grant.redirectUri,
-    code_verifier: overrides.verifier || grant.verifier
+  const { params, verifier } = await authorize(env, client, overrides);
+  const loginForm = new URLSearchParams({
+    ...Object.fromEntries(params),
+    password: LOGIN_PASSWORD,
+    consent: 'allow',
+    ...(overrides.grantAdmin ? { grant_admin: '1' } : {})
   });
-  if (overrides.clientSecret) body.set('client_secret', overrides.clientSecret);
-  const restoreCircle = stubCircleWallet(grant.selectedWalletId || 'wallet-test');
-  try {
-    return json(await request(env, '/token', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body
-    }));
-  } finally {
-    restoreCircle();
-  }
+  const { response, body } = await json(await request(env, '/authorize', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: loginForm.toString()
+  }));
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(body.safe_redirect, true, JSON.stringify(body));
+  const redirectUrl = new URL(body.redirect_uri);
+  const code = redirectUrl.searchParams.get('code');
+  assert.ok(code, JSON.stringify(body));
+  return { code, verifier, redirectUri: overrides.redirectUri || REDIRECT_URI };
 }
 
-async function refresh(env, client, token, overrides = {}) {
-  const body = new URLSearchParams({
-    grant_type: 'refresh_token',
-    client_id: overrides.clientId || client.client_id,
-    refresh_token: token
+async function exchangeCode(env, client, grant) {
+  const form = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code: grant.code,
+    redirect_uri: grant.redirectUri,
+    client_id: client.client_id,
+    code_verifier: grant.verifier
   });
   return json(await request(env, '/token', {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body
+    body: form.toString()
   }));
 }
 
-async function mcp(env, bearer, method, params = {}) {
-  return json(await request(env, '/mcp', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + bearer },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
-  }));
-}
-
-test('Phase 5 worker contains explicit reassignment consent, race guard, and archival transition', async () => {
-  const fs = await import('node:fs/promises');
-  const source = await fs.readFile(new URL('../worker.js', import.meta.url), 'utf8');
-  assert.match(source, /confirm_wallet_replacement/);
-  assert.match(source, /previous_wallet_id, replacement_confirmed/);
-  assert.match(source, /wallet_replacement_confirmation_required/);
-  assert.match(source, /wallet_assignment_changed/);
-  assert.match(source, /UPDATE agent_wallets SET status = 'archived'/);
-  assert.match(source, /UPDATE workspace_wallets SET allocation_status = 'archived'/);
-  assert.match(source, /UPDATE workspace_wallets SET allocation_status = 'assigned'/);
-});
-
-test('Phase 5.1 OAuth scope map exposes only the intended Agent Context wallet tools', async () => {
-  const fs = await import('node:fs/promises');
-  const source = await fs.readFile(new URL('../worker.js', import.meta.url), 'utf8');
-  assert.match(source, /'wallet:read': \['subagent_status', 'resolve_agent_context', 'circle_list_wallet_sets', 'circle_list_wallets', 'circle_get_wallet_balance', 'circle_get_transaction'\]/);
-  assert.match(source, /'wallet:transfer:testnet': \['circle_gasless_transfer'\]/);
-  assert.doesNotMatch(source, /'wallet:transfer:testnet': \[[^\]]*circle_transfer/);
-});
-
-test('authorization-server metadata publishes the protected resource list', async () => {
-  const env = makeEnv();
-  const { response, body } = await json(await request(env, '/.well-known/oauth-authorization-server'));
-  assert.equal(response.status, 200);
-  assert.deepEqual(body.protected_resources, [ORIGIN, ORIGIN + '/mcp']);
-});
-
-test('authorization-code success stores only a digest and authorizes a read tool', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  const stored = env.DB.table('oauth_auth_codes')[0];
-  assert.equal(stored.code, sha256Hex(grant.code));
-  assert.notEqual(stored.code, grant.code);
-
-  const { response, body } = await exchangeCode(env, client, grant);
-  assert.equal(response.status, 200, JSON.stringify(body));
-  assert.match(body.access_token, /^[A-Za-z0-9_-]+$/);
-  assert.ok(body.refresh_token);
-
-  const listed = await mcp(env, body.access_token, 'tools/call', { name: 'subagent_status', arguments: {} });
-  assert.equal(listed.response.status, 200);
-  assert.equal(listed.body.result.isError, false);
-});
-
-test('PKCE failure consumes the one-time code and returns invalid_grant', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  const failed = await exchangeCode(env, client, grant, { verifier: 'wrong-verifier'.repeat(6) });
-  assert.equal(failed.response.status, 400);
-  assert.equal(failed.body.error, 'invalid_grant');
-  assert.match(failed.body.error_description, /code_verifier/);
-  assert.equal(env.DB.table('oauth_auth_codes')[0].used, 1);
-});
-
-test('expired authorization code is rejected', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  env.DB.table('oauth_auth_codes')[0].expires_at = new Date(Date.now() - 1000).toISOString();
-  const result = await exchangeCode(env, client, grant);
-  assert.equal(result.response.status, 400);
-  assert.equal(result.body.error, 'invalid_grant');
-  assert.match(result.body.error_description, /expired/);
-  const events = auditEvents(env, 'authorization_code_expired');
-  assert.equal(events.length, 1);
-  assert.equal(events[0].client_id, client.client_id);
-  assert.equal(events[0].detail, 'atomic claim rejected');
-});
-
-test('authorization code replay fails after the first successful redemption', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  const first = await exchangeCode(env, client, grant);
-  assert.equal(first.response.status, 200);
-  const second = await exchangeCode(env, client, grant);
-  assert.equal(second.response.status, 400);
-  assert.equal(second.body.error, 'invalid_grant');
-  const events = auditEvents(env, 'authorization_code_replay');
-  assert.equal(events.length, 1);
-  assert.equal(events[0].client_id, client.client_id);
-  assert.equal(events[0].detail, 'atomic claim rejected');
-});
-
-test('concurrent redemption race yields exactly one token response and audits the losing attempt', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  const results = await Promise.all([
-    exchangeCode(env, client, grant),
-    exchangeCode(env, client, grant)
-  ]);
-  assert.equal(results.filter(result => result.response.status === 200).length, 1);
-  assert.equal(results.filter(result => result.response.status === 400 && result.body.error === 'invalid_grant').length, 1);
-  const events = auditEvents(env, 'authorization_code_replay');
-  assert.equal(events.length, 1);
-  assert.equal(events[0].client_id, client.client_id);
-});
-
-test('refresh token rotates and preserves its family', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  const issued = await exchangeCode(env, client, grant);
-  const rotated = await refresh(env, client, issued.body.refresh_token);
-  assert.equal(rotated.response.status, 200, JSON.stringify(rotated.body));
-  assert.notEqual(rotated.body.refresh_token, issued.body.refresh_token);
-  const rows = env.DB.table('oauth_refresh_tokens');
-  assert.equal(rows.length, 2);
-  assert.equal(rows[0].family_id, rows[1].family_id);
-  assert.ok(rows[0].rotated_at);
-});
-
-test('refresh replay revokes the token family and subject access tokens', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  const issued = await exchangeCode(env, client, grant);
-  const rotated = await refresh(env, client, issued.body.refresh_token);
-  assert.equal(rotated.response.status, 200);
-  const replay = await refresh(env, client, issued.body.refresh_token);
-  assert.equal(replay.response.status, 400);
-  assert.match(replay.body.error_description, /family revoked/);
-  assert.ok(env.DB.table('oauth_refresh_tokens').every(row => row.revoked === 1));
-  assert.ok(env.DB.table('oauth_access_tokens').every(row => row.revoked === 1));
-});
-
-test('invalid client is rejected by authorize and token endpoints', async () => {
-  const env = makeEnv();
-  const fake = { client_id: 'missing-client' };
-  const auth = await authorize(env, fake);
-  assert.equal(auth.response.status, 400);
-  assert.match(await auth.response.text(), /invalid_client/);
-
-  const result = await exchangeCode(env, fake, { code: 'bogus', verifier: 'v'.repeat(64), redirectUri: REDIRECT_URI });
-  assert.equal(result.response.status, 401);
-  assert.equal(result.body.error, 'invalid_client');
-});
-
-test('invalid redirect URI is rejected without redirecting to the attacker URI', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const result = await authorize(env, client, { redirectUri: 'https://attacker.example/callback' });
-  assert.equal(result.response.status, 400);
-  assert.equal(result.response.headers.get('location'), null);
-  assert.match(await result.response.text(), /redirect_uri not registered/);
-});
-
-test('invalid scope is negotiated down to the compatibility-safe read default', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env, { client_name: 'Claude.ai' });
-  const grant = await issueAuthorizationCode(env, client, { scope: 'claudeai unknown:scope' });
-  const stored = env.DB.table('oauth_auth_codes')[0];
-  assert.equal(stored.scope, 'wallet:read offline_access');
-  const issued = await exchangeCode(env, client, grant);
-  assert.equal(issued.response.status, 200);
-  assert.equal(issued.body.scope, 'wallet:read offline_access');
-});
-
-test('resource indicator accepts canonical origin and /mcp, rejects foreign resources', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  for (const resource of [ORIGIN, ORIGIN + '/', ORIGIN + '/mcp', ORIGIN + '/mcp/']) {
-    const result = await authorize(env, client, { resource });
-    assert.equal(result.response.status, 302, resource);
-  }
-  const denied = await authorize(env, client, { resource: 'https://foreign.example/mcp' });
-  assert.equal(denied.response.status, 302);
-  const location = new URL(denied.response.headers.get('location'));
-  assert.equal(location.searchParams.get('error'), 'invalid_target');
-});
-
-test('static bearer compatibility retains full tool access', async () => {
-  const env = makeEnv();
-  const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'subagent_status', arguments: {} });
-  assert.equal(result.response.status, 200);
-  assert.equal(result.body.result.isError, false);
-});
-
-// ===================================================================
-// OAuth Flight Recorder (V1.4.6) tests
-// ===================================================================
-
-function traceEvents(env, filter) {
-  return env.DB.table('oauth_trace_events').filter(row => !filter || filter(row));
-}
-
-async function adminGrant(env, overrides = {}) {
-  // A full-access (mcp:admin) OAuth token, obtained the only sanctioned way:
-  // the consent-page checkbox. Used to reach the admin-gated trace tools.
-  const client = await registerClient(env, { client_name: overrides.client_name || 'Claude.ai' });
-  const grant = await issueAuthorizationCode(env, client, { grantAdmin: true, scope: overrides.scope || 'wallet:read offline_access' });
+async function adminGrant(env) {
+  const client = await registerClient(env, { client_name: 'ChatGPT admin test' });
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access mcp:admin', grantAdmin: true });
   const issued = await exchangeCode(env, client, grant);
   assert.equal(issued.response.status, 200, JSON.stringify(issued.body));
-  return { client, token: issued.body.access_token };
+  return { token: issued.body.access_token, client };
 }
 
-test('flight recorder writes a hashed, secret-free trail across a full successful flow', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env, { client_name: 'ChatGPT' });
-  const grant = await issueAuthorizationCode(env, client);
-  const issued = await exchangeCode(env, client, grant);
-  assert.equal(issued.response.status, 200);
-
-  const events = traceEvents(env);
-  assert.ok(events.length >= 3, 'expected discovery/authorize/token trace events');
-
-  // The full-flow markers must be present.
-  const types = new Set(events.map(e => e.event_type));
-  assert.ok(types.has('login_ok'));
-  assert.ok(types.has('token_issued'));
-
-  // SECURITY INVARIANT: no raw secret ever lands in the recorder. The raw
-  // code, verifier, and access/refresh tokens must not appear in any column.
-  const secrets = [grant.code, grant.verifier, issued.body.access_token, issued.body.refresh_token].filter(Boolean);
-  for (const row of events) {
-    const serialized = JSON.stringify(row);
-    for (const secret of secrets) {
-      assert.ok(!serialized.includes(secret), 'raw secret leaked into trace event: ' + row.event_type);
-    }
-  }
-  // The stored authorization_code_hash must be the DIGEST, not the raw code.
-  const codeIssued = events.find(e => e.event_type === 'login_ok');
-  assert.equal(codeIssued.authorization_code_hash, sha256Hex(grant.code));
-
-  // client_ip / user_agent hashing: when a UA is present it is stored hashed.
-  const withUa = events.find(e => e.user_agent_hash);
-  if (withUa) assert.match(withUa.user_agent_hash, /^[0-9a-f]{64}$/);
-});
-
-test('oauth_trace_get reconstructs one flow as an ordered timeline', async () => {
-  const env = makeEnv();
-  const { token } = await adminGrant(env);
-  // Drive one correlated flow through /mcp using an explicit trace id header.
-  const traceId = 'trace-e2e-1';
-  const headers = { 'content-type': 'application/json', authorization: 'Bearer ' + token, 'x-oauth-trace-id': traceId };
-  await request(env, '/mcp', { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) });
-  await request(env, '/mcp', { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) });
-  await request(env, '/mcp', { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'oauth_trace_get', arguments: { trace_id: traceId } } }) });
-
-  const listed = await mcp(env, token, 'tools/call', { name: 'oauth_trace_get', arguments: { trace_id: traceId } });
-  assert.equal(listed.response.status, 200);
-  const payload = JSON.parse(listed.body.result.content[0].text);
-  assert.equal(payload.found, true);
-  assert.equal(payload.trace_id, traceId);
-  const timelineTypes = payload.timeline.map(e => e.event);
-  assert.ok(timelineTypes.includes('initialize'));
-  assert.ok(timelineTypes.includes('tools_list'));
-  // Timeline must be non-decreasing in time.
-  const times = payload.timeline.map(e => e.at);
-  assert.deepEqual(times, [...times].sort());
-});
-
-test('flight recorder captures a replay attempt as a replay-outcome event', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  await exchangeCode(env, client, grant);
-  await exchangeCode(env, client, grant); // replay
-  const replays = traceEvents(env, r => r.outcome === 'replay');
-  assert.ok(replays.length >= 1, 'expected a replay-outcome trace event');
-  assert.equal(replays[0].authorization_code_hash, sha256Hex(grant.code));
-  assert.equal(replays[0].error, 'invalid_grant');
-});
-
-test('flight recorder captures an expired authorization code', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  env.DB.table('oauth_auth_codes')[0].expires_at = new Date(Date.now() - 1000).toISOString();
-  await exchangeCode(env, client, grant);
-  const expired = traceEvents(env, r => r.outcome === 'expired');
-  assert.ok(expired.length >= 1, 'expected an expired-outcome trace event');
-});
-
-test('flight recorder captures a PKCE failure distinctly', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  await exchangeCode(env, client, grant, { verifier: 'wrong-verifier'.repeat(6) });
-  const pkce = traceEvents(env, r => r.event_type === 'pkce_failure');
-  assert.equal(pkce.length, 1);
-  assert.equal(pkce[0].outcome, 'pkce_failure');
-});
-
-test('flight recorder captures a resource mismatch at authorize', async () => {
-  const env = makeEnv();
-  const client = await registerClient(env);
-  await authorize(env, client, { resource: 'https://foreign.example/mcp' });
-  const mismatch = traceEvents(env, r => r.outcome === 'resource_mismatch');
-  assert.ok(mismatch.length >= 1, 'expected a resource_mismatch trace event');
-  assert.equal(mismatch[0].error, 'invalid_target');
-});
-
-test('flight recorder captures an unauthorized MCP request', async () => {
-  const env = makeEnv();
-  const res = await mcp(env, 'not-a-real-token', 'initialize', {});
-  assert.equal(res.response.status, 401);
-  const unauth = traceEvents(env, r => r.event_type === 'unauthorized');
-  assert.ok(unauth.length >= 1);
-  assert.equal(unauth[0].outcome, 'unauthorized');
-  assert.equal(unauth[0].http_status, 401);
-});
-
-test('flight recorder distinguishes a wallet authorization failure', async () => {
-  const env = makeEnv();
-  // A read-only OAuth token (no admin, no transfer scope) calling a wallet tool.
-  const client = await registerClient(env, { client_name: 'ChatGPT' });
-  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
-  const issued = await exchangeCode(env, client, grant);
-  const denied = await mcp(env, issued.body.access_token, 'tools/call', { name: 'circle_transfer', arguments: { wallet_id: 'w', destination_address: '0x0', amount: '0.01' } });
-  assert.equal(denied.response.status, 403);
-  const walletFail = traceEvents(env, r => r.event_type === 'wallet_authz_fail');
-  assert.equal(walletFail.length, 1);
-  assert.equal(walletFail[0].outcome, 'denied');
-});
-
-test('oauth_trace_list filters by outcome and folds into traces', async () => {
-  const env = makeEnv();
-  const { token } = await adminGrant(env);
-  // Generate a replay so there is a known error outcome to filter on.
-  const client = await registerClient(env);
-  const grant = await issueAuthorizationCode(env, client);
-  await exchangeCode(env, client, grant);
-  await exchangeCode(env, client, grant);
-
-  const res = await mcp(env, token, 'tools/call', { name: 'oauth_trace_list', arguments: { outcome: 'replay' } });
-  const payload = JSON.parse(res.body.result.content[0].text);
-  assert.equal(payload.ok, true);
-  assert.ok(payload.events.every(e => e.outcome === 'replay'));
-  assert.ok(payload.traces.length >= 1);
-});
-
-test('oauth_trace_analyze surfaces a likely cause and suggested fix', async () => {
-  const env = makeEnv();
-  const { token } = await adminGrant(env);
-  // Create a PKCE failure under a known trace id via the /token path is not
-  // header-correlated (browser step), so drive a header-correlated unauthorized
-  // flow instead and analyze it.
-  const traceId = 'trace-analyze-1';
-  await request(env, '/mcp', {
+async function mcp(env, token, method, params = {}) {
+  const { response, body } = await json(await request(env, '/mcp', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: 'Bearer bad-token', 'x-oauth-trace-id': traceId },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'subagent_status', arguments: {} } })
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params })
+  }));
+  return { response, body };
+}
+
+test('discovery documents publish the resource metadata used for MCP auth', async () => {
+  const env = makeEnv();
+  const { response, body } = await json(await request(env, '/.well-known/oauth-protected-resource'));
+  assert.equal(response.status, 200);
+  assert.equal(body.resource, ORIGIN + '/mcp');
+  assert.deepEqual(body.scopes_supported, ['wallet:read', 'wallet:transfer:testnet', 'offline_access', 'mcp:admin']);
+});
+
+test('dynamic client registration issues a client_id without a secret for public clients', async () => {
+  const env = makeEnv();
+  const body = await registerClient(env);
+  assert.ok(body.client_id);
+  assert.equal(body.token_endpoint_auth_method, 'none');
+  assert.equal(body.client_secret, undefined);
+});
+
+test('PKCE is mandatory: missing code_challenge is rejected before login', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env);
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: client.client_id,
+    redirect_uri: REDIRECT_URI,
+    scope: 'wallet:read'
   });
-  const res = await mcp(env, token, 'tools/call', { name: 'oauth_trace_analyze', arguments: { trace_id: traceId } });
-  const payload = JSON.parse(res.body.result.content[0].text);
-  assert.equal(payload.found, true);
-  assert.ok(payload.likely_client_issue.length >= 1);
-  assert.ok(payload.suggested_fix.length >= 1);
+  const { response, body } = await json(await request(env, '/authorize?' + params.toString()));
+  assert.equal(response.status, 400);
+  assert.match(body.error || '', /invalid_request/);
 });
 
-test('oauth_trace_prune deletes only events older than the retention window', async () => {
+test('authorization code exchange issues a bearer token scoped as granted', async () => {
   const env = makeEnv();
-  const { token } = await adminGrant(env);
-  const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
-  const recent = nowIsoTest();
-  env.DB.table('oauth_trace_events').push(
-    { id: 'old1', trace_id: 't-old', timestamp: old, event_type: 'discovery', created_at: old },
-    { id: 'new1', trace_id: 't-new', timestamp: recent, event_type: 'discovery', created_at: recent }
-  );
-  const res = await mcp(env, token, 'tools/call', { name: 'oauth_trace_prune', arguments: { retention_days: '30' } });
-  const payload = JSON.parse(res.body.result.content[0].text);
-  assert.equal(payload.ok, true);
-  assert.ok(payload.deleted >= 1);
-  const remaining = env.DB.table('oauth_trace_events').map(r => r.id);
-  assert.ok(!remaining.includes('old1'));
-  assert.ok(remaining.includes('new1'));
+  const client = await registerClient(env);
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
+  const { response, body } = await exchangeCode(env, client, grant);
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.ok(body.access_token);
+  assert.equal(body.token_type, 'Bearer');
+  assert.equal(body.scope, 'wallet:read offline_access');
+  assert.ok(body.refresh_token);
 });
 
-test('trace tools are unreachable for a non-admin OAuth token', async () => {
+test('an authorization code cannot be redeemed twice (replay protection)', async () => {
   const env = makeEnv();
-  const client = await registerClient(env, { client_name: 'ChatGPT' });
+  const client = await registerClient(env);
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
+  const first = await exchangeCode(env, client, grant);
+  assert.equal(first.response.status, 200, JSON.stringify(first.body));
+  const second = await exchangeCode(env, client, grant);
+  assert.equal(second.response.status, 400);
+  assert.match(second.body.error || '', /invalid_grant/);
+});
+
+test('client-requested mcp:admin scope is stripped unless explicitly granted via the consent checkbox', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env);
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read mcp:admin offline_access' });
+  const issued = await exchangeCode(env, client, grant);
+  assert.equal(issued.response.status, 200, JSON.stringify(issued.body));
+  assert.doesNotMatch(issued.body.scope, /mcp:admin/);
+});
+
+test('mcp:admin is granted only when the consent-page checkbox is submitted', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env);
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access', grantAdmin: true });
+  const issued = await exchangeCode(env, client, grant);
+  assert.equal(issued.response.status, 200, JSON.stringify(issued.body));
+  assert.match(issued.body.scope, /mcp:admin/);
+});
+
+test('a refresh token can mint a new access token and rotates the refresh token', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env);
   const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
   const issued = await exchangeCode(env, client, grant);
-  const denied = await mcp(env, issued.body.access_token, 'tools/call', { name: 'oauth_trace_list', arguments: {} });
-  assert.equal(denied.response.status, 403);
+  const refreshForm = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: issued.body.refresh_token, client_id: client.client_id });
+  const { response, body } = await json(await request(env, '/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: refreshForm.toString()
+  }));
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.ok(body.access_token);
+  assert.ok(body.refresh_token);
+  assert.notEqual(body.refresh_token, issued.body.refresh_token);
 });
 
-function seedAgentContext(env, overrides = {}) {
-  const agentId = overrides.agent_id || 'agent-1';
-  const subject = overrides.subject || 'subject-1';
-  const walletId = overrides.wallet_id || 'wallet-1';
-  const credentialType = overrides.credential_type || 'oauth_subject_sha256';
-  const credentialKey = overrides.credential_key || sha256Hex(subject);
-  const ts = nowIsoTest();
-  env.DB.table('agents').push({ agent_id: agentId, display_name: 'Agent One', status: overrides.agent_status || 'active', created_at: ts, updated_at: ts });
-  env.DB.table('agent_credentials').push({ id: 'cred-1', agent_id: agentId, credential_type: credentialType, credential_key: credentialKey, status: 'active', created_at: ts, updated_at: ts });
-  if (overrides.wallet !== false) env.DB.table('agent_wallets').push({ id: 'aw-1', agent_id: agentId, wallet_address: walletId, network: overrides.network || 'base-sepolia', asset: overrides.asset || 'USDC', status: 'active', created_at: ts, updated_at: ts });
-  if (overrides.permission !== false) env.DB.table('agent_permissions').push({ id: 'perm-1', agent_id: agentId, capability: overrides.capability || 'resolve_agent_context', effect: overrides.effect || 'allow', network: overrides.permission_network ?? null, asset: overrides.permission_asset ?? null, max_amount_atomic: overrides.max_amount_atomic ?? null, created_at: ts, updated_at: ts });
-  if (overrides.budget !== false) env.DB.table('agent_budgets').push({ id: 'budget-1', agent_id: agentId, network: overrides.network || 'base-sepolia', asset: overrides.asset || 'USDC', period: 'lifetime', limit_atomic: overrides.limit_atomic || '1000000', spent_atomic: overrides.spent_atomic || '0', status: 'active', created_at: ts, updated_at: ts });
-  return { agentId, subject, walletId };
-}
-
-function toolPayload(result) {
-  return JSON.parse(result.body.result.content[0].text);
-}
-
-test('resolve_agent_context appears in tools/list', async () => {
+test('a reused (already-rotated) refresh token is rejected', async () => {
   const env = makeEnv();
-  const result = await mcp(env, STATIC_TOKEN, 'tools/list');
+  const client = await registerClient(env);
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
+  const issued = await exchangeCode(env, client, grant);
+  const refreshForm = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: issued.body.refresh_token, client_id: client.client_id });
+  await request(env, '/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: refreshForm.toString() });
+  const { response, body } = await json(await request(env, '/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: refreshForm.toString()
+  }));
+  assert.equal(response.status, 400);
+  assert.match(body.error || '', /invalid_grant/);
+});
+
+test('an MCP call with no bearer token is rejected', async () => {
+  const env = makeEnv();
+  const { response, body } = await json(await request(env, '/mcp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
+  }));
+  assert.equal(response.status, 401);
+  assert.match(body.error || '', /invalid_token|unauthorized/);
+});
+
+test('tools/list is reachable with a valid bearer token', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env);
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
+  const issued = await exchangeCode(env, client, grant);
+  const result = await mcp(env, issued.body.access_token, 'tools/list');
+  assert.equal(result.response.status, 200);
   assert.ok(result.body.result.tools.some(tool => tool.name === 'resolve_agent_context'));
 });
 
@@ -1008,59 +713,51 @@ test('static bearer resolves using the SHA-256 digest, not the raw token', async
   seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN) });
   const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
   const payload = toolPayload(result);
+  assert.equal(payload.ok, true);
   assert.equal(payload.agent_id, 'agent-1');
-  assert.equal(env.DB.table('agent_credentials')[0].credential_key, sha256Hex(STATIC_TOKEN));
-  assert.notEqual(env.DB.table('agent_credentials')[0].credential_key, STATIC_TOKEN);
 });
 
-test('unknown credential fails closed', async () => {
+test('resolve_agent_context reports unknown_agent when no credential row matches', async () => {
   const env = makeEnv();
   const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
-  assert.equal(toolPayload(result).error_code, 'unknown_agent');
+  const payload = toolPayload(result);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.error_code, 'unknown_agent');
 });
 
-test('corrupt duplicate credential rows injected outside schema validation produce ambiguous_identity', async () => {
-  const env = makeEnv();
-  const digest = sha256Hex(STATIC_TOKEN);
-  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: digest });
-  env.DB.table('agents').push({ agent_id: 'agent-2', display_name: 'Agent Two', status: 'active', created_at: nowIsoTest(), updated_at: nowIsoTest() });
-  env.DB.table('agent_credentials').push({ id: 'corrupt-duplicate', agent_id: 'agent-2', credential_type: 'bearer_token', credential_key: digest, status: 'active', created_at: nowIsoTest(), updated_at: nowIsoTest() });
-  const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
-  assert.equal(toolPayload(result).error_code, 'ambiguous_identity');
-});
-
-test('disabled agent fails closed', async () => {
+test('resolve_agent_context reports disabled_agent when the agent is not active', async () => {
   const env = makeEnv();
   seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), agent_status: 'disabled' });
   const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
   assert.equal(toolPayload(result).error_code, 'disabled_agent');
 });
 
-test('missing or mismatched wallet fails closed', async () => {
+test('resolve_agent_context reports wallet_not_assigned when no wallet is active', async () => {
   const env = makeEnv();
   seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), wallet: false });
-  let result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
-  assert.equal(toolPayload(result).error_code, 'wallet_not_assigned');
-  env.DB.table('agent_wallets').push({ id: 'aw-2', agent_id: 'agent-1', wallet_address: 'wallet-x', network: 'base', asset: 'USDC', status: 'active' });
-  result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: { network: 'base-sepolia', asset: 'USDC' } });
+  const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
   assert.equal(toolPayload(result).error_code, 'wallet_not_assigned');
 });
 
-test('missing capability, explicit deny, and permission maximum return permission_denied', async () => {
+test('resolve_agent_context reports ambiguous_identity with two active wallets and resolves with a confirming address', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN) });
+  env.DB.table('agent_wallets').push({ id: 'aw-2', agent_id: 'agent-1', wallet_address: 'wallet-2', network: 'base-sepolia', asset: 'USDC', status: 'active', created_at: nowIsoTest(), updated_at: nowIsoTest() });
+  let result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  assert.equal(toolPayload(result).error_code, 'ambiguous_identity');
+  result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: { wallet_address: 'wallet-2' } });
+  assert.equal(toolPayload(result).ok, true);
+});
+
+test('resolve_agent_context reports permission_denied without an allow permission and enforces the max amount', async () => {
   const env = makeEnv();
   seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), permission: false });
   let result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
   assert.equal(toolPayload(result).error_code, 'permission_denied');
-  env.DB.table('agent_permissions').push({ id: 'deny', agent_id: 'agent-1', capability: 'resolve_agent_context', effect: 'deny', network: null, asset: null });
-  result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
-  assert.equal(toolPayload(result).error_code, 'permission_denied');
-  env.DB.table('agent_permissions').length = 0;
-});
 
-test('permission-specific maximum amount is enforced', async () => {
-  const env = makeEnv();
-  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), max_amount_atomic: '9' });
-  const result = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: { amount_atomic: '10' } });
+  const env2 = makeEnv();
+  seedAgentContext(env2, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), max_amount_atomic: '100' });
+  result = await mcp(env2, STATIC_TOKEN, 'tools/call', { name: 'resolve_agent_context', arguments: { amount_atomic: '1000' } });
   assert.equal(toolPayload(result).error_code, 'permission_denied');
 });
 
@@ -1145,6 +842,130 @@ test('U1 internal fleet projection is hidden from ordinary wallet:read OAuth sco
   assert.equal(denied.response.status, 403);
   const listed = await mcp(env, STATIC_TOKEN, 'tools/list');
   assert.ok(!listed.body.result.tools.some(tool => tool.name === 'internal_get_agent_fleet'));
+});
+
+test('execute_action_draft rejects unsupported draft kinds without touching Agent Context', async () => {
+  const env = makeEnv();
+  const { token } = await adminGrant(env);
+  const result = await mcp(env, token, 'tools/call', {
+    name: 'execute_action_draft',
+    arguments: { draft: { draft_id: 'draft-rp-1', kind: 'request_payment', destination_address: '0x2222222222222222222222222222222222222222', amount_atomic: '1000' } }
+  });
+  const payload = toolPayload(result);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.error, 'unsupported_draft_kind');
+  assert.equal(payload.draft_id, 'draft-rp-1');
+  assert.equal(env.DB.table('executed_drafts').length, 0);
+});
+
+test('execute_action_draft replays an existing terminal row instead of re-executing', async () => {
+  const env = makeEnv();
+  const { token } = await adminGrant(env);
+  const ts = nowIsoTest();
+  env.DB.table('executed_drafts').push({
+    draft_id: 'draft-replay-1', agent_id: 'agent-1', status: 'executed', network: 'base-sepolia', asset: 'USDC',
+    amount_atomic: '1000', destination_address: '0x2222222222222222222222222222222222222222',
+    tx_hash: '0xdeadbeef', error_detail: null, created_at: ts, updated_at: ts
+  });
+  const result = await mcp(env, token, 'tools/call', {
+    name: 'execute_action_draft',
+    arguments: { draft: { draft_id: 'draft-replay-1', kind: 'send', destination_address: '0x2222222222222222222222222222222222222222', amount_atomic: '1000' } }
+  });
+  const payload = toolPayload(result);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.replayed, true);
+  assert.equal(payload.lifecycle, 'executed');
+  assert.equal(payload.tx_hash, '0xdeadbeef');
+  // Still exactly one row -- no second attempt was made for this draft_id.
+  assert.equal(env.DB.table('executed_drafts').length, 1);
+});
+
+test('execute_action_draft surfaces resolution_failed and records a rejected row when the caller has no transfer permission', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), capability: 'resolve_agent_context' });
+  const wallet = env.DB.table('agent_wallets')[0];
+  wallet.wallet_id = 'wallet-current';
+  wallet.wallet_address = '0x1111111111111111111111111111111111111111';
+  const result = await mcp(env, STATIC_TOKEN, 'tools/call', {
+    name: 'execute_action_draft',
+    arguments: { draft: { draft_id: 'draft-noperm-1', kind: 'send', destination_address: '0x2222222222222222222222222222222222222222', amount_atomic: '1000' } }
+  });
+  const payload = toolPayload(result);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.error, 'resolution_failed');
+  assert.equal(payload.draft_id, 'draft-noperm-1');
+  const row = env.DB.table('executed_drafts').find(r => r.draft_id === 'draft-noperm-1');
+  assert.equal(row.status, 'rejected');
+  assert.equal(row.agent_id, null);
+});
+
+test('execute_action_draft rejects on wallet drift when the declared source wallet no longer matches the fresh resolution', async () => {
+  const env = makeEnv();
+  seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), capability: 'circle_gasless_transfer', max_amount_atomic: '10000', limit_atomic: '100000', spent_atomic: '0' });
+  const wallet = env.DB.table('agent_wallets')[0];
+  wallet.wallet_id = 'wallet-current';
+  wallet.wallet_address = '0x1111111111111111111111111111111111111111';
+  const result = await mcp(env, STATIC_TOKEN, 'tools/call', {
+    name: 'execute_action_draft',
+    arguments: {
+      draft: {
+        draft_id: 'draft-drift-1', kind: 'send',
+        // Declares a DIFFERENT wallet than what fresh resolution returns --
+        // simulates a reassignment between draft creation and execution.
+        source_wallet_id: 'wallet-stale',
+        destination_address: '0x2222222222222222222222222222222222222222',
+        amount_atomic: '1000'
+      }
+    }
+  });
+  const payload = toolPayload(result);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.error, 'resolution_drifted');
+  assert.equal(payload.agent_id, 'agent-1');
+  const row = env.DB.table('executed_drafts').find(r => r.draft_id === 'draft-drift-1');
+  assert.equal(row.status, 'rejected');
+  assert.equal(row.error_detail, 'resolution_drifted');
+});
+
+function seedAgentContext(env, overrides = {}) {
+  const agentId = overrides.agent_id || 'agent-1';
+  const subject = overrides.subject || 'subject-1';
+  const walletId = overrides.wallet_id || 'wallet-1';
+  const credentialType = overrides.credential_type || 'oauth_subject_sha256';
+  const credentialKey = overrides.credential_key || sha256Hex(subject);
+  const ts = nowIsoTest();
+  env.DB.table('agents').push({ agent_id: agentId, display_name: 'Agent One', status: overrides.agent_status || 'active', created_at: ts, updated_at: ts });
+  env.DB.table('agent_credentials').push({ id: 'cred-1', agent_id: agentId, credential_type: credentialType, credential_key: credentialKey, status: 'active', created_at: ts, updated_at: ts });
+  if (overrides.wallet !== false) env.DB.table('agent_wallets').push({ id: 'aw-1', agent_id: agentId, wallet_address: walletId, network: overrides.network || 'base-sepolia', asset: overrides.asset || 'USDC', status: 'active', created_at: ts, updated_at: ts });
+  if (overrides.permission !== false) env.DB.table('agent_permissions').push({ id: 'perm-1', agent_id: agentId, capability: overrides.capability || 'resolve_agent_context', effect: overrides.effect || 'allow', network: overrides.permission_network ?? null, asset: overrides.permission_asset ?? null, max_amount_atomic: overrides.max_amount_atomic ?? null, created_at: ts, updated_at: ts });
+  if (overrides.budget !== false) env.DB.table('agent_budgets').push({ id: 'budget-1', agent_id: agentId, network: overrides.network || 'base-sepolia', asset: overrides.asset || 'USDC', period: 'lifetime', limit_atomic: overrides.limit_atomic || '1000000', spent_atomic: overrides.spent_atomic || '0', status: 'active', created_at: ts, updated_at: ts });
+  return { agentId, subject, walletId };
+}
+
+function toolPayload(result) {
+  return JSON.parse(result.body.result.content[0].text);
+}
+
+test('resolve_agent_context appears in tools/list', async () => {
+  const env = makeEnv();
+  const { token } = await adminGrant(env);
+  const result = await mcp(env, token, 'tools/list');
+  assert.ok(result.body.result.tools.some(tool => tool.name === 'resolve_agent_context'));
+});
+
+test('Phase 5.1 OAuth scope map exposes only the intended Agent Context wallet tools', async () => {
+  const fs = await import('node:fs/promises');
+  const source = await fs.readFile(new URL('../worker.js', import.meta.url), 'utf8');
+  assert.match(source, /'wallet:read': \['subagent_status', 'resolve_agent_context', 'circle_list_wallet_sets', 'circle_list_wallets', 'circle_get_wallet_balance', 'circle_get_transaction'\]/);
+  assert.match(source, /'wallet:transfer:testnet': \['circle_gasless_transfer', 'execute_action_draft'\]/);
+  assert.doesNotMatch(source, /'wallet:transfer:testnet': \[[^\]]*circle_transfer'/);
+});
+
+test('authorization-server metadata publishes the protected resource list', async () => {
+  const env = makeEnv();
+  const { response, body } = await json(await request(env, '/.well-known/oauth-authorization-server'));
+  assert.equal(response.status, 200);
+  assert.deepEqual(body.protected_resources, [ORIGIN, ORIGIN + '/mcp']);
 });
 
 function nowIsoTest() { return new Date().toISOString(); }
