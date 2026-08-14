@@ -1202,6 +1202,21 @@ test('execute_action_draft surfaces resolution_failed and records a rejected row
   assert.equal(row.agent_id, null);
 });
 
+test('execute_action_draft tx_hash extraction reads settle.transaction (the real facilitator field, confirmed via live test)', async () => {
+  const fs = await import('node:fs/promises');
+  const source = await fs.readFile(new URL('../worker.js', import.meta.url), 'utf8');
+  // Confirmed against a real live settlement 2026-08-14: the facilitator returns the
+  // on-chain hash as settle.transaction. An earlier version of this code only checked
+  // settle.txHash/transactionId, which don't exist on the real response shape, so
+  // tx_hash silently stored NULL despite a successful transfer. settle.transaction must
+  // be checked, and checked before the incorrect legacy field names.
+  const match = /const txHash = \(transferResult[^;]*;/s.exec(source);
+  assert.ok(match, 'expected the txHash extraction expression in worker.js');
+  const expr = match[0];
+  assert.match(expr, /settle\.transaction\b/);
+  assert.ok(expr.indexOf('settle.transaction') < expr.indexOf('settle.txHash'), 'settle.transaction must be checked before the incorrect legacy field name');
+});
+
 test('execute_action_draft rejects on wallet drift when the declared source wallet no longer matches the fresh resolution', async () => {
   const env = makeEnv();
   seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN), capability: 'circle_gasless_transfer', max_amount_atomic: '10000', limit_atomic: '100000', spent_atomic: '0' });
