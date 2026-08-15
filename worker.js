@@ -423,6 +423,44 @@ async function adminAssignAgentWallet(env, a, authContext) {
   return { ...assigned, credential_type: attached.credential_type, credential_fingerprint: fingerprint, token: rawToken, one_time_reveal: true };
 }
 
+// Credential-only recovery/rotation path. Unlike admin_assign_agent_wallet this MUST NOT
+// rewrite wallet assignment, permissions, budgets, spent amounts, or OAuth bindings. The raw
+// token is returned once; only its SHA-256 fingerprint is persisted. Rotation is atomic so
+// callers never observe a state with both the old and new bearer active.
+async function adminRotateAgentBearer(env, a, authContext) {
+  if (!authContext || !authContext.ok || authContext.mode !== 'oauth' || !(authContext.scope || []).includes(OAUTH_ADMIN_SCOPE)) {
+    return agentContextError('permission_denied', 'OAuth mcp:admin authentication is required');
+  }
+  const agentId = clean(a && a.agent_id);
+  if (!agentId) return agentContextError('invalid_request', 'agent_id is required');
+  const agent = await dbFirst(env, `SELECT * FROM agents WHERE agent_id = ? AND status = 'active'`, [agentId]);
+  if (!agent) return agentContextError('unknown_agent', 'active agent does not exist', { agent_id: agentId });
+
+  const rawToken = randomBearerToken();
+  const fingerprint = await sha256Hex(rawToken);
+  const ts = nowIso();
+  const db = requireDb(env);
+  const results = await db.batch([
+    db.prepare(`UPDATE agent_credentials SET status = 'revoked', updated_at = ? WHERE agent_id = ? AND credential_type = 'bearer_token' AND status = 'active'`).bind(ts, agentId),
+    db.prepare(`INSERT INTO agent_credentials (id, agent_id, credential_type, credential_key, status, metadata_json, created_at, updated_at) VALUES (?, ?, 'bearer_token', ?, 'active', ?, ?, ?)`).bind(
+      uid('acred'), agentId, fingerprint, JSON.stringify({ source: 'admin_rotate_agent_bearer', fingerprint: 'sha256' }), ts, ts
+    )
+  ]);
+  const revokedPriorBearerCount = Number(results && results[0] && results[0].meta && results[0].meta.changes || 0);
+  await writeAgentContextAudit(env, { agent, credential: { type: 'bearer_token', key: fingerprint }, capability: 'admin_rotate_agent_bearer' }, 'allowed', null, {
+    detail: 'agent bearer rotated; prior active bearer credentials revoked=' + revokedPriorBearerCount
+  });
+  return {
+    ok: true,
+    agent_id: agentId,
+    credential_type: 'bearer_token',
+    credential_fingerprint: fingerprint,
+    revoked_prior_bearer_count: revokedPriorBearerCount,
+    token: rawToken,
+    one_time_reveal: true
+  };
+}
+
 // V1.5.6: OAuth-family binding as a first-class admin tool (capture-on-first-connect arm).
 // Admin-gated. Arms a PENDING binding of a trusted client family -> an explicit active agent.
 // The next OAuth session for that family that hits resolveAgentContext's no-credential branch
@@ -2230,6 +2268,7 @@ const toolSchemas = [
     inputSchema: obj({ draft: obj({ draft_id: str, kind: str, source_wallet_id: str, destination_address: str, amount_atomic: str, network: str, asset: str }, ['draft_id', 'kind', 'destination_address', 'amount_atomic']) }, ['draft']) },
 
   { name: 'admin_assign_agent_wallet', description: 'Admin-only: assign a Circle wallet, budget, permissions, and a server-generated one-time bearer credential to an explicit agent_id.', inputSchema: obj({ agent_id: str, display_name: str, wallet_id: str, network: str, asset: str, budget_atomic: str, transfer_max_atomic: str }, ['agent_id', 'wallet_id', 'budget_atomic']) },
+  { name: 'admin_rotate_agent_bearer', description: 'OAuth mcp:admin-only: revoke active per-agent bearer credentials for an existing active agent and mint exactly one replacement bearer. Credential-only operation: does not modify wallet assignment, permissions, budgets, spent amounts, or OAuth bindings. Returns the raw afo_x402_ token once and persists only its SHA-256 fingerprint.', inputSchema: obj({ agent_id: str }, ['agent_id']) },
   { name: 'admin_bind_oauth_identity', description: 'Admin-only: arm capture-on-first-connect for a trusted OAuth client family (claude|chatgpt|perplexity) toward an explicit active agent_id. Writes only a pending arm; the next OAuth session for that family with no existing credential is atomically bound to the agent at resolve time. Idempotent; refuses if the family is already armed or bound to a different active agent.', inputSchema: obj({ agent_id: str, family: str }, ['agent_id', 'family']) },
   { name: 'admin_bind_caller', description: 'Admin-only: bind or rebind an external service caller_id (source + caller_id) to an explicit agent_id. Supported mutation path for agent_caller_bindings -- the authoritative source+caller_id -> agent_id mapping used by the internal cross-service wallet resolver. Idempotent upsert.', inputSchema: obj({ source: str, caller_id: str, agent_id: str }, ['source', 'caller_id', 'agent_id']) },
 
@@ -2252,6 +2291,7 @@ async function callTool(env, name, args, authContext) {
     case 'resolve_agent_context': return resolveAgentContextTool(env, a, authContext);
     case 'provision_agent_context_self': return agentContextError('deprecated', 'provision_agent_context_self is deprecated; use admin_assign_agent_wallet for onboarding');
     case 'admin_assign_agent_wallet': return adminAssignAgentWallet(env, a, authContext);
+    case 'admin_rotate_agent_bearer': return adminRotateAgentBearer(env, a, authContext);
     case 'admin_bind_oauth_identity': return adminBindOauthIdentity(env, a, authContext);
     case 'admin_bind_caller': return adminBindCaller(env, a, authContext);
     case 'internal_get_agent_wallet': return resolveAgentWalletInternal(env, a, authContext);
