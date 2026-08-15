@@ -1003,6 +1003,56 @@ test('wallet:transfer:testnet does not expose admin tools and mcp:admin still do
   assert.equal(allowed.response.status, 200);
 });
 
+test('admin_rotate_agent_bearer is mcp:admin-only', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env, { client_name: 'ChatGPT' });
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:transfer:testnet offline_access' });
+  const issued = await exchangeCode(env, client, grant);
+  const denied = await mcp(env, issued.body.access_token, 'tools/call', { name: 'admin_rotate_agent_bearer', arguments: { agent_id: 'agent-1' } });
+  assert.equal(denied.response.status, 403);
+});
+
+test('admin_rotate_agent_bearer rotates only bearer credentials and leaves wallet economics unchanged', async () => {
+  const env = makeEnv();
+  const adminToken = await adminOAuthToken(env, 'ChatGPT bearer rotation test');
+  seedAgentContext(env, { agent_id: 'agent-rotate', credential_type: 'oauth_subject_sha256', credential_key: 'oauth-agent-rotate', capability: 'resolve_agent_context', max_amount_atomic: '10000', limit_atomic: '100000', spent_atomic: '11002' });
+  const oldBearer = 'afo_x402_old_test_bearer';
+  const ts = nowIsoTest();
+  env.DB.table('agent_credentials').push({ id: 'cred-old-bearer', agent_id: 'agent-rotate', credential_type: 'bearer_token', credential_key: sha256Hex(oldBearer), status: 'active', metadata_json: JSON.stringify({ source: 'old' }), created_at: ts, updated_at: ts });
+
+  const walletBefore = clone(env.DB.table('agent_wallets').find(row => row.agent_id === 'agent-rotate'));
+  const budgetBefore = clone(env.DB.table('agent_budgets').find(row => row.agent_id === 'agent-rotate'));
+  const permissionBefore = clone(env.DB.table('agent_permissions').find(row => row.agent_id === 'agent-rotate'));
+  const oauthBefore = clone(env.DB.table('agent_credentials').find(row => row.agent_id === 'agent-rotate' && row.credential_type === 'oauth_subject_sha256'));
+
+  const rotated = await mcp(env, adminToken, 'tools/call', { name: 'admin_rotate_agent_bearer', arguments: { agent_id: 'agent-rotate' } });
+  assert.equal(rotated.response.status, 200);
+  const payload = toolPayload(rotated);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.agent_id, 'agent-rotate');
+  assert.equal(payload.credential_type, 'bearer_token');
+  assert.equal(payload.one_time_reveal, true);
+  assert.equal(payload.revoked_prior_bearer_count, 1);
+  assert.match(payload.token, /^afo_x402_[A-Za-z0-9_-]+$/);
+
+  const bearerRows = env.DB.table('agent_credentials').filter(row => row.agent_id === 'agent-rotate' && row.credential_type === 'bearer_token');
+  assert.equal(bearerRows.filter(row => row.status === 'active').length, 1);
+  assert.equal(bearerRows.find(row => row.status === 'active').credential_key, sha256Hex(payload.token));
+  assert.equal(bearerRows.find(row => row.id === 'cred-old-bearer').status, 'revoked');
+  assert.ok(!JSON.stringify(bearerRows).includes(payload.token), 'raw bearer must never be persisted');
+
+  assert.deepEqual(env.DB.table('agent_wallets').find(row => row.agent_id === 'agent-rotate'), walletBefore);
+  assert.deepEqual(env.DB.table('agent_budgets').find(row => row.agent_id === 'agent-rotate'), budgetBefore);
+  assert.deepEqual(env.DB.table('agent_permissions').find(row => row.agent_id === 'agent-rotate'), permissionBefore);
+  assert.deepEqual(env.DB.table('agent_credentials').find(row => row.agent_id === 'agent-rotate' && row.credential_type === 'oauth_subject_sha256'), oauthBefore);
+
+  const oldDenied = await mcp(env, oldBearer, 'tools/call', { name: 'subagent_status', arguments: {} });
+  assert.equal(oldDenied.response.status, 401);
+  const newAllowed = await mcp(env, payload.token, 'tools/call', { name: 'resolve_agent_context', arguments: {} });
+  assert.equal(newAllowed.response.status, 200);
+  assert.equal(toolPayload(newAllowed).agent_id, 'agent-rotate');
+});
+
 test('static bearer resolves using the SHA-256 digest, not the raw token', async () => {
   const env = makeEnv();
   seedAgentContext(env, { credential_type: 'bearer_token', credential_key: sha256Hex(STATIC_TOKEN) });
