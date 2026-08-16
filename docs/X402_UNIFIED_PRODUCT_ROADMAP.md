@@ -40,7 +40,7 @@ The Wallet Brain may understand and propose. Deterministic server-side tools res
 
 ## Current proven foundation
 
-The backend foundation is sufficiently proven to begin product UI development:
+The backend foundation is proven through live-accepted controlled execution:
 
 - Agent Context and wallet reassignment are live.
 - OAuth tool-scope regression suite is repaired and CI-green.
@@ -48,12 +48,15 @@ The backend foundation is sufficiently proven to begin product UI development:
 - Authoritative wallet resolution is live and has passed the wallet-reassignment regression without a CairnStone D1 wallet update.
 - Missing binding, disabled agent, no active wallet, and ambiguous wallet paths fail closed.
 - Fresh-chat LLM transaction execution has independently resolved its own Agent Context and completed a verified on-chain transfer.
+- Deterministic `execute_action_draft` SEND-only execution is live in `x402-sub-agent-mcp`, re-resolves Agent Context/current wallet/budget/policy immediately before executing, rejects wallet drift, and uses `draft_id` as a durable idempotency key.
+- The Cockpit's Confirm & Execute flow is live-accepted: a real 1-atomic BASE-SEPOLIA USDC SEND settled on-chain, and an exact unchanged replay of the same draft returned `replayed:true` with the same transaction hash and no second budget debit.
+- Per-agent execution bearer issuance/rotation is credential-only, separate from the read-model OAuth identity, and live-proven in the real execution path.
 
-These facts justify moving the primary development focus from backend rescue to operator UX while preserving backend regression coverage.
+These facts justify moving the primary development focus from controlled-execution backend/UI rescue to the Wallet Brain → deterministic draft bridge while preserving all existing regression coverage.
 
 ## Accepted implementation lineage
 
-The accepted product lineage supersedes the original draft numbering: **U1 shared authoritative read model → U2 operational Wallet Cockpit → U3 Wallet Brain read-only + BYOK**. Those three phases are complete and live-accepted. The next bounded phase is **U4 transaction drafts, requests, and explicit previews**. Controlled transfer execution remains a later phase and is not implied by creating a draft.
+The accepted product lineage supersedes the original draft numbering: **U1 shared authoritative read model → U2 operational Wallet Cockpit → U3 Wallet Brain read-only + BYOK → U4 deterministic non-executing action drafts → U5.1 execute_action_draft backend plumbing → U5.2 real backend execution/idempotency proof → U5.3 Cockpit Confirm & Execute live-accepted**. Those phases are complete and live-accepted. The remaining U5 slice is **U5.4 Wallet Brain → deterministic draft bridge**: letting Wallet Brain interpret natural-language economic intent into the same deterministic `x402-action-draft-v1` the Cockpit already executes, without the LLM ever receiving transfer/signing authority. Phase U6 — Agent Universe live read-only fleet view — follows only after U5.4 and final U5 human-approved live acceptance are both complete.
 
 # Execution order
 
@@ -165,6 +168,8 @@ Cockpit renders the precision preview. Universe may originate drafts from graph 
 
 **Exit condition:** users can create, inspect, edit, cancel, and copy/promote transaction drafts without moving funds.
 
+**Status: complete and live-accepted.** The deterministic non-executing `x402-action-draft-v1` resolver is in production use by the Cockpit Action Draft Preview.
+
 ## Phase U5 — Controlled execution from Wallet Brain/Cockpit
 
 **Goal:** allow the in-wallet LLM and UI to execute only through deterministic wallet tools and existing policy.
@@ -182,7 +187,14 @@ Ship:
 - failure/retry policy that never silently changes wallet, amount, destination, network, or asset
 - post-execution Agent Context re-resolution and final report
 
-**Exit condition:** a user can say “send 0.01 USDC from Claude to Jared 3,” approve a resolved preview, execute exactly one testnet transfer, and independently verify the resulting receipt/on-chain event.
+**Exit condition:** a user can say "send 0.01 USDC from Claude to Jared 3," approve a resolved preview, execute exactly one testnet transfer, and independently verify the resulting receipt/on-chain event.
+
+**Status: U5.1–U5.3 complete and live-accepted; U5.4 remaining.**
+
+- **U5.1 (backend plumbing) — complete.** `execute_action_draft` is SEND-only, reuses `circleGaslessTransfer` for signing/submission, re-resolves Agent Context/current wallet/budget at execution time, rejects wallet drift, and uses `draft_id` as the idempotency key via the `executed_drafts` migration.
+- **U5.2 (real backend E2E execution proof) — complete.** A real controlled BASE-SEPOLIA USDC send executed exactly once through `execute_action_draft` with independently verified on-chain evidence and idempotent replay.
+- **U5.3 (Cockpit Confirm & Execute) — complete and live-accepted.** The existing Action Draft Preview is wired to a Confirm & Execute flow that requires exact-current-draft human confirmation (invalidated by any edit), keeps the execution bearer separate from read-model authentication and page-memory-only, revalidates immediately before execution, and fails closed on staleness/drift/policy/auth mismatch. Proven live: draft `draft:x402-action-draft-v1:fnv1a64:46dc1ddd9a266bff` settled as tx `0xacc1bb793641bf6ece6cf4d92ae9f42425ea4e13c664548439a5a99115314530`; an exact unchanged replay returned `replayed:true` with the same draft ID and transaction hash and no second budget debit. Per-agent execution-bearer rotation (credential-only, leaves wallet/budget/permission/OAuth-identity state untouched) is also live-proven in this same path.
+- **U5.4 (Wallet Brain → deterministic draft bridge) — remaining.** Add a read/draft-only Wallet Brain capability (e.g. `create_action_draft` / `resolve_action_draft`) so natural-language intent such as "send 0.01 USDC from Claude to Jared 3" resolves through deterministic tools into the same `x402-action-draft-v1` contract, with `execution: none` at Brain/tool-return time. The LLM must never receive a transfer/signing capability; alias/entity resolution against current authoritative wallet state must fail closed on ambiguity, staleness, or mismatch. The resolved draft opens in the existing Cockpit Action Draft Preview; the existing U5.3 Confirm & Execute flow remains the only execution path. Final U5 acceptance requires a human-approved, independently verified live send through this full bridge — not merely the non-executing draft-generation proof.
 
 ## Phase U6 — Agent Universe live read-only fleet view
 
@@ -214,8 +226,8 @@ Ship:
 - shared conversation/session state across views
 - Brain-driven graph filtering/highlighting
 - Brain answers with entity references that open Cockpit details or Universe locations
-- “show me” commands for fleet navigation
-- “open this in Cockpit” for precision review
+- "show me" commands for fleet navigation
+- "open this in Cockpit" for precision review
 - one action-draft contract across both interfaces
 
 Examples:
@@ -262,7 +274,7 @@ Ship:
 
 The Brain becomes the primary fleet query interface; the Universe becomes the primary relationship/navigation interface; the Cockpit remains the primary precision/execution interface.
 
-**Exit condition:** an operator can answer “what needs my attention?” and drill from fleet summary to exact source records and receipts without manually scanning 1,000 wallet cards.
+**Exit condition:** an operator can answer "what needs my attention?" and drill from fleet summary to exact source records and receipts without manually scanning 1,000 wallet cards.
 
 # Repository responsibilities
 
@@ -354,12 +366,14 @@ Local repo roadmaps may contain deeper implementation detail but should referenc
 
 # Immediate next bounded slice
 
-Begin **Phase U4 — Transaction drafts, requests, and explicit previews**, not controlled Brain/Cockpit execution.
+Begin **Phase U5.4 — Wallet Brain → deterministic draft bridge**, the sole remaining U5 slice. Do not restart U4 and do not redo U5.1-U5.3.
 
-1. Promote the existing non-executing prompt composer into the common deterministic action-draft contract.
-2. Support `send`, `request_payment`, `x402_purchase`, and `external_agent_prompt` drafts with explicit actor, authoritative source wallet, destination, network, asset, exact atomic amount, display amount, purpose/resource, budget/policy evidence, confirmation requirement, and idempotency identity.
-3. Resolve draft identity/wallet fields only from `x402-read-model-v1`; fail closed on missing, archived, ambiguous, stale, conflicting, or mismatched authority.
-4. Render a precision Cockpit preview that can be created, inspected, edited, canceled, copied, and promoted to an external-agent prompt without moving funds.
-5. Keep Wallet Brain and the Cockpit at `execution: none`. Controlled testnet execution begins only in U5 after a separate review and explicit safety implementation.
+1. Inspect the current Wallet Brain runtime/tool orchestration and the current action-draft resolver before changing code. Use the existing architecture/name for a draft-only capability if one already exists rather than inventing a duplicate.
+2. Add a Brain-visible READ/DRAFT-ONLY capability (e.g. `create_action_draft` / `resolve_action_draft`). The LLM itself must not receive a transfer/signing capability.
+3. Wallet Brain may interpret semantic aliases and intent (e.g. "send 0.01 USDC from Claude to Jared 3"), but model prose is not authority for identity, wallet, balance, amount, network, asset, budget, permission, cap, confirmation, or settlement state. Deterministic code resolves aliases/entities against `x402-read-model-v1` / authoritative backend state and then uses the existing action-draft resolver.
+4. Result must be a structured `x402-action-draft-v1` with `execution: none` at Brain/tool-return time. The Brain can explain the proposed action but must not execute it.
+5. Promote/open that exact deterministic draft in the existing Cockpit Action Draft Preview. The existing U5.3 Confirm & Execute flow remains the only UI execution path; do not create a parallel "Brain executes transfer" path.
+6. Fail closed on ambiguous, stale, conflicting, archived, missing, mismatched, or unauthorized alias/entity resolution rather than guessing a wallet or fabricating an execution-ready draft.
+7. First prove the non-money-moving bridge (Brain calls the draft-only tool, current identities are resolved by tools not model memory, `execution:none` draft is produced, it opens in the Cockpit preview, no funds move, edit/cancel/copy still work, execution still requires the separate bearer + exact-current-draft confirmation) before attempting the final U5 human-approved live send.
 
-This ordering preserves the proven U1→U2→U3 foundation while creating a machine-structured bridge from semantic intent to future deterministic execution.
+This ordering preserves the proven U1→U2→U3→U4→U5.1→U5.2→U5.3 foundation while creating a machine-structured bridge from semantic intent to the existing deterministic execution path. Phase U6 — Agent Universe live read-only fleet view — begins only after U5.4 and final U5 human-approved live acceptance are both complete.
