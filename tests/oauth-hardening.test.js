@@ -168,6 +168,20 @@ class MemoryStatement {
       return agent ? [{ agent_id: credential.agent_id }] : [];
     }
 
+    const credentialInventorySelect = 'SELECT ac.agent_id, ag.display_name, ac.credential_type, ac.status, ac.created_at, ac.updated_at, ac.credential_key FROM agent_credentials ac JOIN agents ag ON ag.agent_id = ac.agent_id';
+    if (this.sql.startsWith(credentialInventorySelect)) {
+      const filteredByAgent = /WHERE ac\.agent_id = \?/i.test(this.sql);
+      let rows = this.db.table('agent_credentials').filter(row => this.db.table('agents').some(agent => agent.agent_id === row.agent_id));
+      if (filteredByAgent) rows = rows.filter(row => row.agent_id === this.params[0]);
+      rows = rows.map(row => {
+        const agent = this.db.table('agents').find(a => a.agent_id === row.agent_id);
+        return { agent_id: row.agent_id, display_name: agent?.display_name || null, credential_type: row.credential_type, status: row.status, created_at: row.created_at, updated_at: row.updated_at, credential_key: row.credential_key };
+      });
+      if (filteredByAgent) rows = rows.toSorted((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+      else rows = rows.toSorted((a, b) => String(a.display_name || '').localeCompare(String(b.display_name || '')) || String(b.created_at).localeCompare(String(a.created_at))).slice(0, 200);
+      return rows;
+    }
+
     const match = /^SELECT (.+?) FROM (\w+)(?: WHERE (.+?))?(?: ORDER BY .+?)?(?: LIMIT (\?|\d+))?$/i.exec(this.sql);
     if (!match) throw new Error('Unsupported SELECT in test D1 mock: ' + this.sql);
     const [, select, tableName, whereClause, limitToken] = match;
