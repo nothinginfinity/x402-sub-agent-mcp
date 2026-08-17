@@ -1309,4 +1309,104 @@ test('execute_action_draft rejects on wallet drift when the declared source wall
   assert.equal(row.error_detail, 'resolution_drifted');
 });
 
+// ---- Option A: Console Credentials panel (CONSOLE_ADMIN_PASSWORD) ----------
+// Narrow, separate secret from MCP_AUTH_TOKEN (full access) and OAUTH_ADMIN_SCOPE
+// (broad admin). Must grant access to admin_rotate_agent_bearer and
+// admin_list_agent_credentials ONLY -- never to any other admin_* tool.
+
+test('admin_list_agent_credentials appears in tools/list', async () => {
+  const env = makeEnv();
+  const result = await mcp(env, STATIC_TOKEN, 'tools/list');
+  assert.ok(result.body.result.tools.some(tool => tool.name === 'admin_list_agent_credentials'));
+});
+
+test('admin_list_agent_credentials and admin_rotate_agent_bearer are denied without any admin credential', async () => {
+  const env = makeEnv();
+  const client = await registerClient(env, { client_name: 'ChatGPT' });
+  const grant = await issueAuthorizationCode(env, client, { scope: 'wallet:read offline_access' });
+  const issued = await exchangeCode(env, client, grant);
+  const listDenied = await mcp(env, issued.body.access_token, 'tools/call', { name: 'admin_list_agent_credentials', arguments: {} });
+  assert.equal(listDenied.response.status, 403);
+  const rotateDenied = await mcp(env, issued.body.access_token, 'tools/call', { name: 'admin_rotate_agent_bearer', arguments: { agent_id: 'agent-1' } });
+  assert.equal(rotateDenied.response.status, 403);
+});
+
+test('the pre-existing full-access MCP_AUTH_TOKEN (mode:static) still cannot call admin_rotate_agent_bearer or admin_list_agent_credentials -- no regression from this change', async () => {
+  const env = makeEnv();
+  // mode:'static' is not pre-dispatch-gated (only 'agent' and 'console_credential_admin'
+  // are), so it reaches callTool and the tool's own isCredentialAdminAuthorized() check
+  // returns the denial inside a 200 response, exactly as it always did before this change.
+  const rotateDenied = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'admin_rotate_agent_bearer', arguments: { agent_id: 'agent-1' } });
+  assert.equal(rotateDenied.response.status, 200);
+  assert.equal(toolPayload(rotateDenied).ok, false);
+  assert.equal(toolPayload(rotateDenied).error, 'permission_denied');
+  const listDenied = await mcp(env, STATIC_TOKEN, 'tools/call', { name: 'admin_list_agent_credentials', arguments: {} });
+  assert.equal(listDenied.response.status, 200);
+  assert.equal(toolPayload(listDenied).ok, false);
+  assert.equal(toolPayload(listDenied).error, 'permission_denied');
+});
+
+test('CONSOLE_ADMIN_PASSWORD authorizes admin_list_agent_credentials and admin_rotate_agent_bearer, never returns a raw token from list, and is rejected when wrong', async () => {
+  const env = makeEnv();
+  env.CONSOLE_ADMIN_PASSWORD = 'a-strong-console-passphrase';
+  seedAgentContext(env, { agent_id: 'agent-console', credential_type: 'oauth_subject_sha256', credential_key: 'oauth-agent-console', capability: 'resolve_agent_context', max_amount_atomic: '10000', limit_atomic: '100000', spent_atomic: '0' });
+  const oldBearer = 'afo_x402_console_old_bearer';
+  const ts = nowIsoTest();
+  env.DB.table('agent_credentials').push({ id: 'cred-console-old-bearer', agent_id: 'agent-console', credential_type: 'bearer_token', credential_key: sha256Hex(oldBearer), status: 'active', metadata_json: JSON.stringify({ source: 'old' }), created_at: ts, updated_at: ts });
+
+  const wrongPassword = await mcp(env, 'not-the-right-password', 'tools/call', { name: 'admin_list_agent_credentials', arguments: {} });
+  assert.equal(wrongPassword.response.status, 401, 'an unrecognized bearer fails authenticate() entirely, before any tool-level or scope check runs');
+
+  const listed = await mcp(env, env.CONSOLE_ADMIN_PASSWORD, 'tools/call', { name: 'admin_list_agent_credentials', arguments: { agent_id: 'agent-console' } });
+  assert.equal(listed.response.status, 200);
+  const listedPayload = toolPayload(listed);
+  assert.equal(listedPayload.ok, true);
+  assert.ok(listedPayload.credentials.length >= 2, 'expects both the oauth_subject_sha256 and bearer_token rows');
+  const bearerRow = listedPayload.credentials.find(c => c.credential_type === 'bearer_token');
+  assert.equal(bearerRow.agent_id, 'agent-console');
+  assert.equal(bearerRow.status, 'active');
+  assert.ok(bearerRow.fingerprint_prefix);
+  assert.equal(bearerRow.fingerprint_prefix, sha256Hex(oldBearer).slice(0, 12));
+  assert.ok(!('credential_key' in bearerRow), 'must never leak the full stored hash, only a short prefix');
+  assert.ok(!JSON.stringify(listedPayload).includes(oldBearer), 'raw bearer must never appear in a list response');
+
+  const rotated = await mcp(env, env.CONSOLE_ADMIN_PASSWORD, 'tools/call', { name: 'admin_rotate_agent_bearer', arguments: { agent_id: 'agent-console' } });
+  assert.equal(rotated.response.status, 200);
+  const rotatedPayload = toolPayload(rotated);
+  assert.equal(rotatedPayload.ok, true);
+  assert.equal(rotatedPayload.revoked_prior_bearer_count, 1);
+  assert.match(rotatedPayload.token, /^afo_x402_[A-Za-z0-9_-]+$/);
+
+  const reListed = await mcp(env, env.CONSOLE_ADMIN_PASSWORD, 'tools/call', { name: 'admin_list_agent_credentials', arguments: { agent_id: 'agent-console' } });
+  const reListedPayload = toolPayload(reListed);
+  const activeBearers = reListedPayload.credentials.filter(c => c.credential_type === 'bearer_token' && c.status === 'active');
+  assert.equal(activeBearers.length, 1);
+  assert.notEqual(activeBearers[0].fingerprint_prefix, sha256Hex(oldBearer).slice(0, 12));
+  assert.ok(!JSON.stringify(reListedPayload).includes(rotatedPayload.token), 'raw rotated bearer must never appear in a subsequent list response');
+});
+
+test('CONSOLE_ADMIN_PASSWORD does not broaden access to any other admin_* tool', async () => {
+  const env = makeEnv();
+  env.CONSOLE_ADMIN_PASSWORD = 'a-strong-console-passphrase';
+  const denied = await mcp(env, env.CONSOLE_ADMIN_PASSWORD, 'tools/call', {
+    name: 'admin_assign_agent_wallet',
+    arguments: { agent_id: 'agent-x', wallet_id: '11111111-1111-1111-1111-111111111111', budget_atomic: '1000000' }
+  });
+  // The pre-dispatch allow-list (consoleCredentialAdminToolAllowed) blocks
+  // this mode from ever reaching a non-allow-listed tool -- returned as a
+  // clean 403 at the transport layer, matching mode:'agent's pattern.
+  assert.equal(denied.response.status, 403);
+  const bindDenied = await mcp(env, env.CONSOLE_ADMIN_PASSWORD, 'tools/call', { name: 'admin_bind_caller', arguments: { source: 'claude', caller_id: 'jared', agent_id: 'agent-x' } });
+  assert.equal(bindDenied.response.status, 403);
+});
+
+test('when CONSOLE_ADMIN_PASSWORD is not configured on env, no bearer value can satisfy the console-admin auth mode', async () => {
+  const env = makeEnv(); // env.CONSOLE_ADMIN_PASSWORD intentionally left unset
+  const attempts = ['', 'undefined', 'null', 'some-guessed-password'];
+  for (const attempt of attempts) {
+    const result = await mcp(env, attempt, 'tools/call', { name: 'admin_list_agent_credentials', arguments: {} });
+    assert.equal(result.response.status, 401, `expected 401 for attempted bearer "${attempt}"`);
+  }
+});
+
 function nowIsoTest() { return new Date().toISOString(); }
