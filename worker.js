@@ -427,9 +427,20 @@ async function adminAssignAgentWallet(env, a, authContext) {
 // rewrite wallet assignment, permissions, budgets, spent amounts, or OAuth bindings. The raw
 // token is returned once; only its SHA-256 fingerprint is persisted. Rotation is atomic so
 // callers never observe a state with both the old and new bearer active.
+// Narrowly extends authority beyond OAUTH_ADMIN_SCOPE to the separate CONSOLE_ADMIN_PASSWORD
+// secret (mode 'console_credential_admin'), used ONLY by these two credential-hygiene tools --
+// never by admin_assign_agent_wallet/admin_bind_caller/admin_bind_oauth_identity, which remain
+// OAuth mcp:admin-only.
+function isCredentialAdminAuthorized(authContext) {
+  return !!(authContext && authContext.ok && (
+    (authContext.mode === 'oauth' && (authContext.scope || []).includes(OAUTH_ADMIN_SCOPE)) ||
+    authContext.mode === 'console_credential_admin'
+  ));
+}
+
 async function adminRotateAgentBearer(env, a, authContext) {
-  if (!authContext || !authContext.ok || authContext.mode !== 'oauth' || !(authContext.scope || []).includes(OAUTH_ADMIN_SCOPE)) {
-    return agentContextError('permission_denied', 'OAuth mcp:admin authentication is required');
+  if (!isCredentialAdminAuthorized(authContext)) {
+    return agentContextError('permission_denied', 'OAuth mcp:admin or console credential-admin authentication is required');
   }
   const agentId = clean(a && a.agent_id);
   if (!agentId) return agentContextError('invalid_request', 'agent_id is required');
@@ -459,6 +470,30 @@ async function adminRotateAgentBearer(env, a, authContext) {
     token: rawToken,
     one_time_reveal: true
   };
+}
+
+// Read-only credential inventory for the Console's Credentials panel. Never returns a raw
+// token (none are stored server-side); fingerprint_prefix is the first 12 chars of the stored
+// SHA-256 hash, useful only for a human to visually distinguish rows, never to reconstruct a
+// credential. Omit agent_id to list credentials across all agents (bounded to 200 rows).
+async function adminListAgentCredentials(env, a, authContext) {
+  if (!isCredentialAdminAuthorized(authContext)) {
+    return agentContextError('permission_denied', 'OAuth mcp:admin or console credential-admin authentication is required');
+  }
+  const agentId = clean(a && a.agent_id);
+  const rows = agentId
+    ? await dbAll(env, `SELECT ac.agent_id, ag.display_name, ac.credential_type, ac.status, ac.created_at, ac.updated_at, ac.credential_key FROM agent_credentials ac JOIN agents ag ON ag.agent_id = ac.agent_id WHERE ac.agent_id = ? ORDER BY ac.created_at DESC`, [agentId])
+    : await dbAll(env, `SELECT ac.agent_id, ag.display_name, ac.credential_type, ac.status, ac.created_at, ac.updated_at, ac.credential_key FROM agent_credentials ac JOIN agents ag ON ag.agent_id = ac.agent_id ORDER BY ag.display_name ASC, ac.created_at DESC LIMIT 200`, []);
+  const credentials = rows.map(r => ({
+    agent_id: r.agent_id,
+    display_name: r.display_name,
+    credential_type: r.credential_type,
+    status: r.status,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    fingerprint_prefix: r.credential_key ? String(r.credential_key).slice(0, 12) : null
+  }));
+  return { ok: true, credentials, count: credentials.length };
 }
 
 // V1.5.6: OAuth-family binding as a first-class admin tool (capture-on-first-connect arm).
@@ -2268,7 +2303,8 @@ const toolSchemas = [
     inputSchema: obj({ draft: obj({ draft_id: str, kind: str, source_wallet_id: str, destination_address: str, amount_atomic: str, network: str, asset: str }, ['draft_id', 'kind', 'destination_address', 'amount_atomic']) }, ['draft']) },
 
   { name: 'admin_assign_agent_wallet', description: 'Admin-only: assign a Circle wallet, budget, permissions, and a server-generated one-time bearer credential to an explicit agent_id.', inputSchema: obj({ agent_id: str, display_name: str, wallet_id: str, network: str, asset: str, budget_atomic: str, transfer_max_atomic: str }, ['agent_id', 'wallet_id', 'budget_atomic']) },
-  { name: 'admin_rotate_agent_bearer', description: 'OAuth mcp:admin-only: revoke active per-agent bearer credentials for an existing active agent and mint exactly one replacement bearer. Credential-only operation: does not modify wallet assignment, permissions, budgets, spent amounts, or OAuth bindings. Returns the raw afo_x402_ token once and persists only its SHA-256 fingerprint.', inputSchema: obj({ agent_id: str }, ['agent_id']) },
+  { name: 'admin_rotate_agent_bearer', description: 'OAuth mcp:admin OR console credential-admin (CONSOLE_ADMIN_PASSWORD): revoke active per-agent bearer credentials for an existing active agent and mint exactly one replacement bearer. Credential-only operation: does not modify wallet assignment, permissions, budgets, spent amounts, or OAuth bindings. Returns the raw afo_x402_ token once and persists only its SHA-256 fingerprint.', inputSchema: obj({ agent_id: str }, ['agent_id']) },
+  { name: 'admin_list_agent_credentials', description: 'OAuth mcp:admin OR console credential-admin (CONSOLE_ADMIN_PASSWORD): read-only credential inventory (agent_id, display_name, credential_type, status, created_at, updated_at, fingerprint_prefix) for one agent or all agents. Never returns a raw token -- none are stored server-side.', inputSchema: obj({ agent_id: str }) },
   { name: 'admin_bind_oauth_identity', description: 'Admin-only: arm capture-on-first-connect for a trusted OAuth client family (claude|chatgpt|perplexity) toward an explicit active agent_id. Writes only a pending arm; the next OAuth session for that family with no existing credential is atomically bound to the agent at resolve time. Idempotent; refuses if the family is already armed or bound to a different active agent.', inputSchema: obj({ agent_id: str, family: str }, ['agent_id', 'family']) },
   { name: 'admin_bind_caller', description: 'Admin-only: bind or rebind an external service caller_id (source + caller_id) to an explicit agent_id. Supported mutation path for agent_caller_bindings -- the authoritative source+caller_id -> agent_id mapping used by the internal cross-service wallet resolver. Idempotent upsert.', inputSchema: obj({ source: str, caller_id: str, agent_id: str }, ['source', 'caller_id', 'agent_id']) },
 
@@ -2292,6 +2328,7 @@ async function callTool(env, name, args, authContext) {
     case 'provision_agent_context_self': return agentContextError('deprecated', 'provision_agent_context_self is deprecated; use admin_assign_agent_wallet for onboarding');
     case 'admin_assign_agent_wallet': return adminAssignAgentWallet(env, a, authContext);
     case 'admin_rotate_agent_bearer': return adminRotateAgentBearer(env, a, authContext);
+    case 'admin_list_agent_credentials': return adminListAgentCredentials(env, a, authContext);
     case 'admin_bind_oauth_identity': return adminBindOauthIdentity(env, a, authContext);
     case 'admin_bind_caller': return adminBindCaller(env, a, authContext);
     case 'internal_get_agent_wallet': return resolveAgentWalletInternal(env, a, authContext);
@@ -3505,6 +3542,11 @@ async function authenticate(req, env) {
   const token = extractBearer(req);
   if (!token) return { ok: false };
   if (env.MCP_AUTH_TOKEN && timingSafeEqual(token, env.MCP_AUTH_TOKEN)) return { ok: true, mode: 'static', raw_token: token };
+  // Narrow, separate secret from MCP_AUTH_TOKEN (which grants full access). This mode is
+  // recognized ONLY by adminRotateAgentBearer/adminListAgentCredentials via
+  // isCredentialAdminAuthorized() -- it must never be treated as equivalent to
+  // OAUTH_ADMIN_SCOPE or MCP_AUTH_TOKEN anywhere else.
+  if (env.CONSOLE_ADMIN_PASSWORD && timingSafeEqual(token, env.CONSOLE_ADMIN_PASSWORD)) return { ok: true, mode: 'console_credential_admin', raw_token: token };
   const row = await verifyOauthAccessToken(env, token);
   if (!row) {
     // Per-agent bearer token (A1): only reached when the token is NEITHER the
