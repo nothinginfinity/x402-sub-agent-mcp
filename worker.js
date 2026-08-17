@@ -2504,6 +2504,19 @@ function agentToolAllowed(toolName) {
   return AGENT_ALLOWED_TOOLS.has(toolName);
 }
 
+// Narrow least-privilege allow-list for mode:'console_credential_admin' (the
+// separate CONSOLE_ADMIN_PASSWORD secret). Unlike mode:'agent'/'oauth', this
+// mode has no scope system of its own, so the allow-list IS its entire
+// authority -- pre-dispatch-gated here (belt) in addition to the
+// isCredentialAdminAuthorized() check inside each tool itself (suspenders).
+const CONSOLE_CREDENTIAL_ADMIN_TOOLS = new Set([
+  'admin_rotate_agent_bearer',
+  'admin_list_agent_credentials'
+]);
+function consoleCredentialAdminToolAllowed(toolName) {
+  return CONSOLE_CREDENTIAL_ADMIN_TOOLS.has(toolName);
+}
+
 // ---- crypto / encoding helpers ----
 function b64urlFromBytes(bytes) {
   let bin = '';
@@ -3639,6 +3652,13 @@ async function handleMcp(req, env) {
       if (auth.mode === 'agent' && !agentToolAllowed(toolName)) {
         await traceFromRequest(env, req, { event_type: 'scope_denied', client_id: null, request_id: reqId, http_status: 403, latency_ms: Date.now() - mT0, outcome: 'denied', error: 'agent_tool_not_allowed', metadata: { tool_name: toolName, mode: 'agent', agent_id: auth.agent_id || null } });
         return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32002, message: 'agent_tool_not_allowed: this agent bearer token cannot call ' + toolName } }), {
+          status: 403,
+          headers: { ...CORS, 'content-type': 'application/json;charset=utf-8', 'cache-control': 'no-store' }
+        });
+      }
+      if (auth.mode === 'console_credential_admin' && !consoleCredentialAdminToolAllowed(toolName)) {
+        await traceFromRequest(env, req, { event_type: 'scope_denied', client_id: null, request_id: reqId, http_status: 403, latency_ms: Date.now() - mT0, outcome: 'denied', error: 'console_credential_admin_tool_not_allowed', metadata: { tool_name: toolName, mode: 'console_credential_admin' } });
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32002, message: 'console_credential_admin_tool_not_allowed: this credential cannot call ' + toolName } }), {
           status: 403,
           headers: { ...CORS, 'content-type': 'application/json;charset=utf-8', 'cache-control': 'no-store' }
         });
