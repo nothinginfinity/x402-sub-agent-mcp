@@ -32,6 +32,7 @@ Development and handoff procedure is defined in [DEVFLOW.md](./DEVFLOW.md). The 
 - [V1.4 — payment-signing orchestration](#v14--payment-signing-orchestration)
 - [V2 — enterprise reserve memberships (mid-term)](#v2--enterprise-reserve-memberships-mid-term)
 - [V3+ — longer-term](#v3--longer-term)
+- [Adjacent proposed track — CairnStone Escrow (E0–E5)](#adjacent-proposed-track--cairnstone-escrow-e0e5)
 - [Risks & open questions](#risks--open-questions)
 
 ---
@@ -603,6 +604,27 @@ likely they are to matter soon, not by size.
 - [ ] **Separate investor-product research.** Explore only through a
       dedicated project after specialist legal review; do not add it to
       this Worker's membership surface.
+
+## Adjacent proposed track — CairnStone Escrow (E0–E5)
+
+**Status: proposed / roadmap-only (2026-10-09).** No escrow smart contract deployed, no real-customer funds approved. This is an **adjacent product track**, not an enterprise membership-reserve feature, and does not change the active unified x402 U5.4 → U6 execution order.
+
+Use case: client escrows $1,500 USDC for 10 coaching sessions; the coach receives $150 for each properly approved milestone, while unused balance remains locked/refundable under agreed terms. Longer-term extensions: freelancers, milestone-based B2B services, AI agent work contracts.
+
+**Canonical design proposal in this repo:** [CairnStone Escrow — Programmable Agreements & Milestone Settlement](docs/X402_ESCROW_MILESTONE_SETTLEMENT_PROPOSAL.md).
+
+- [ ] **E0 — Contract/spec review:** compare the current x402 batch-settlement/escrow-channel scheme with a dedicated bilateral vault; formalize parties, token, agreement hash, signatures, replay protection, custody, expiration, and dispute requirements.
+- [ ] **E1 — Base Sepolia funding:** gas-sponsored USDC deposit and atomic agreement accounting, with verified chain receipts and double-deposit rejection.
+- [ ] **E2 — Earned milestone payout/refund:** exact signed EIP-712 milestone approvals or compatible cumulative vouchers; no double release; cancel/refund and disputed-milestone rules only after design approval.
+- [ ] **E3 — Worker + CairnStone evidence adapter:** event index, immutable agreement/version references, receipt reconciliation, reorg/failure handling.
+- [ ] **E4 — Mobile-first interface:** client/coach escrow details, session approval, refund/dispute status, iPhone owner acceptance.
+- [ ] **E5 — Production gates:** independent security audit; custody/escrow and money-transmission, consumer, tax, accounting, sanctions/AML/KYC as applicable; controlled pilot approval.
+
+**Open next decision: disputes and cancellation.** Do not implement a default 7-day auto-release, unilateral coach withdrawal, platform-only arbitration, or silence-as-consent policy. Decide approval, evidence, dispute windows, neutral adjudication, abandonment, cancellation/refund, and appeal before choosing the payout contract.
+
+Keep `x402-sub-agent-mcp` as wallet/policy plane, **not escrow custodian**. The escrow contract/provider controls funds; CairnStone stores provenance and receipts. x402 payment authorization is not automatically vault-withdrawal authorization. Real-customer custody remains prohibited until existing V1.3C/V2 security/legal gates are satisfied.
+
+**Cross-repo synchronization pending:** the unified roadmap mirror is `docs/X402_UNIFIED_PRODUCT_ROADMAP.md`; its declared canonical source at `nothinginfinity/agent-wallets-console` is currently inaccessible via the connected GitHub integration. This local proposed-track addition does not purport to amend that missing canonical source or its mirrors.
 
 ## Risks & open questions
 
