@@ -33,6 +33,7 @@ Development and handoff procedure is defined in [DEVFLOW.md](./DEVFLOW.md). The 
 - [V2 — enterprise reserve memberships (mid-term)](#v2--enterprise-reserve-memberships-mid-term)
 - [V3+ — longer-term](#v3--longer-term)
 - [Adjacent proposed track — CairnStone Escrow (E0–E5)](#adjacent-proposed-track--cairnstone-escrow-e0e5)
+- [Adjacent proposed track — CairnStone Accord (A0–A5)](#adjacent-proposed-track--cairnstone-accord-a0a5)
 - [Risks & open questions](#risks--open-questions)
 
 ---
@@ -625,6 +626,25 @@ Use case: client escrows $1,500 USDC for 10 coaching sessions; the coach receive
 Keep `x402-sub-agent-mcp` as wallet/policy plane, **not escrow custodian**. The escrow contract/provider controls funds; CairnStone stores provenance and receipts. x402 payment authorization is not automatically vault-withdrawal authorization. Real-customer custody remains prohibited until existing V1.3C/V2 security/legal gates are satisfied.
 
 **Cross-repo synchronization pending:** the unified roadmap mirror is `docs/X402_UNIFIED_PRODUCT_ROADMAP.md`; its declared canonical source at `nothinginfinity/agent-wallets-console` is currently inaccessible via the connected GitHub integration. This local proposed-track addition does not purport to amend that missing canonical source or its mirrors.
+
+## Adjacent proposed track — CairnStone Accord (A0–A5)
+
+**Status: design proposal / roadmap-only (2026-10-09).** Subtrack of CairnStone Escrow (E0–E5), with a possible standalone product **CairnStone Accord — Voluntary AI Negotiation & Settlement**. No debate engine, delegated settlement, mainnet release, real-money escrow or legal acceptance is claimed. This track does NOT interrupt the unified wallet U5.4 → U6 sequence or override the existing escrow security/custody gates.
+
+**Product thesis:** resolve low-value service disputes and renegotiate micro-obligations by allowing each counterparty to choose an LLM advocate. Those agents can debate, present evidence, and counteroffer; a voluntary, exact-version settlement is independently accepted by both humans, then executed only through deterministic, authorized escrow/x402 payment paths. AI reasoning is never money authority and is not binding arbitration. This also covers legitimate negotiated extras (longer sessions) as well as credits (late arrival).
+
+**Canonical design:** [CairnStone Accord — Voluntary AI Negotiation & Settlement](docs/CAIRNSTONE_ACCORD_VOLUNTARY_AI_NEGOTIATION.md). Parent escrow design: [CairnStone Escrow](docs/X402_ESCROW_MILESTONE_SETTLEMENT_PROPOSAL.md).
+
+- [ ] **A0 — Negotiation contract:** party roles, redacted evidence, offer schema, disclosure of advocacy/neutral models, bounded rounds/cost, consent state machine, no-deal fallback and legal wording.
+- [ ] **A1 — Read-only two-agent simulation:** client and trainer LLMs debate one $150 coaching-session dispute, produce typed proposals, preserve offer revisions/evidence and measure inference costs, WITHOUT money movement.
+- [ ] **A2 — Explicit dual human acceptance:** stable settlement hash binding exact amounts/parties/wallets/milestone/expiry, independent consent, editing/rejection invalidates acceptance, no automatic AI award.
+- [ ] **A3 — Guarded Base Sepolia settlement:** verify final dual consent and funded balance; settle signed micro-refund / payout adjustment with onchain receipts, correct idempotency/replay behavior and independently authorized top-up for extra fees.
+- [ ] **A4 — Mobile Hop Card + Console presentation:** selectable model/BYOK, readable arguments, evidence provenance, final before/after balance preview, both acceptance controls, privacy, owner iPhone acceptance.
+- [ ] **A5 — Security, privacy, economics and pilot review:** assess manipulation/prompt injection, unbiased evidence labeling, fee incentives, refund/escrow legal obligations, contract audit, wallet authority isolation and applicability to external users.
+
+**Non-negotiable:** two explicit human approvals in initial design; no agent can debit an unapproved additional charge or unilaterally release escrow. No forced award or silence-as-consent. When either declines, the original contract's agreed resolution fallback applies; its timeout/escalation structure remains OPEN and must be designed before real deployment. LLM claims are untrusted evidence until corroborated; all money flows must reconcile against authoritative chain/provider state. A neutral LLM may suggest, but cannot judge or spend.
+
+**Cross-repo mirror sync pending:** `docs/X402_UNIFIED_PRODUCT_ROADMAP.md` identifies `nothinginfinity/agent-wallets-console` as canonical. This local track registration must be mirrored only after access to that source is restored and the canonical ordering is reviewed.
 
 ## Risks & open questions
 
