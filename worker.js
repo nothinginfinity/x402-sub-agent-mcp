@@ -2320,8 +2320,39 @@ const toolSchemas = [
     inputSchema: obj({ retention_days: num }, ['retention_days']) }
 ];
 
+// X1 (Slop Talk pay-to-play review post_5e09c59b; GO from Jared 2026-11-24): a per-agent bearer (mode 'agent')
+// may read only its OWN wallets. Before this, circle_list_wallets / circle_get_wallet_balance /
+// circle_get_transaction took any wallet set, wallet id or transaction id, so one agent bearer could read every
+// wallet and transaction in the account. Spend was already scoped (resolveAgentContext). Admin (static token,
+// OAuth mcp:admin) and OAuth wallet:read sessions are unchanged.
+const AGENT_SCOPED_READ_TOOLS = new Set(['circle_list_wallets', 'circle_get_wallet_balance', 'circle_get_transaction']);
+
+async function agentOwnWalletIds(env, agentId) {
+  const rows = await dbAll(env, `SELECT wallet_id FROM agent_wallets WHERE agent_id = ? AND status = 'active'`, [clean(agentId)]);
+  return new Set(rows.map(r => clean(r.wallet_id)).filter(Boolean));
+}
+
+async function agentScopedRead(env, name, a, authContext) {
+  const own = await agentOwnWalletIds(env, authContext.agent_id);
+  if (name === 'circle_list_wallets') {
+    const wallets = [];
+    for (const id of own) wallets.push(await circleGetWallet(env, id));
+    return { ok: true, http_status: 200, scoped_to_agent: authContext.agent_id, result: { data: { wallets } } };
+  }
+  if (name === 'circle_get_wallet_balance') {
+    if (!own.has(clean(a.wallet_id))) return agentContextError('wallet_not_assigned', 'agent bearers can only read their own assigned wallet', { agent_id: authContext.agent_id });
+    return circleGetWalletBalance(env, a);
+  }
+  // circle_get_transaction: fetch, then release it only if it belongs to one of the agent's wallets.
+  const r = await circleGetTransaction(env, a);
+  const walletId = clean(r && r.result && r.result.data && r.result.data.transaction && r.result.data.transaction.walletId);
+  if (!walletId || !own.has(walletId)) return agentContextError('transaction_not_owned', 'agent bearers can only read transactions of their own assigned wallet', { agent_id: authContext.agent_id });
+  return r;
+}
+
 async function callTool(env, name, args, authContext) {
   const a = args || {};
+  if (authContext && authContext.mode === 'agent' && AGENT_SCOPED_READ_TOOLS.has(name)) return agentScopedRead(env, name, a, authContext);
   switch (name) {
     case 'subagent_status': return status(env);
     case 'resolve_agent_context': return resolveAgentContextTool(env, a, authContext);
